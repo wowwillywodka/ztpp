@@ -1,0 +1,1177 @@
+// ztpp — рейкастер (Фаза 2): вид от первого лица по реальной геометрии ZT.
+//
+// ВАЖНО: прагматичный DDA-рейкастер поверх данных ZT (карта, celltype-классификация,
+// метатекстуры стен). НЕ пиксель-в-пиксель с Mega Drive (оригинал — ячеечный проектор
+// со «скомпилированным» колоночным скейлером, render3d.asm). Классификация клеток и декод
+// текстур — по канону ztextractor (см. cells.hpp, gfx.hpp::decodeTile, _build_metatexture).
+#pragma once
+#include "rom.hpp"
+#include "gfx.hpp"
+#include "level.hpp"
+#include "cells.hpp"
+#include "background.hpp"
+#include "gamedata.hpp"          // GameData/WallBank (ЭТАП 0: данные, не Rom+адреса)
+#include <cmath>
+#include <cstdint>
+#include <vector>
+#include <unordered_map>
+#include <algorithm>
+
+static const uint16_t DOOR_METATEX = 18; // канонич. метатекстура двери (пустой texorder)
+
+// ── ДВЕРИ: открытие при ВСТАВАНИИ НА ЯЧЕЙКУ двери (как ZT step-on b202: наступил на клетку ct6/7 →
+// дверь в список открытия). НЕ «перед дверью» — именно НА её клетке. Створки разъезжаются (раздвижные),
+// проходимы. Закрываются (анимация) когда игрок сошёл с клетки. doorMap/doorOpen/doorKey — в cells.hpp. ──
+// Возвращает true, если какая-то дверь ТОЛЬКО ЧТО начала открываться (для звука двери — caller играет SFX_DOOR).
+inline bool   rcUpdateDoors(int floor, double px, double py, const Level& lvl) {
+    auto& m = doorMap();
+    int cx = (int)px, cy = (int)py;
+    bool justOpened = false;
+    for (int y = cy - 3; y <= cy + 3; ++y)
+        for (int x = cx - 3; x <= cx + 3; ++x) {
+            if (x < 0 || y < 0 || x >= Level::W || y >= Level::H) continue;
+            uint8_t ct = lvl.cellType(floor, x, y);
+            if (ct != 6 && ct != 7) continue;
+            bool onCell = (cx == x && cy == y);          // игрок СТОИТ на клетке двери (ZT step-on)
+            int k = doorKey(floor, x, y);
+            double o = m.count(k) ? m[k] : 0.0, prev = o;
+            o += (onCell ? 0.20 : -0.10);                // открыть на клетке (быстро), иначе закрыть (анимация)
+            if (o < 0) o = 0; if (o > 1) o = 1;
+            if (onCell && prev < 0.01 && o > 0.0) justOpened = true;   // фронт открытия двери
+            m[k] = o;
+        }
+    return justOpened;
+}
+
+// Общий коэффициент гор. растяжки дисплея (faithful И DDA). 1.0 = без растяжки.
+// MD показывает узкий по ширине рендер растянутым → стены/двери ШИРОКИЕ. Ключи −/=. Дефолт 2.0.
+inline double& faHStretch() { static double v = 2.2; return v; }
+
+// ── ДЕКОР/ОБЪЕКТЫ-БИЛБОРДЫ (лампы/растения/мебель/столбы/деревья) ──────────────
+// Объекты окружения ZT (класс иконки 16) — спрайты-билборды из банка объектов 0x10E9BE,
+// стоящие в клетках карты. Рендер ТОЧНО как в игре (блиттер eda0 + хендлеры 0x11868..0x119be,
+// дизассемблированы из ROM): билборд в ЦЕНТРЕ клетки X, z-тест против стен по колонке, прозрачный
+// индекс 0, палитра-линия 0 (= wallPal). Тумблер faDecor.
+//
+// ВЕРТИКАЛЬ (из хендлеров; S = высота клетки на дистанции = высота полной стены, горизонт = центр вида):
+//   eda0 рисует ВЕРХ на screenY, вниз на D0(высоту). База Ybase = пол = горизонт + S/2.
+//   Каждый объект: top = горизонт + topOff·S, высота = hFrac·S, ширина(нат) = wFrac·S.
+//   Напольные объекты заканчиваются НИЗОМ на полу; ЛАМПЫ (0x62/63/64/75) висят ВЕРХОМ на ПОТОЛКЕ
+//   (top = горизонт − S/2). Доли — точные сдвиги/asr из дизасма хендлеров (в восьмых).
+inline bool& faDecor()    { static bool v = true; return v; }   // показывать декор
+inline int&  decorFrame() { static int  f = 0;    return f; }   // тик анимации декора (инкремент в main/кадр)
+
+// Один спрайт билборда объекта: тайл банка + вертикаль (в 1/16 S; S = высота клетки на дист., горизонт =
+// центр вида): topOff16 = (top−горизонт)·16/S, hFrac16 = высота·16/S, wFrac16 = ширина·16/ширина_клетки.
+// anim: 0 статич.; 1 вентилятор (4 кадра: tile/tile+1 + hflip, дизасм 0x119be); 2 мигание (alt=tile−4, 0x1195e).
+struct DecorSprite { uint8_t tile; int8_t topOff16; uint8_t hFrac16, wFrac16; uint8_t anim; };
+struct DecorDef { DecorSprite s[2]; uint8_t count; };          // 1–2 спрайта (напр. лампа + отражение)
+
+// celltype → объект (дизассемблировано из хендлеров 0x11868..0x119be). Доли — точные asr/sub в 1/16 S.
+inline bool decorForCt(uint8_t ct, DecorDef& d) {
+    switch (ct) {                          //  { {tile, topOff16, hFrac16, wFrac16, anim}, ... }, count
+        case 0x37: d = {{{46,-8,16, 8,0}}, 1}; return true;  // Дерево        — пол, во всю высоту
+        case 0x5C: d = {{{47,-8,16, 8,0}}, 1}; return true;  // Дерево
+        case 0x5D: d = {{{48,-4,12, 6,0}}, 1}; return true;  // Напольная лампа — пол, 3/4 высоты
+        case 0x5E: d = {{{55, 2, 6, 8,0}}, 1}; return true;  // Стол          — пол, низкий и ШИРОКИЙ
+        case 0x5F: d = {{{55, 0, 8, 2,0}}, 1}; return true;  // Барный стул    — пол, полвысоты, узкий
+        case 0x60: d = {{{51,-8,16, 4,0}}, 1}; return true;  // Металлич. столб — пол, во всю высоту, тонкий
+        case 0x61: d = {{{54,-8,16, 4,0}}, 1}; return true;  // Бетонный столб
+        case 0x76: d = {{{52,-8,16, 4,0}}, 1}; return true;  // Металлич. столб 2
+        case 0x62: d = {{{53,-8, 4, 2,2}}, 1}; return true;  // Мигающая лампа — ПОТОЛОК (мигает 53↔49)
+        case 0x63: d = {{{53,-8, 4, 2,0}}, 1}; return true;  // Лампа         — ПОТОЛОК
+        // Полусфера-лампа: купол на ПОТОЛКЕ (56) + световое ОТРАЖЕНИЕ-пятно на полу (50, дизасм 0x1198a)
+        case 0x64: d = {{{56,-8, 2, 4,0}, {50, 7, 2, 8,0}}, 2}; return true;
+        case 0x75: d = {{{57,-8, 4, 8,0}}, 1}; return true;  // Лампа 2       — ПОТОЛОК, широкая
+        case 0x78: d = {{{58, 7, 2, 8,1}}, 1}; return true;  // Напольный вентилятор (аним. tile 58/59)
+        default:   return false;
+    }
+}
+
+// ── ПИКАПЫ ОРУЖИЯ/ПРЕДМЕТОВ как floor-билборды (celltype 0x18..0x26) ──────────────
+// Из дизасма диспетча предметов (хендлеры @0x115a0..0x11676, таблица @0x113F4): каждый item грузит
+// a1 = указатель в объект-банк 0x10E9BE → тайл = (a1−0x10E9BE)/0x200; общий позиционер 0x11a52 ставит
+// его на пол, размер ≈ S/4 (квадрат). idx = celltype−0x18 (как в weapons.hpp). Тайлы (idx→тайл):
+inline bool itemBillboardForCt(uint8_t ct, DecorDef& d) {
+    static const uint8_t TILE[15] = {0,3,8,10,11,15,4,13,14,7,5,6,12,18,19};  // Map..Pulse → тайл объект-банка
+    int ic = cellIcon(ct);
+    if (ic != 10 && ic != 11) return false;             // не оружие(10)/предмет(11)
+    int idx = (int)ct - 0x18;
+    uint8_t tile;
+    if (idx >= 0 && idx < 15)      tile = TILE[idx];
+    else if (ct == 0x36)           tile = 17;           // ЛАЗЕРНАЯ ВИНТОВКА (хендлер дисплея 0x115ea → tile17)
+    else return false;
+    uint8_t h = 4, w = 4;                                // ~S/4 квадрат (позиционер 0x11a52)
+    if (tile == 15) { w = 6; h = 3; }                   // FireSuit — широкий 2:1
+    int8_t topOff = (int8_t)(8 - h);                    // НИЗ на полу (горизонт + S/2 = +8/16)
+    d = {{{tile, topOff, h, w, 0}}, 1};
+    return true;
+}
+// Хук «пикап уже подобран» (ставит weapons.hpp через pickedSet); null → показывать все.
+inline bool (*&pickupHiddenFn())(int, int, int) { static bool (*p)(int, int, int) = nullptr; return p; }
+
+// Динамические эффекты стрельбы в МИРЕ (взрывы-импакты по стене, снаряды) — билборды объект-банка.
+// Заполняет updateShots (weapons.hpp) каждый кадр; рисуются в drawDecorBillboards. Доли в 1/16 S.
+struct WorldFx { double wx, wy; int floor; uint8_t tile; int8_t topOff16; uint8_t hFrac16, wFrac16;
+                 int sprId = -1; uint8_t efr = 0; bool corpse = false; float zlift = 0;
+                 uint8_t dir = 0, animSt = 0, variant = 0; bool foam = false; bool burned = false; };  // sprId≥0 → спрайт врага; zlift подъём; animSt 0walk/1fire/2hit/3death; foam пена; burned обугленный труп
+inline std::vector<WorldFx>& worldFx() { static std::vector<WorldFx> v; return v; }
+
+#include "tuning.hpp"   // gameDist/playerPhysics/gameDistOctagonal — общие тумблеры reference-точности
+
+struct Camera {
+    double px = 1.5, py = 1.5;
+    double dirX = 1.0, dirY = 0.0;
+    double planeX = 0.0, planeY = 0.66;
+    int    floor = 0;
+    // ZT-ИНЕРЦИЯ движения (DAB8): три плавно разгоняемых значения (eased) — угл.скорость / вперёд / стрейф.
+    double turnVel = 0.0, fwdVel = 0.0, strafeVel = 0.0;
+    // Межэтажные переходы (см. rcUpdateTransit): питч вида + автомат лифта.
+    double pitch = 0;       // вертикальный сдвиг вида (ZT-ед., ±64≈одна высота стены); = -cabin
+    double cabin = 0;       // счётчик кабины/наклона лестницы (ZT $FF116E, -64..+64)
+    int    elevState = 0;   // 0 idle, +1 поездка вниз по зданию (floor++), -1 вверх (floor--)
+};
+
+// Кэш метатекстур стены 128x64 (4x2 тайла 32x32). Ключ — индекс метатекстуры эпизода.
+// Раскладка: тайл i -> col=i/2, row=i%2 (верх=0,2,4,6 / низ=1,3,5,7) — как _build_metatexture.
+struct MetaCache {
+    const WallBank* wall = nullptr;          // банк текстур стен (данные, не Rom)
+    const WallBank* obj  = nullptr;          // банк графики объектов/декора (билборды)
+    const Level*    lvl  = nullptr;
+    const uint8_t*  shadeRampData = nullptr; // регион рамп затенения (для ShadeRamps)
+    const uint8_t*  fcTemplateData = nullptr; // шаблоны пол/потолок (5 env × 0xA0, для FloorCeil)
+    const uint16_t* texdefSrc = nullptr;     // живой texdef аниматора (256*8); null → база уровня
+    std::unordered_map<uint16_t, std::vector<uint8_t>> cache;
+
+    void reset(const Level* l) { lvl = l; cache.clear(); } // вызывать при смене эпизода
+    void invalidate(uint16_t meta) { cache.erase(meta); }  // аниматор: метатекстура изменилась
+
+    // Текущий тайл слота метатекстуры: из живого texdef аниматора, иначе из базы уровня.
+    uint16_t texdefAt(uint16_t meta, int sub) const {
+        return texdefSrc ? texdefSrc[(static_cast<size_t>(meta & 0xFF) * 8) + sub]
+                         : lvl->texdef(meta, sub);
+    }
+
+    const uint8_t* get(uint16_t meta) {
+        auto it = cache.find(meta);
+        if (it != cache.end()) return it->second.data();
+        std::vector<uint8_t> buf(128 * 64, 0);
+        uint8_t t[32 * 32];
+        for (int i = 0; i < 8; ++i) {
+            wall->decode(texdefAt(meta, i), t);
+            int ox = (i / 2) * 32, oy = (i % 2) * 32;
+            for (int y = 0; y < 32; ++y)
+                for (int x = 0; x < 32; ++x)
+                    buf[(oy + y) * 128 + ox + x] = t[y * 32 + x];
+        }
+        auto r = cache.emplace(meta, std::move(buf));
+        return r.first->second.data();
+    }
+};
+
+// ── АНИМАТОР СТЕН (по дизасму ZT FUN_000023c2 / BZT FUN_000022a6) ──
+// Держит ЖИВУЮ копию texdef эпизода и циклит кадры анимаций по таймеру period (как RAM-копия игры
+// $FF63C6). Кадр перезаписывает слоты texdef → метатекстура помечается грязной в MetaCache (пересборка
+// при следующем get). Применение КУМУЛЯТИВНО: live не сбрасывается между кадрами (пустой кадр = без
+// изменений), как в оригинале. Один на эпизод; init при смене эпизода, update() раз в игр.кадр.
+struct WallAnimator {
+    const Level* lvl = nullptr;
+    MetaCache*   mc  = nullptr;
+    std::vector<uint16_t> live;              // живой texdef 256*8 (мутирует аниматор)
+    std::vector<int> frameIdx, counter;      // на каждую анимацию: текущий кадр + счётчик до смены
+    bool active = false;
+
+    // Применить кадр ai: записать его подстановки в live + инвалидировать затронутые метатекстуры.
+    void applyFrame(size_t ai, int fi) {
+        const auto& fr = lvl->wallAnims[ai].frames[(size_t)fi];
+        for (const auto& s : fr) {
+            uint16_t off = s.first;                          // байт-смещение в texdef
+            if (off + 1 >= live.size() * 2) continue;
+            size_t w = off / 2;                              // индекс тайл-слова = meta*8 + sub
+            if (w >= live.size()) continue;
+            live[w] = s.second;
+            if (mc) mc->invalidate((uint16_t)(off / 16));    // метатекстура = off/16
+        }
+    }
+
+    // (Пере)инициализация для эпизода: копируем базу texdef, подключаем как источник MetaCache,
+    // применяем кадр 0 каждой анимации (базовое состояние).
+    void init(const Level& l, MetaCache& cache) {
+        lvl = &l; mc = &cache;
+        live.assign(l.texdefT, l.texdefT + 256 * 8);
+        size_t na = l.wallAnims.size();
+        frameIdx.assign(na, 0);
+        counter.assign(na, 0);
+        for (size_t i = 0; i < na; ++i) counter[i] = l.wallAnims[i].period < 1 ? 1 : l.wallAnims[i].period;
+        active = na > 0;
+        mc->lvl = &l;                                        // согласуем эпизод
+        mc->texdefSrc = live.data();                         // рендер берёт живой texdef
+        mc->cache.clear();                                   // полная пересборка под новый источник
+        for (size_t i = 0; i < na; ++i)
+            if (!l.wallAnims[i].frames.empty()) applyFrame(i, 0);
+    }
+
+    // Один игровой кадр: для каждой анимации тикаем счётчик; на нуле — следующий кадр (циклично).
+    void update() {
+        if (!active || !lvl) return;
+        for (size_t ai = 0; ai < lvl->wallAnims.size(); ++ai) {
+            const auto& an = lvl->wallAnims[ai];
+            int nf = (int)an.frames.size();
+            if (nf < 1) continue;
+            if (--counter[ai] > 0) continue;
+            // ×wallAnimSlow(): ZT-аниматор (0x23c2) вызывался раз в игр.кадр, но рейкастер реально шёл ~30fps; порт на
+            // 60fps крутил бы анимацию вдвое быстрее (period=1 → строб 60Гц). Множитель настраивается в меню (дефолт 2.0).
+            int base = an.period < 1 ? 1 : an.period;
+            int eff = (int)(base * wallAnimSlow() + 0.5); if (eff < 1) eff = 1;
+            counter[ai] = eff;
+            frameIdx[ai] = (frameIdx[ai] + 1) % nf;
+            applyFrame(ai, frameIdx[ai]);
+        }
+    }
+};
+
+// Стена для ЛУЧА (стены+двери) — луч останавливается и рисует текстуру.
+inline bool rcSolidRay(const Level& lvl, int floor, int cx, int cy) {
+    if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return true;
+    return cellRenderWall(lvl.cellType(floor, cx, cy));
+}
+// Блокирует ДВИЖЕНИЕ (стены, но не двери).
+inline bool rcSolidMove(const Level& lvl, int floor, int cx, int cy) {
+    if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return true;
+    return cellBlocks(lvl.cellType(floor, cx, cy));
+}
+
+inline uint32_t shade(uint32_t c, double f) {
+    if (f < 0.0) f = 0.0; if (f > 1.0) f = 1.0;
+    uint32_t r = (uint32_t)(((c >> 16) & 0xFF) * f);
+    uint32_t g = (uint32_t)(((c >> 8) & 0xFF) * f);
+    uint32_t b = (uint32_t)((c & 0xFF) * f);
+    return 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+
+// Стартовая клетка: самая «открытая» пустая клетка (icon 0); взгляд вдоль длинного коридора.
+inline void rcSpawn(Camera& cam, const Level& lvl) {
+    int bx = -1, by = -1;
+    // ТОЧКА СПАВНА игрока = ПЕРВАЯ (row-major) клетка с иконкой 8 «player start» (ZT celltype 0x77).
+    // Точно как ZT (скан этажа @0x12cc: первый ct 0x77 → центр клетки) и ztextractor (oztd_export: icon==8).
+    for (int y = 0; y < Level::H && by < 0; ++y)
+        for (int x = 0; x < Level::W; ++x)
+            if (cellIcon(lvl.cellType(cam.floor, x, y)) == 8) { bx = x; by = y; break; }
+    if (bx < 0) {                                   // ФОЛБЭК (нет точки спавна на этаже): самая открытая пустая клетка
+        int best = -1;
+        for (int y = 0; y < Level::H; ++y)
+            for (int x = 0; x < Level::W; ++x) {
+                if (cellIcon(lvl.cellType(cam.floor, x, y)) != 0) continue;
+                int sc = 0;
+                for (int dy = -2; dy <= 2; ++dy)
+                    for (int dx = -2; dx <= 2; ++dx)
+                        if (!rcSolidRay(lvl, cam.floor, x + dx, y + dy)) ++sc;
+                if (sc > best) { best = sc; bx = x; by = y; }
+            }
+    }
+    if (bx < 0) { cam.px = cam.py = 1.5; cam.dirX = 1; cam.dirY = 0; cam.planeX = 0; cam.planeY = 0.66; return; }
+    cam.px = bx + 0.5; cam.py = by + 0.5;
+    static const int D[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    int bd = 0, bc = -1;
+    for (int d = 0; d < 4; ++d) {
+        int cnt = 0;
+        for (int s = 1; s <= 12; ++s) {
+            if (rcSolidRay(lvl, cam.floor, bx + D[d][0] * s, by + D[d][1] * s)) break;
+            ++cnt;
+        }
+        if (cnt > bc) { bc = cnt; bd = d; }
+    }
+    cam.dirX = D[bd][0]; cam.dirY = D[bd][1];
+    cam.planeX = -cam.dirY * 0.66; cam.planeY = cam.dirX * 0.66;
+}
+
+// ── Межэтажные переходы: ЛИФТЫ и ЛЕСТНИЦЫ (по дизасму ZT) ────────────────────
+// Этаж = индекс (cam.floor 0..15); карта = lvl.cellId(floor,...). В ZT: индекс этажа $FF1028,
+// карта $FF7CD6+floor*0x400; FUN_0xb862 (этаж+1 = вниз по зданию)/FUN_0xb800 (этаж-1 = вверх)
+// перезагружают этаж и спавнят его врагов; FUN_0xb8fc грузит этаж D0. Шаг-он диспетчер 0xa1d2.
+// Лифт = одна шахта (x,y) на этажах: celltype «down» 0x33/52/56/5a → этаж+1, «up» 0x32/51/55/59
+// → этаж-1, «up/down» 0x34/53/57/5b → авто по соседнему этажу. Едет, пока след. клетка того же
+// направления (многоэтажный), прибытие на лифт противоположного напр. (down→up). Подтверждено:
+// e1 D5(0x56)→этаж+1 D6(0x55); 99(0x5a)→9A(0x59). Лестница: interst-down 0x16→этаж+1, up 0x15→-1.
+// ТОЧНЫЙ набор клеток ШАХТЫ лифта (НЕ весь диапазон 0x30-0x5b!): направленные кабины (step-on idx3
+// @0xa20a) + стены/площадки шахты. Иначе ловит НЕ-лифтовые клетки в этом диапазоне (оружие 0x36
+// «лазер-винтовка», декор 0x37/0x5c-0x5f, клетки лестниц 0x3c/0x3e/0x3f/0x44/0x46/0x47/0x4c/0x4e/0x4f)
+// → им рисовался синий void (баг «весь фон синий на ячейке оружия»). Лифты idx3: 0x32-34/51-53/55-57/59-5b.
+inline bool rcElevCell(uint8_t ct) {
+    return (ct >= 0x32 && ct <= 0x34) || (ct >= 0x51 && ct <= 0x53) ||
+           (ct >= 0x55 && ct <= 0x57) || (ct >= 0x59 && ct <= 0x5b) ||   // направленные кабины
+           ct == 0x30 || ct == 0x31 || ct == 0x50 || ct == 0x54 || ct == 0x58;  // стены/площадки шахты
+}
+// Целтайп ПЕРВОЙ стена-рендер клетки на пути луча колонны x (упрощённый осевой DDA, без дверей/диагоналей).
+// Нужно рендеру лифта: отличить колонну «стена кабины» (rcElevCell) от «вид на выход» (коридор) для
+// фильмстрип-скролла в faithful-блите (cellRenderWall — из cells.hpp).
+inline uint8_t rcColumnHitCt(const Level& lvl, const Camera& cam, int x, int W, double hs) {
+    double cameraX = (2.0 * x / W - 1.0) / hs;
+    double rayX = cam.dirX + cam.planeX * cameraX;
+    double rayY = cam.dirY + cam.planeY * cameraX;
+    int mapX = (int)cam.px, mapY = (int)cam.py;
+    double dDistX = (rayX == 0) ? 1e30 : std::fabs(1.0 / rayX);
+    double dDistY = (rayY == 0) ? 1e30 : std::fabs(1.0 / rayY);
+    int stepX, stepY; double sideX, sideY;
+    if (rayX < 0) { stepX = -1; sideX = (cam.px - mapX) * dDistX; } else { stepX = 1; sideX = (mapX + 1.0 - cam.px) * dDistX; }
+    if (rayY < 0) { stepY = -1; sideY = (cam.py - mapY) * dDistY; } else { stepY = 1; sideY = (mapY + 1.0 - cam.py) * dDistY; }
+    for (int g = 0; g < 256; ++g) {
+        if (sideX < sideY) { sideX += dDistX; mapX += stepX; } else { sideY += dDistY; mapY += stepY; }
+        if (mapX < 0 || mapY < 0 || mapX >= Level::W || mapY >= Level::H) return 1;
+        uint8_t ct = lvl.cellType(cam.floor, mapX, mapY);
+        if (cellRenderWall(ct)) return ct;
+    }
+    return 1;
+}
+// «Кабина» — направленные клетки шахты (step-on idx3 @0xa3ec, где центрируется игрок). Площадки
+// (area 0x31/50/54/58) и стены (0x30) сюда НЕ входят: сойдя с кабины на площадку, игрок выходит.
+inline bool rcElevCabin(uint8_t ct) {
+    return (ct >= 0x32 && ct <= 0x34) || (ct >= 0x51 && ct <= 0x53) ||
+           (ct >= 0x55 && ct <= 0x57) || (ct >= 0x59 && ct <= 0x5b);
+}
+inline int  rcElevDepart(uint8_t ct) {                 // направление старта поездки (этаж)
+    if (ct == 0x33 || ct == 0x52 || ct == 0x56 || ct == 0x5a) return +1;  // вниз по зданию (floor++)
+    if (ct == 0x32 || ct == 0x51 || ct == 0x55 || ct == 0x59) return -1;  // вверх по зданию (floor--)
+    return 0;
+}
+inline bool rcElevArrival(uint8_t ct, int dir) {       // клетка-прибытие для текущего напр. поездки
+    if (dir > 0) return (ct == 0x32 || ct == 0x51 || ct == 0x55 || ct == 0x59); // ехали вниз → стоп на up
+    else         return (ct == 0x33 || ct == 0x52 || ct == 0x56 || ct == 0x5a);
+}
+// Клетка-переход лестницы (0x17/0x3f/0x47/0x4f): свап по суб-позиции вдоль оси + гистерезис cabin.
+inline void rcStairTrans(Camera& c, double sub, bool needHigh) {
+    bool high = (sub >= 128.0);
+    if (c.cabin != 64.0) {                              // ещё не «вверху» → можно подняться
+        if (needHigh ? high : !high) { c.cabin = 64.0;  if (c.floor > 0)  c.floor--; }   // этаж-1 (вверх)
+    } else {                                            // cabin==64 → можно спуститься
+        if (needHigh ? !high : high) { c.cabin = -64.0; if (c.floor < 15) c.floor++; }   // этаж+1 (вниз)
+    }
+}
+// Вызывать КАЖДЫЙ кадр. enteredNewCell=true в кадре, когда игрок вошёл в новую клетку (x,y).
+// Возвращает true, если движение игрока заблокировано (идёт поездка лифта).
+inline bool rcUpdateTransit(Camera& c, const Level& lvl, bool enteredNewCell) {
+    int cx = (int)c.px, cy = (int)c.py;
+    bool inb = (cx >= 0 && cy >= 0 && cx < Level::W && cy < Level::H);
+    uint8_t ct = inb ? lvl.cellType(c.floor, cx, cy) : 0;
+    double subX = (c.px - cx) * 256.0, subY = (c.py - cy) * 256.0;
+
+    // ── ЛИФТ: поездка в процессе ──
+    if (c.elevState != 0) {
+        int dir = c.elevState;
+        // ВЫХОД на промежуточном этаже: игрок сошёл с КАБИНЫ (на площадку area / в коридор) → стоп.
+        // (Возможно только когда |cabin|<0x18 — у этажа центрирование снято, см. ниже.)
+        if (!rcElevCabin(ct)) {
+            c.elevState = 0;                            // далее cabin сам плавно затухнет до 0
+        } else {
+            // Центрирование кабины ТОЛЬКО в середине перехода (|cabin|>=0x18, как a3ec @0xa3ec):
+            // у этажа игрок свободен и может «выскочить» вперёд (идя вперёд) — лифт медленный.
+            if (c.cabin >= 24.0 || c.cabin <= -24.0) {
+                double fx = c.px - cx, fy = c.py - cy;
+                if (fx < 0.125) c.px = cx + 0.125; else if (fx > 0.871) c.px = cx + 0.871;
+                if (fy < 0.125) c.py = cy + 0.125; else if (fy > 0.871) c.py = cy + 0.871;
+            }
+            if (dir > 0) {                              // вниз по зданию (floor++)
+                c.cabin += 4.0;
+                if (rcElevArrival(ct, dir)) { if (c.cabin >= 0.0) { c.cabin = 0.0; c.elevState = 0; } }
+                else if (c.cabin > 64.0)    { c.cabin = -64.0; if (c.floor < 15) c.floor++; }
+            } else {                                    // вверх по зданию (floor--)
+                c.cabin -= 4.0;
+                if (rcElevArrival(ct, dir)) { if (c.cabin <= 0.0) { c.cabin = 0.0; c.elevState = 0; } }
+                else if (c.cabin < -64.0)   { c.cabin = 64.0;  if (c.floor > 0)  c.floor--; }
+            }
+            c.pitch = -c.cabin;
+            return true;
+        }
+    }
+
+    // ── ЛИФТ: старт по входу в клетку-departure ──
+    int dep = rcElevDepart(ct);
+    if (dep == 0 && (ct == 0x34 || ct == 0x53 || ct == 0x57 || ct == 0x5b)) {  // up/down: по соседу
+        if (c.floor < 15 && rcElevCell(lvl.cellType(c.floor + 1, cx, cy))) dep = +1;
+        else if (c.floor > 0 && rcElevCell(lvl.cellType(c.floor - 1, cx, cy))) dep = -1;
+    }
+    if (dep != 0 && enteredNewCell) {
+        c.elevState = dep; c.cabin = 0.0; c.px = cx + 0.5; c.py = cy + 0.5; c.pitch = 0.0;
+        return true;
+    }
+
+    // ── ЛЕСТНИЦЫ: наклон по суб-позиции + своп на клетке-перехода ──
+    bool onStair = true;
+    switch (ct) {
+        case 0x12: c.cabin = (subY - 255.0) / 4.0; break;   // b612
+        case 0x14: c.cabin = (255.0 - subY) / 4.0; break;   // b664
+        case 0x3c: c.cabin = (-subY) / 4.0;        break;   // b626
+        case 0x3e: c.cabin = ( subY) / 4.0;        break;   // b67a
+        case 0x44: c.cabin = (-subX) / 4.0;        break;   // b638
+        case 0x46: c.cabin = ( subX) / 4.0;        break;   // b68a
+        case 0x4c: c.cabin = (subX - 255.0) / 4.0; break;   // b64a
+        case 0x4e: c.cabin = (255.0 - subX) / 4.0; break;   // b69a
+        case 0x13: case 0x3d: case 0x45: case 0x4d: c.cabin = 0.0; break;  // площадка (b65e)
+        case 0x15: c.cabin = -64.0; break;                  // interstorey-up (b6b0)
+        case 0x16: c.cabin =  64.0; break;                  // interstorey-down (b6b8)
+        case 0x17: rcStairTrans(c, subX, true);  break;     // переход, ось X, high (b6c0)
+        case 0x3f: rcStairTrans(c, subX, false); break;     // переход, ось X, low  (b6ea)
+        case 0x47: rcStairTrans(c, subY, true);  break;     // переход, ось Y, high (b714)
+        case 0x4f: rcStairTrans(c, subY, false); break;     // переход, ось Y, low  (b73e)
+        default:   onStair = false; break;
+    }
+    if (!onStair) {                                          // не на лестнице → питч плавно к 0
+        if (c.cabin > 0.0) { c.cabin -= 4.0; if (c.cabin < 0.0) c.cabin = 0.0; }
+        else if (c.cabin < 0.0) { c.cabin += 4.0; if (c.cabin > 0.0) c.cabin = 0.0; }
+    }
+    c.pitch = -c.cabin;
+    return false;
+}
+
+inline void rcRotate(Camera& c, double a) {
+    double s = std::sin(a), co = std::cos(a);
+    double ox = c.dirX;   c.dirX   = ox * co - c.dirY * s;     c.dirY   = ox * s + c.dirY * co;
+    double op = c.planeX; c.planeX = op * co - c.planeY * s;   c.planeY = op * s + c.planeY * co;
+}
+
+// Точечная проверка движения с УЧЁТОМ диагоналей (game-true, FUN_e1b2 / таблица e23e).
+inline bool rcBlockedPt(const Level& lvl, int floor, double px, double py) {
+    int cx = (int)px, cy = (int)py;
+    if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return true;
+    return cellBlockedAt(lvl.cellType(floor, cx, cy), px - cx, py - cy);
+}
+
+inline void rcMove(Camera& c, const Level& lvl, double dx, double dy, bool noclip = false) {
+    if (noclip) { c.px += dx; c.py += dy; return; }
+    const double r = 0.18;
+    double nx = c.px + dx;
+    if (!rcBlockedPt(lvl, c.floor, nx + (dx > 0 ? r : -r), c.py)) c.px = nx;
+    double ny = c.py + dy;
+    if (!rcBlockedPt(lvl, c.floor, c.px, ny + (dy > 0 ? r : -r))) c.py = ny;
+}
+
+// ── ZT-ФИЗИКА ДВИЖЕНИЯ ИГРОКА (DAB8, collision_move.asm dc3c..dd0c) ──
+// Три значения скорости плавно идут к ЦЕЛИ (ввод): при цель≠0 разгон, при цель=0 — затухание ÷2/кадр.
+//   • Поворот  -$7182 → цель ±16 (ед/512=окружность), разгон ÷8.
+//   • Вперёд   -$717e → цель +40/+45(бег) / −20/−35(назад), разгон ÷16.
+//   • Стрейф   -$717a → цель ±40 (A+Left/Right), разгон ÷16.
+// Присед/нокдаун (питч<0) ХАЛВИТ вперёд+стрейф (asr -$717c/-$7178). Применение через sin/cos.
+namespace ztmove {
+    constexpr double PI2 = 6.28318530717958647692;
+    constexpr double U   = 1.0 / 256.0;          // ZT 8.8 fixed → клетки
+    constexpr double A   = PI2 / 512.0;          // ZT угл.ед. → радианы (512 = окружность)
+    constexpr double FWD = 40 * U, FWD_RUN = 45 * U, BACK = -20 * U, BACK_RUN = -35 * U, STRAFE = 40 * U;
+    constexpr double TURN = 16 * A;              // пиковая цель угл.скорости
+}
+// ZT-ease: цель≠0 → cur += (цель−cur)·accel (разгон); цель=0 → cur ·= 0.5 (затухание/2, инерция выбега).
+inline double ztEase(double cur, double target, double accel) {
+    if (target != 0.0) { cur += (target - cur) * accel; }
+    else { cur *= 0.5; if (cur < 1e-4 && cur > -1e-4) cur = 0.0; }
+    return cur;
+}
+// Полный шаг движения с ИНЕРЦИЕЙ. Явные намерения ввода (уже разрешённые из раскладки клавиш).
+inline void rcMovePhysics(Camera& c, const Level& lvl, bool fwd, bool back, bool strafeL, bool strafeR,
+                          bool turnL, bool turnR, bool runMod, bool halveMove, bool noclip) {
+    using namespace ztmove;
+    double fwdT = 0.0, strafeT = 0.0, turnT = 0.0;
+    if (strafeL) strafeT += STRAFE;                   // влево (+ = вектор «влево» sx)
+    if (strafeR) strafeT -= STRAFE;
+    if (turnL)   turnT   -= TURN;
+    if (turnR)   turnT   += TURN;
+    if (fwd)  fwdT = runMod ? FWD_RUN : FWD;
+    if (back) fwdT = runMod ? BACK_RUN : BACK;        // назад вдвое медленнее вперёда (40 vs 20)
+    if (halveMove) { fwdT *= 0.5; strafeT *= 0.5; }   // присед/нокдаун ÷2
+    c.turnVel   = ztEase(c.turnVel,   turnT,   1.0 / 8.0);   // поворот: разгон ÷8
+    c.fwdVel    = ztEase(c.fwdVel,    fwdT,    1.0 / 16.0);  // вперёд:  разгон ÷16
+    c.strafeVel = ztEase(c.strafeVel, strafeT, 1.0 / 16.0);  // стрейф:  разгон ÷16
+    if (c.turnVel != 0.0) rcRotate(c, c.turnVel);
+    const double sx = c.dirY, sy = -c.dirX;                  // единичный вектор «ВЛЕВО» (исправлено: было -dirY/dirX = вправо)
+    double dx = c.dirX * c.fwdVel + sx * c.strafeVel;
+    double dy = c.dirY * c.fwdVel + sy * c.strafeVel;
+    if (dx != 0.0 || dy != 0.0) rcMove(c, lvl, dx, dy, noclip);
+}
+
+// Дальность видимости по режиму темноты env (0 Bright..4 Black) — клаустрофобный полумрак ZT.
+inline double rcMaxVis(int envMode) {
+    switch (envMode) {
+        case 0: return 13.0; case 1: return 9.0; case 2: return 6.5;
+        case 3: return 12.0; case 4: return 4.0; default: return 10.0;
+    }
+}
+
+// ТОЧНАЯ таблица ZT height→band, извлечена статически из скейлер-таблицы 0x4392 → per-height
+// рутины (0x4766..0x700c), у каждой зашит слот рампы (movea.l (d16,A6),A3). h = высота колонны
+// (= D0 = scale = 0x10000/(forward>>6) = 64/forward). h≥42: рутины CLUT не грузят → банд 0.
+inline int bandForHeight(int h) {
+    if (h >= 38) return 0;
+    if (h >= 34) return 1;
+    if (h >= 30) return 2;
+    if (h >= 26) return 3;
+    if (h >= 22) return 4;
+    if (h >= 16) return 5;
+    if (h >= 10) return 6;
+    return 7;                       // h<10 (далеко) → самый тёмный
+}
+
+// ДАЛЬНОСТЬ ПРОРИСОВКИ (cull): сеттер 0x1d66 ставит -0x714c по env; рендер @0xba60 клампит X/Y-смещение
+// клетки от камеры к [−dist,+dist] (box/Чебышёв) → клетки-стены дальше dist НЕ рисуются (за ними фон/тёмный
+// градиент). env: Bright 16 (≈весь уровень), Dim/Haze/Black 5, No-ceiling 12.
+inline int drawDistForEnv(int env) {
+    switch (env) { case 0: return 16; case 3: return 12; default: return 5; }  // 1/2/4 → 5
+}
+inline int& faDrawDist() { static int v = -1; return v; }   // override дальности (cull); <0 = по env (--drawdist)
+// faStairK() / faStairUni() — в tuning.hpp (общие тюнинги, слайдеры меню)
+
+// ДИАГОНАЛЬ ЛЕСТНИЦЫ (профиль, дровер D0C4): хендлеры стен-лестниц 0x0c-0x11 кладут на каждую грань СЛОВО
+// (L,R)=байт-смещения левого/правого края; дровер сдвигает выборку ТЕКСТУРЫ по вертикали поколоночно
+// (интерполяция L→R по ширине грани × 1/z) → «искажённая по диагонали» текстура на наклонных гранях,
+// обычная на плоских (L==R). Селектор asc/desc = знак -0x6e92 (под-позиция камеры в клетке).
+inline bool isStairProfileCT(uint8_t ct) { return ct >= 0x0c && ct <= 0x11; }
+// НАКЛОН ПИТЧА НА ЛЕСТНИЦЕ (главная механика спуска, дизасм BAEE: -0x71e6 -= -0x6e92). Стоя на клетке-лестницы
+// игра наклоняет камеру по под-позиции в клетке (B4E4 → таблица B51A). Возвращает добавку к питчу (= −V).
+// Формулы V (-0x6e92) per celltype (camXf/camYf = дробь*256, 0..255): спуск-клетки дают плавный переход.
+inline double& stairPitchState() { static double g = 0.0; return g; }      // персистентный -0x6e92 (эволюция)
+inline double& stairEasedPitch()  { static double v = 0.0; return v; }      // СГЛАЖЕННЫЙ питч (лерп к цели ±4/кадр)
+inline double& faStairPitchOverride() { static double v = 1e9; return v; }  // CLI-оверрайд для статик-теста (1e9=выкл)
+// faStairUni() — в tuning.hpp
+inline bool&   faStairOff() { static bool b = false; return b; }            // ДИАГ: отключить спец-обработку лестницы
+inline double stairPitchAdjust(const Level& lvl, int floor, double px, double py) {
+    int cx = (int)px, cy = (int)py;
+    if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return 0.0;
+    uint8_t ct = lvl.cellType(floor, cx, cy);
+    double yf = (py - cy) * 256.0, xf = (px - cx) * 256.0;
+    double& g = stairPitchState();
+    // обновляем персистентный g по celltype (дизасм B612/B664/B65E/B6B0/B6B8/B6C0). 0x17 — ГИСТЕРЕЗИС: держит
+    // предыдущее g, ставит 64 только если xf>=128 (camX_frac<0 как signed). Спуск 0x12/0x14 — плавно по yf.
+    switch (ct) {
+        case 0x12: g = (yf - 255.0) / 4.0;  break;   // спуск (ось Y): -63..0
+        case 0x14: g = (255.0 - yf) / 4.0;  break;   // спуск (ось Y): 0..63
+        case 0x13: g = 0.0;   break;                 // ровно
+        case 0x15: g = -64.0; break;                 // вверх
+        case 0x16: g = 64.0;  break;                 // вниз
+        case 0x17: if (g != 64.0 && xf >= 128.0) g = 64.0;  break;  // держит предыдущее (гистерезис)
+        default:   return 0.0;                       // не лестница → без наклона (g сохраняется)
+    }
+    return g;    // ЦЕЛЬ питча (мгновенная -0x6e92); сглаживание/оверрайд — в renderFaithful
+}
+// Клетки-ШАХТЫ/СПУСКА: их ПОЛ (и потолок-пустота) = синяя пустота пролёта/шахты. Спуск-сегменты 0x12-0x14
+// (наклонный пол лестницы) — синий пол; floor-casting в блите красит их пол/потолок в VOID_BLUE (не барьер-полосы).
+inline bool isShaftFloorCT(uint8_t ct) { return ct >= 0x12 && ct <= 0x14; }
+// Все ПРОХОДИМЫЕ клетки лестницы (спуск 0x12/0x14 + синий 0x13 + ровные смещённые 0x15-0x17): пол ОПУЩЕН.
+inline bool isStairFloorCT(uint8_t ct)   { return ct >= 0x12 && ct <= 0x17; }
+// НИЗКОЕ направление клетки-спуска (открытая грань градиент-сегмента → туда пол УХОДИТ ВНИЗ). {0,0}=не спуск.
+inline void descentLowDir(uint8_t ct, int& ddx, int& ddy) {
+    ddx = 0; ddy = 0;
+    switch (ct) {
+        case 0x12: case 0x14: case 0x55: case 0x56: case 0x57: ddy = 1;  break;  // South
+        case 0x3c: case 0x3e: case 0x59: case 0x5a: case 0x5b: ddy = -1; break;  // North
+        case 0x44: case 0x46: case 0x32: case 0x33: case 0x34: ddx = -1; break;  // West
+        case 0x4c: case 0x4e: case 0x51: case 0x52: case 0x53: ddx = 1;  break;  // East
+    }
+}
+// НАПРАВЛЕНИЕ УГЛУБЛЕНИЯ спуска (куда РАСТЁТ cabin = пол ниже) по celltype слоупа. {0,0}=не слоуп.
+// (по формулам cabin в rcUpdateTransit: 0x14=(255-subY)/4 растёт при y↓ → North, и т.д.)
+inline void descentDeepDir(uint8_t ct, int& ddx, int& ddy) {
+    ddx = 0; ddy = 0;
+    switch (ct) {
+        case 0x14: case 0x3c: ddy = -1; break;   // North (cabin↑ при y↓)
+        case 0x12: case 0x3e: ddy =  1; break;   // South
+        case 0x4e: case 0x44: ddx = -1; break;   // West
+        case 0x4c: case 0x46: ddx =  1; break;   // East
+    }
+}
+// Направление углубления СЕКЦИИ возле (cx,cy): берём слоуп-клетку рядом (сама/сосед). false=не нашли.
+inline bool stairSectionDeepDir(const Level& lvl, int floor, int cx, int cy, int& ddx, int& ddy) {
+    auto chk = [&](int x, int y) -> bool {
+        if (x < 0 || y < 0 || x >= Level::W || y >= Level::H) return false;
+        descentDeepDir(lvl.cellType(floor, x, y), ddx, ddy);
+        return (ddx || ddy);
+    };
+    if (chk(cx, cy)) return true;
+    for (int r = 1; r <= 2; ++r)
+        for (int dy = -r; dy <= r; ++dy) for (int dx = -r; dx <= r; ++dx)
+            if ((dx || dy) && chk(cx + dx, cy + dy)) return true;
+    return false;
+}
+// КАРТА ВЫСОТ ПОЛА ЛЕСТНИЦЫ (целое: больше = выше пол): уровни клеток через пропагацию по спускам. Клетка-спуск
+// роняет пол на 1 в свою низкую сторону (по descentLowDir). Лестница часто ЗАМКНУТА стенами (вход = спуск с
+// уровня выше) — поэтому НЕ ищем «обычный пол», а распространяем относительные уровни от любой клетки.
+inline void buildStairHeightMap(const Level& lvl, int floor, std::vector<int>& ht) {
+    const int W = Level::W, H = Level::H;
+    const int UNSET = -100000;
+    ht.assign((size_t)W * H, 0);
+    std::vector<int> level((size_t)W * H, UNSET), q;
+    const int dx[4] = {1, -1, 0, 0}, dy[4] = {0, 0, 1, -1};
+    auto isS = [&](int x, int y) { return x >= 0 && y >= 0 && x < W && y < H && isStairFloorCT(lvl.cellType(floor, x, y)); };
+    for (int sy = 0; sy < H; ++sy) for (int sx = 0; sx < W; ++sx) {
+        if (!isS(sx, sy) || level[(size_t)sy * W + sx] != UNSET) continue;
+        level[(size_t)sy * W + sx] = 0; q.clear(); q.push_back(sy * W + sx);   // новая компонента
+        for (size_t i = 0; i < q.size(); ++i) {
+            int c = q[i], cx = c % W, cy = c / W;
+            int adx, ady; descentLowDir(lvl.cellType(floor, cx, cy), adx, ady);
+            for (int d = 0; d < 4; ++d) { int nx = cx + dx[d], ny = cy + dy[d];
+                if (!isS(nx, ny) || level[(size_t)ny * W + nx] != UNSET) continue;
+                int bdx, bdy; descentLowDir(lvl.cellType(floor, nx, ny), bdx, bdy);
+                int dl = 0;                                            // разница уровня A(c)→B(n)
+                if ((adx || ady) && dx[d] == adx && dy[d] == ady) dl = -1;          // B — низкая сторона A
+                if ((bdx || bdy) && dx[d] == -bdx && dy[d] == -bdy) dl += 1;        // A — низкая сторона B
+                level[(size_t)ny * W + nx] = level[c] + dl;
+                q.push_back(ny * W + nx);
+            }
+        }
+    }
+    for (size_t i = 0; i < (size_t)W * H; ++i) ht[i] = (level[i] == UNSET) ? 0 : level[i];
+}
+// (L,R) байты профиля для МОЕЙ грани (0=N,1=W,2=E,3=S). Грань→d3→слово: N=d3:4=LW1hi, S=d3:5=LW1lo,
+// W=d3:2=LW2hi, E=d3:3=LW2lo (по геометрии рёбер растеризатора C6E0). Возвращает 0 если нет профиля.
+inline uint16_t stairProfileWord(uint8_t ct, int myface, bool desc) {
+    if (!isStairProfileCT(ct)) return 0;
+    static const uint32_t T[6][4] = {   // [asc-LW1, asc-LW2, desc-LW1, desc-LW2] по celltype 0x0c..0x11
+        {0x40407F7Fu, 0x7F40407Fu, 0xC0C00000u, 0x00C0C000u}, // 0c
+        {0x40404040u, 0x40404040u, 0xC0C0C0C0u, 0xC0C0C0C0u}, // 0d
+        {0x40404040u, 0x40404040u, 0xC0C0C0C0u, 0xC0C0C0C0u}, // 0e
+        {0x40404040u, 0x40404040u, 0xC0C0C0C0u, 0xC0C0C0C0u}, // 0f
+        {0x40400000u, 0x00404000u, 0xC0C08080u, 0x80C0C080u}, // 10
+        {0x40407F00u, 0x0040407Fu, 0xC0C00080u, 0x80C0C000u}, // 11
+    };
+    const uint32_t* p = T[ct - 0x0c];
+    uint32_t lw1 = desc ? p[2] : p[0];
+    uint32_t lw2 = desc ? p[3] : p[1];
+    switch (myface) {
+        case 0: return (uint16_t)(lw1 >> 16);     // N
+        case 3: return (uint16_t)(lw1 & 0xFFFF);  // S
+        case 1: return (uint16_t)(lw2 >> 16);     // W
+        case 2: return (uint16_t)(lw2 & 0xFFFF);  // E
+    }
+    return 0;
+}
+
+// ОТЛОЖЕННЫЙ СЕГМЕНТ ПОЛ/ПОТОЛКА ЛИФТА/ЛЕСТНИЦЫ (по дизасму FUN_9226 хендлеры → FUN_9d42/9d4a → FUN_9d72).
+// Спец-клетка добавляет сегмент на РЕБРО, обращённое к камере: 9d42 = ГРАДИЕНТ (направленные клетки шахты),
+// 9d4a = СИНИЙ idx1 (площадки/вход/area; источник 0xd074 = сплошной idx1). Ребро рисуется поверх стен →
+// иллюзия пол/потолок шахты. Геометрия извлечена из всех ~30 хендлеров (axis+знак → ближнее ребро).
+// Возвращает 1=синий, 2=градиент, 0=нет. Ребро (целочисл. углы клетки) в ex0,ey0..ex1,ey1.
+inline int shaftSeg(uint8_t ct, int cx, int cy, int camCX, int camCY,
+                    int& ex0, int& ey0, int& ex1, int& ey1) {
+    int edge = -1, type = 0;     // edge: 0=N(y=cy) 1=S(y=cy+1) 2=W(x=cx) 3=E(x=cx+1)
+    switch (ct) {
+        // ГРАДИЕНТ (9d42) — направленные клетки шахты лифта/лестницы
+        case 0x12: case 0x14: case 0x55: case 0x56: case 0x57: edge = 1; type = 2; break; // South
+        case 0x3c: case 0x3e: case 0x59: case 0x5a: case 0x5b: edge = 0; type = 2; break; // North
+        case 0x44: case 0x46: case 0x32: case 0x33: case 0x34: edge = 2; type = 2; break; // West
+        case 0x4c: case 0x4e: case 0x51: case 0x52: case 0x53: edge = 3; type = 2; break; // East
+        // СИНИЙ (9d4a) — площадки/вход (area/landing)
+        case 0x3d: case 0x58: edge = 1; type = 1; break; // South
+        case 0x13: case 0x54: edge = 0; type = 1; break; // North
+        case 0x45: case 0x31: edge = 3; type = 1; break; // East
+        case 0x4d: case 0x50: edge = 2; type = 1; break; // West
+        default: return 0;
+    }
+    int dx = cx - camCX, dy = cy - camCY;          // ребро рисуется, только если ОБРАЩЕНО к камере (near-edge)
+    if (edge == 0 && !(dy > 0)) return 0;          // North-ребро видно, если клетка южнее камеры
+    if (edge == 1 && !(dy < 0)) return 0;          // South — клетка севернее
+    if (edge == 2 && !(dx > 0)) return 0;          // West — клетка восточнее
+    if (edge == 3 && !(dx < 0)) return 0;          // East — клетка западнее
+    if      (edge == 0) { ex0 = cx;     ey0 = cy;     ex1 = cx + 1; ey1 = cy; }
+    else if (edge == 1) { ex0 = cx;     ey0 = cy + 1; ex1 = cx + 1; ey1 = cy + 1; }
+    else if (edge == 2) { ex0 = cx;     ey0 = cy;     ex1 = cx;     ey1 = cy + 1; }
+    else                { ex0 = cx + 1; ey0 = cy;     ex1 = cx + 1; ey1 = cy + 1; }
+    return type;
+}
+
+// Рампы затенения ZT (CLUT): сеттер 0x1d66 ставит 8 таблиц-рамп по 256 б (ремап упакованного
+// байта-текселя). Дальние банды ремапят индексы → 15 (чёрный). hi/lo нибблы байта затеняются
+// по-разному → горизонтальный ДИЗЕРИНГ. Режим Haze (env 2) — свой набор 0x3b92.., прочие — 0x3392..
+struct ShadeRamps {
+    uint8_t lo[8][16], hi[8][16];   // [банд][индекс] -> затенённый индекс (lo/hi для дизеринга)
+    int env = -1;
+    // base = регион рамп (копия ROM с 0x3392): MAIN[b] = base + b*0x100; HAZE[b] = base + 0x800 + b*0x100.
+    void build(const uint8_t* base, int envMode) {
+        if (envMode == env || !base) return;
+        env = envMode;
+        size_t setBase = (envMode == 2) ? 0x800 : 0x0;     // Haze (env2) → HAZE-набор
+        for (int b = 0; b < 8; ++b)
+            for (int p = 0; p < 16; ++p) {
+                uint8_t byte = base[setBase + (size_t)b * 0x100 + ((p << 4) | p)];
+                hi[b][p] = byte >> 4; lo[b][p] = byte & 0x0F;
+            }
+    }
+    // финальный индекс палитры для текселя idx на банде band, дизер по чётности тексель-X.
+    // doShade=false (Bright) — без рампы (сырой индекс, полная яркость).
+    inline uint8_t map(uint8_t idx, int band, bool hiNib, bool doShade) const {
+        if (!doShade) return idx;
+        return hiNib ? hi[band][idx] : lo[band][idx];
+    }
+};
+
+// ── ПОЛ/ПОТОЛОК = ОТДЕЛЬНЫЙ СЛОЙ ZT (разобрано по дизасму, НЕ скейлер) ─────────
+// Дизасм: пол/потолок рисует НЕ колоночный скейлер стен, а предрассчитанный буфер ($FF6226/$FF6276),
+// который рутина d202 копирует в кадр ПО ЭКРАННОЙ СТРОКЕ (потолок сверху d2d6, пол снизу d342/d40a),
+// а стена накладывается поверх (occlusion по z-буферу $FF6126). Буфер строится из ШАБЛОНА @-0x7152
+// (сеттер 0x1d66, свой на каждый env) рутиной d4a6 (вертикальный скролл по питчу).
+// Шаблон = 0xA0 байт = ДВА вертикальных паттерна по 80 строк (нечёт/чёт нативная колонка → гориз.
+// дизер); байт = 2 пикселя 4bpp (hi-ниббл = левый px, lo = правый). Затенение вдаль ЗАПЕЧЕНО в данные
+// (индекс 15 = чёрный у горизонта на тёмных env), НЕ применяется рантайм-рампа. Индекс 0 = ПРОЗРАЧНЫЙ
+// (виден фон-панорама; так env3 NoCeil = открытое небо). Палитра — общая со стенами (0x20F2):
+// потолок idx3→2→1 (сине-серый), пол idx8→9→b (красно-коричневый) — сверено с палитрой и сэмплами кадров.
+// Из шаблона env извлекаем ПЛАВНЫЙ градиент: на каждую из 80 строк — 2 индекса (по ЯРКОСТИ палитры:
+// lo тёмный / hi светлый) и доля светлого hiFrac (0..1) из 4 семплов строки [evenHi,evenLo,oddHi,oddLo].
+// Это разделяет «градиент» (плавный) и «дизер» (наш, тонкий, на экранном res) — иначе двойной дизер
+// (наш поверх запечённого) даёт муар, а нативный 1px-дизер при апскейле — толстые полосы.
+struct FloorCeil {
+    int env = -1;
+    bool ok = false;
+    const uint8_t* tpl = nullptr;              // СЫРОЙ шаблон env (0xA0): [0..0x4f] нечёт-кол, [0x50..0x9f] чёт
+    uint8_t loIdx[80] = {}, hiIdx[80] = {};   // индексы палитры по строке (lo=тёмный, hi=светлый)
+    uint8_t hiCnt[80] = {};                    // 0..4 — сколько из 4 семплов = hiIdx (доля яркого)
+    void build(const uint8_t* fcBase, const Palette& pal, int envMode) {
+        if (envMode == env) return;
+        env = envMode;
+        tpl = fcBase ? fcBase + (size_t)(envMode & 7) * 0xA0 : nullptr;
+        ok = (tpl != nullptr);
+        if (!ok) return;
+        auto luma = [&](int idx) { uint32_t c = pal.c[idx & 0xF];
+            return (int)(((c >> 16) & 0xFF) * 30 + ((c >> 8) & 0xFF) * 59 + (c & 0xFF) * 11); };
+        for (int r = 0; r < 80; ++r) {
+            uint8_t s[4] = { (uint8_t)(tpl[0x50 + r] >> 4), (uint8_t)(tpl[0x50 + r] & 0xF),
+                             (uint8_t)(tpl[r] >> 4),        (uint8_t)(tpl[r] & 0xF) };
+            int lo = s[0], hi = s[0];
+            for (int k = 1; k < 4; ++k) { if (luma(s[k]) < luma(lo)) lo = s[k]; if (luma(s[k]) > luma(hi)) hi = s[k]; }
+            int cnt = 0; for (int k = 0; k < 4; ++k) if (s[k] == hi) cnt++;
+            loIdx[r] = (uint8_t)lo; hiIdx[r] = (uint8_t)hi; hiCnt[r] = (uint8_t)((lo == hi) ? 4 : cnt);
+        }
+    }
+};
+
+// Индекс палитры пол/потолок для ЭКРАННОГО пикселя (x,y), высота вида H, горизонт на строке horizon.
+// Возвращает 0..15; вызывающий: idx==0 → прозрачный (sentinel/панорама).
+//
+// ВАЖНО (по дизасму d2d6/d40a): нативный вид ZT = 80 СКАНЛАЙНОВ, дизер шаблона = 1px (per-scanline по
+// вертикали + 2 нибблы/2 паттерна по горизонтали). При фуллскрин-апскейле (80→H≈640, ×8) прямой сэмпл
+// шаблона дал бы ТОЛСТЫЕ 8px-полосы. Поэтому: ГРАДИЕНТ берём из строки шаблона (по экранному y), а САМ
+// ДИЗЕР накладываем на ЭКРАННОМ разрешении (тонкий, ~1px) — верт. смесь соседних строк шаблона по
+// чётности экранной строки + горизонт. 4px-цикл по 4 семплам [evenHi,evenLo,oddHi,oddLo] со сдвигом-
+// шахматкой на нечёт. строке. Так вид совпадает с оригиналом (мелкий дизер), а не «лесенка из полос».
+inline int fcIndexZT(const FloorCeil& fc, int x, int y, int horizon, int H, int /*coordW*/) {
+    if (!fc.ok || H < 1) return 0;
+    // float позиция в градиенте шаблона (0..79, горизонт=40)
+    double fr;
+    if (y < horizon) fr = (horizon > 0) ? (double)y * 40.0 / horizon : 0.0;
+    else             fr = 40.0 + (double)(y - horizon) * 40.0 / ((H - horizon) > 0 ? (H - horizon) : 1);
+    int r0 = (int)fr; if (r0 < 0) r0 = 0; if (r0 > 79) r0 = 79;
+    int r1 = r0 + 1;  if (r1 > 79) r1 = 79;
+    double t = fr - (int)fr;
+    int lo = fc.loIdx[r0], hi = fc.hiIdx[r0];
+    double frac;                                   // доля яркого (hi), сглаженная между строками
+    if (fc.loIdx[r1] == lo && fc.hiIdx[r1] == hi)  // та же пара → плавная интерполяция доли
+        frac = (fc.hiCnt[r0] + (fc.hiCnt[r1] - fc.hiCnt[r0]) * t) / 4.0;
+    else { int r = (t < 0.5) ? r0 : r1; lo = fc.loIdx[r]; hi = fc.hiIdx[r]; frac = fc.hiCnt[r] / 4.0; }
+    // ЧИСТЫЙ упорядоченный дизер Bayer 4×4 на ЭКРАННОМ разрешении (тонкий ~1px) между lo и hi по доле
+    static const int B4[4][4] = {{0,8,2,10},{12,4,14,6},{3,11,1,9},{15,7,13,5}};
+    double thr = (B4[y & 3][x & 3] + 0.5) / 16.0;
+    return (thr < frac) ? hi : lo;
+}
+
+// Цвет пол/потолок. idx 0 → прозрачный (0x00000000 sentinel: блит подставит панораму/синий).
+inline uint32_t floorCeilColor(const Palette& pal, const FloorCeil& fc,
+                               int x, int y, int horizon, int H, int coordW) {
+    int idx = fcIndexZT(fc, x, y, horizon, H, coordW);
+    if (idx == 0) return 0x00000000u;
+    return pal.c[idx & 0x0F];
+}
+
+// ТОЧНАЯ выборка шаблона (БИТ-В-БИТ ZT, БЕЗ Bayer-реконструкции) на НАТИВНОЙ сетке 256×80 — для FAITHFUL.
+// Дизасм d4a6/d202: буфер колонки индексируется ПРЯМО по сканлайну вида (ny = строка буфера, pitch=0),
+// горизонт = строка 40; гориз. — нативная 2px-колонка (байт) с выбором паттерна нечёт/чёт + 2 нибблы.
+// nx∈0..255 (нативный пиксель вида 256 шир.), ny∈0..79 (сканлайн). Паттерн период 4px (повторяется),
+// magnitude c не важна — только c&1 (чёт/нечёт колонка) и nx&1 (ниббл). Кламп nx до 255 (НЕ 127!).
+inline int fcIndexExact(const FloorCeil& fc, int nx, int ny) {
+    if (!fc.ok) return 0;
+    if (nx < 0) nx = 0; if (nx > 255) nx = 255;
+    if (ny < 0) ny = 0; if (ny > 79)  ny = 79;
+    int c = nx >> 1;                                          // нативная 2px-колонка (байт)
+    const uint8_t* pat = (c & 1) ? fc.tpl : (fc.tpl + 0x50);  // нечёт-кол → база, чёт → +0x50 (как ccb6)
+    uint8_t byte = pat[ny];
+    return (nx & 1) ? (byte & 0x0F) : (byte >> 4);            // hi-ниббл = левый px (чёт nx), lo = правый
+}
+inline uint32_t floorCeilColorExact(const Palette& pal, const FloorCeil& fc, int nx, int ny) {
+    int idx = fcIndexExact(fc, nx, ny);
+    if (idx == 0) return 0x00000000u;
+    return pal.c[idx & 0x0F];
+}
+
+// ── РЕНДЕР ДЕКОРА-БИЛБОРДОВ (точно как блиттер ZT eda0 + хендлеры) ──────────────
+// Рисуется ПОСЛЕ стен в «экранном пространстве» рендера (нат-буфер faithful или фреймбуфер DDA).
+// Билборд — экранный прямоугольник в центре клетки по X (как eda0: верх на screenY, вниз на высоту),
+// z-тест против стен ПО КОЛОНКЕ, прозрачный индекс 0, затенение рампами по банду дистанции.
+// Размеры — ТОЧНЫЕ доли S (высота клетки на дистанции) из дизасм-хендлеров (DecorDef в восьмых).
+// Ширину берём из ПРОЕКЦИИ ширины клетки `cellW=sx(0.5)−sx(−0.5)` (×wFrac) — это автоматически
+// учитывает FOV/растяжку каждого режима (faithful-фуллскрин, референс 256, DDA с hs). Обобщён лямбдами:
+//   put(x,y,argb) · wallCloser(x,fObj)→скрыт ли за стеной · sx(f,l)→screenX · colH(f)→высота клетки.
+template <typename Put, typename WallCloser, typename SX, typename ColH>
+inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& cam,
+                                const WallBank& obj, const Palette& wallPal,
+                                const ShadeRamps& ramps, bool doShade, int drawDist,
+                                Put put, WallCloser wallCloser, SX sx, ColH colH) {
+    const int ccx = (int)cam.px, ccy = (int)cam.py;
+    struct Item { double f, l; DecorDef d; bool square = false; int sprId = -1; uint8_t efr = 0; bool corpse = false; float zlift = 0; uint8_t dir = 0, animSt = 0, variant = 0; bool foam = false; bool burned = false; };  // враг: zlift; dir/animSt; foam пена; burned обугл.
+    std::vector<Item> items;
+    for (int y = ccy - drawDist; y <= ccy + drawDist; ++y) {
+        if (y < 0 || y >= Level::H) continue;
+        for (int x = ccx - drawDist; x <= ccx + drawDist; ++x) {
+            if (x < 0 || x >= Level::W) continue;
+            uint8_t ct = lvl.cellType(cam.floor, x, y);
+            DecorDef dd;
+            if (!decorForCt(ct, dd)) {                        // не декор → может быть пикап оружия/предмета
+                if (!itemBillboardForCt(ct, dd)) continue;
+                if (pickupHiddenFn() && pickupHiddenFn()(cam.floor, x, y)) continue;  // уже подобран
+            }
+            double rx = (x + 0.5) - cam.px, ry = (y + 0.5) - cam.py;
+            double f = rx * cam.dirX + ry * cam.dirY;          // forward (как faProject)
+            if (f < 0.05) continue;                            // позади камеры / слишком близко
+            double l = ry * cam.dirX - rx * cam.dirY;          // lateral
+            items.push_back({f, l, dd});
+        }
+    }
+    // Динамические эффекты стрельбы (взрывы/снаряды): мировые позиции → билборды того же прохода.
+    for (const WorldFx& fx : worldFx()) {
+        if (fx.floor != cam.floor) continue;
+        double rx = fx.wx - cam.px, ry = fx.wy - cam.py;
+        double f = rx * cam.dirX + ry * cam.dirY;
+        if (f < 0.05) continue;
+        double l = ry * cam.dirX - rx * cam.dirY;
+        DecorDef d = {{{fx.tile, fx.topOff16, fx.hFrac16, fx.wFrac16, 0}}, 1};
+        items.push_back({f, l, d, true, fx.sprId, fx.efr, fx.corpse, fx.zlift, fx.dir, fx.animSt, fx.variant, fx.foam, fx.burned});   // эффекты/враги/пена/обугл.
+    }
+    // painter's: дальние раньше, ближние поверх (z-тест только против стен)
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.f > b.f; });
+
+    const double horizon = SH * 0.5;
+    const int frame = decorFrame();
+    uint8_t tile[32 * 32];
+    for (const auto& it : items) {
+        const double f = it.f, l = it.l;
+        const double S  = colH(f);                              // высота клетки (полной стены) на дистанции
+        double cw = sx(f, 0.5) - sx(f, -0.5);  if (cw < 0) cw = -cw;   // ширина клетки на таргете
+        const double cx = sx(f, l);                             // центр билборда по X
+        const int band = doShade ? bandForHeight((int)(64.0 / f)) : 0;  // тот же банд, что у стены на f
+        // ПЕНА ОГНЕТУШИТЕЛЯ: ФОРМА декор-тайла 0 (как ZT draw 0x14272), но огненные индексы РЕМАПЛЮ в сине-белую пену
+        // (ZT рисует тот же тайл палитра-линией 0x20d2 = голубой, а не 0x20f2 = огонь). Размер квадрат wFrac·S/16.
+        if (it.foam) {
+            double width = it.d.s[0].wFrac16 * 0.0625 * S, height = it.d.s[0].hFrac16 * 0.0625 * S;
+            if (width < 0.5 || height < 0.5) continue;
+            double topY = horizon + it.d.s[0].topOff16 * 0.0625 * S, xa = cx - width * 0.5;
+            int ix0 = (int)std::ceil(xa), ix1 = (int)std::floor(cx + width * 0.5);
+            int iy0 = (int)std::ceil(topY), iy1 = (int)std::floor(topY + height) - 1;
+            if (ix1 < 0 || ix0 > SW - 1 || iy1 < 0 || iy0 > SH - 1) continue;
+            if (ix0 < 0) ix0 = 0; if (ix1 > SW - 1) ix1 = SW - 1; if (iy0 < 0) iy0 = 0; if (iy1 > SH - 1) iy1 = SH - 1;
+            obj.decode(it.d.s[0].tile, tile);                            // форма тайла 0
+            for (int ix = ix0; ix <= ix1; ++ix) {
+                if (wallCloser(ix, f)) continue;
+                int su = (int)((ix + 0.5 - xa) / width * 32.0); if (su < 0) su = 0; if (su > 31) su = 31;
+                for (int iy = iy0; iy <= iy1; ++iy) {
+                    int sv = (int)((iy + 0.5 - topY) / height * 32.0); if (sv < 0) sv = 0; if (sv > 31) sv = 31;
+                    uint8_t idx = tile[sv * 32 + su]; if (!idx) continue;
+                    uint32_t fc = (idx == 12 || idx == 13 || idx == 10) ? 0xFFF0F4FFu      // ярко → почти белая пена
+                                : (idx == 11 || idx == 9)               ? 0xFFB4CCF0u      // средне → светло-голубая
+                                                                        : 0xFF6890C8u;     // тёмно → голубая
+                    put(ix, iy, fc);
+                }
+            }
+            continue;
+        }
+        // РЕАЛЬНЫЙ СПРАЙТ ВРАГА (ARGB-дерево). Размер по ZT-формуле (eda0/0x1BCAA): ширина=drawW·S/32,
+        // высота=drawH·S/16 (S = высота стены = мастер-скейл). Кадр ходьбы efr; corpse = лежит на полу.
+        if (it.sprId >= 0 && it.sprId < 16 && g_enemyAnim[it.sprId].ok) {
+            // FH вар2: при variant==1 и наличии АЛЬТ-БАНКА (другая модель, напр. коммандо) берём ЕГО целиком
+            EnemyAnimSet& A = (it.variant && g_enemyAnimVar2[it.sprId].ok) ? g_enemyAnimVar2[it.sprId] : g_enemyAnim[it.sprId];
+            // ВЫБОР АНИМАЦИИ: 0=ходьба (по направлению dir), 1=стрельба/удар, 2=стаггер, 3=смерть, 4=лазанье по стене. Фолбэк → ходьба.
+            std::vector<EnemySprite>* lst = &A.walk[it.dir < (uint8_t)A.walkDirs ? it.dir : 0];
+            // Hydaca потолок: при variant==1 и наличии walkB (тот же банк) используем второй набор ходьбы
+            if (it.variant && A.hasVariant && it.animSt == 0) {
+                uint8_t bd = it.dir < (uint8_t)A.walkBDirs ? it.dir : 0;
+                if (!A.walkB[bd].empty()) lst = &A.walkB[bd];
+            }
+            if (it.animSt == 1 && !A.fire.empty())  lst = &A.fire;
+            else if (it.animSt == 2 && !A.hit.empty())   lst = &A.hit;
+            else if (it.animSt == 3 && !A.death.empty()) lst = &A.death;
+            else if (it.animSt == 4 && !A.climb.empty()) lst = &A.climb;   // Hydaca: вертикальный спрайт на стене
+            auto& frames = *lst;
+            if (frames.empty()) continue;
+            const EnemySprite& es = frames[it.efr < frames.size() ? it.efr : 0];
+            if (!es.ok) continue;
+            // РАЗМЕР ПО ТАЙЛ-СЕТКЕ спрайта (ИСПРАВЛЕН аспект): real px = Wтайл·32 × Hтайл·32 = es.w × es.h →
+            // экранные W/H пропорц. РЕАЛЬНЫМ пикселям, единый скейл K (0.375·S держит гуманоида 1×2 на ~0.75·S).
+            // Пёс (1×1=32×32)=КВАДРАТ низкий, Hydaca (2×1=64×32)=ШИРОКАЯ низкая, боссы (2×2) крупнее. (Был баг:
+            // drawW/drawH≈равны + формула 16/8 делала ВСЕХ вытянутыми 1:2 → пёс/Hydaca выглядели длинными.)
+            double K = 0.375 * S;
+            double height = (es.h / 32.0) * K, width = (es.w / 32.0) * K;
+            if (it.corpse) { height *= 0.42; width *= 1.25; }            // труп: сплющен в кучу на полу
+            double bottomY = horizon + S * 0.5 - it.zlift * S * 0.9;     // ноги на полу; zlift>0 = поднят к потолку (Hydaca «на стене/потолке»)
+            double topY = bottomY - height;
+            double xa = cx - width * 0.5;
+            int ix0 = (int)std::ceil(xa), ix1 = (int)std::floor(cx + width * 0.5);
+            int iy0 = (int)std::ceil(topY), iy1 = (int)std::floor(bottomY) - 1;
+            if (ix1 < 0 || ix0 > SW - 1 || iy1 < 0 || iy0 > SH - 1 || width < 0.5 || height < 0.5) continue;
+            if (ix0 < 0) ix0 = 0; if (ix1 > SW - 1) ix1 = SW - 1; if (iy0 < 0) iy0 = 0; if (iy1 > SH - 1) iy1 = SH - 1;
+            double fdim = (band > 0) ? (1.0 - band * 0.07) : 1.0; if (fdim < 0.4) fdim = 0.4;
+            for (int ix = ix0; ix <= ix1; ++ix) {
+                if (wallCloser(ix, f)) continue;
+                int su = (int)((ix + 0.5 - xa) / width * es.w); if (su < 0) su = 0; if (su >= es.w) su = es.w - 1;
+                for (int iy = iy0; iy <= iy1; ++iy) {
+                    int sv = (int)((iy + 0.5 - topY) / height * es.h); if (sv < 0) sv = 0; if (sv >= es.h) sv = es.h - 1;
+                    uint32_t c = es.argb[(size_t)sv * es.w + su];
+                    if (c == 0) continue;
+                    if (it.burned) {                                     // ОБУГЛЕННЫЙ труп: тёмно-серый силуэт с лёгким угольным красным
+                        int g = ((((c>>16)&0xFF)+((c>>8)&0xFF)+(c&0xFF))/3) / 4 + 12;
+                        c = 0xFF000000u | ((g+8)<<16) | (g<<8) | g;
+                    } else if (fdim < 1.0) { int r=(c>>16)&0xFF,g=(c>>8)&0xFF,b=c&0xFF;
+                        c = 0xFF000000u | ((int)(r*fdim)<<16) | ((int)(g*fdim)<<8) | (int)(b*fdim); }
+                    put(ix, iy, c);
+                }
+            }
+            continue;                                                    // спрайт врага нарисован
+        }
+        for (int si = 0; si < it.d.count; ++si) {
+            const DecorSprite& sp = it.d.s[si];
+            uint8_t tnum = sp.tile; bool hflip = false;
+            if (sp.anim == 1) {                                       // вентилятор: 4 кадра (tile/tile+1 ± hflip)
+                int ph = (frame >> 3) & 3;
+                if (ph == 1 || ph == 2) tnum = sp.tile + 1;
+                hflip = (ph == 2 || ph == 3);
+            } else if (sp.anim == 2) {                                // мигание: alt = tile−4
+                if ((frame >> 4) & 1) tnum = (uint8_t)(sp.tile - 4);
+            }
+            const double height = sp.hFrac16 * 0.0625 * S;           // высота (доля S, 1/16)
+            // ширина: декор — доля ширины КЛЕТКИ (cw, мир-аспект); эффекты/враги — КВАДРАТ от S (не растянуто).
+            const double width  = sp.wFrac16 * 0.0625 * (it.square ? S : cw);
+            const double topY   = horizon + sp.topOff16 * 0.0625 * S;     // верх (отн. горизонта)
+            if (width < 0.5 || height < 0.5) continue;
+            const double xa = cx - width * 0.5;
+            int ix0 = (int)std::ceil(xa), ix1 = (int)std::floor(cx + width * 0.5);
+            int iy0 = (int)std::ceil(topY), iy1 = (int)std::floor(topY + height) - 1;
+            if (ix1 < 0 || ix0 > SW - 1 || iy1 < 0 || iy0 > SH - 1) continue;
+            if (ix0 < 0) ix0 = 0; if (ix1 > SW - 1) ix1 = SW - 1;
+            if (iy0 < 0) iy0 = 0; if (iy1 > SH - 1) iy1 = SH - 1;
+            obj.decode(tnum, tile);
+            for (int ix = ix0; ix <= ix1; ++ix) {
+                if (wallCloser(ix, f)) continue;                      // за стеной
+                int su = (int)((ix + 0.5 - xa) / width * 32.0);  if (su < 0) su = 0; if (su > 31) su = 31;
+                if (hflip) su = 31 - su;
+                const bool hiNib = !(ix & 1);
+                for (int iy = iy0; iy <= iy1; ++iy) {
+                    int sv = (int)((iy + 0.5 - topY) / height * 32.0);  if (sv < 0) sv = 0; if (sv > 31) sv = 31;
+                    uint8_t idx = tile[sv * 32 + su];
+                    if (idx == 0) continue;                           // прозрачный (MD цвет 0)
+                    put(ix, iy, wallPal.c[ramps.map(idx, band, hiNib, doShade)]);
+                }
+            }
+        }
+    }
+}
+
+// Рендер кадра вида от первого лица. put(x,y,argb); zbuf[x] = глубина колонки.
+template <typename PutFn>
+void renderFPS(PutFn&& put, int W, int H, const Level& lvl, const Palette& wallPal,
+               MetaCache& meta, const Camera& cam, std::vector<double>& zbuf, int envMode) {
+    zbuf.assign(W, 1e9);
+    const bool   openTop = (envMode == 3);
+    // PITCH = ВЫСОТА ГЛАЗА (не наклон! dead_ends #5/#8: наклона камеры в ZT НЕТ). Равномерный вертикальный
+    // сдвиг ВСЕГО вида (стены+пол+потолок вместе через общий horizon), без перспективного наклона колонн.
+    // Лестница/нокбэк/прыжок/присед → горизонт плывёт вверх/вниз. Лифт (elevState≠0) — своя ветка, не трогаем.
+    const int    pitchPx = (cam.elevState != 0) ? 0 : (int)cam.pitch;
+    const int    horizon = H / 2 + pitchPx;
+    const bool   doShade = (envMode != 0);      // env0 Bright — рампы не ставит (полная яркость)
+    static ShadeRamps ramps; ramps.build(meta.shadeRampData, envMode);
+    static FloorCeil fc; fc.build(meta.fcTemplateData, wallPal, envMode);  // слой пол/потолок (ROM-шаблон по env)
+
+    const double hs = faHStretch();             // гор. растяжка: ýже FOV → шире стены
+    // ДАЛЬНОСТЬ ПРОРИСОВКИ (cull @0xba60): box ±dist от камеры; стены дальше → фон/градиент.
+    const int camCXd = (int)cam.px, camCYd = (int)cam.py;
+    const int ddist = (faDrawDist() > 0) ? faDrawDist() : drawDistForEnv(envMode);
+    const Panorama* bgF = activeBg();
+    const bool skyF = (openTop && bgF && bgF->valid());
+    auto colBackdrop = [&](int x_) {            // весь столбец = пол/потолок/панорама (нет стены)
+        for (int y = 0; y < H; ++y) {
+            bool ceil = (y < horizon);
+            uint32_t c = (skyF && ceil)
+                ? bgSample(*bgF, cam.dirX, cam.dirY, cam.floor, cam.cabin, x_, W, y, horizon)
+                : floorCeilColor(wallPal, fc, x_, y, horizon, H, W);
+            if ((c & 0xFF000000u) == 0)
+                c = (bgF && bgF->valid()) ? bgSample(*bgF, cam.dirX, cam.dirY, cam.floor, cam.cabin, x_, W, y, horizon) : 0xFF000000u;
+            put(x_, y, c);
+        }
+    };
+    for (int x = 0; x < W; ++x) {
+        double cameraX = (2.0 * x / W - 1.0) / hs;
+        double rayX = cam.dirX + cam.planeX * cameraX;
+        double rayY = cam.dirY + cam.planeY * cameraX;
+
+        int mapX = (int)cam.px, mapY = (int)cam.py;
+        double dDistX = (rayX == 0) ? 1e30 : std::fabs(1.0 / rayX);
+        double dDistY = (rayY == 0) ? 1e30 : std::fabs(1.0 / rayY);
+        int stepX, stepY; double sideX, sideY;
+        if (rayX < 0) { stepX = -1; sideX = (cam.px - mapX) * dDistX; }
+        else          { stepX =  1; sideX = (mapX + 1.0 - cam.px) * dDistX; }
+        if (rayY < 0) { stepY = -1; sideY = (cam.py - mapY) * dDistY; }
+        else          { stepY =  1; sideY = (mapY + 1.0 - cam.py) * dDistY; }
+
+        int side = 0, guard = 0; bool hit = false, diag = false, culled = false;
+        double diagPerp = 0, diagTexU = 0; uint16_t diagMeta = 0;
+        while (!hit && guard++ < 256) {
+            if (sideX < sideY) { sideX += dDistX; mapX += stepX; side = 0; }
+            else               { sideY += dDistY; mapY += stepY; side = 1; }
+            if (mapX < 0 || mapY < 0 || mapX >= Level::W || mapY >= Level::H) { hit = true; break; }
+            if (mapX < camCXd - ddist || mapX > camCXd + ddist ||
+                mapY < camCYd - ddist || mapY > camCYd + ddist) { culled = true; break; }  // за дальностью
+            uint8_t ctc = lvl.cellType(cam.floor, mapX, mapY);
+            uint8_t cid = lvl.cellId(cam.floor, mapX, mapY);
+            if (ctc == 6 || ctc == 7) {
+                // ДВЕРЬ: панель в ЦЕНТРЕ ячейки. ct6 гориз. (y=mapY+0.5), ct7 верт. (x=mapX+0.5).
+                bool horiz = (ctc == 6);
+                double denom = horiz ? rayY : rayX;
+                if (std::fabs(denom) > 1e-9) {
+                    double td = horiz ? ((mapY + 0.5 - cam.py) / denom)
+                                      : ((mapX + 0.5 - cam.px) / denom);
+                    if (td > 1e-4) {
+                        double lp = horiz ? (cam.px + rayX * td - mapX)   // вдоль X
+                                          : (cam.py + rayY * td - mapY);  // вдоль Y
+                        // РАЗДВИЖНЫЕ СТВОРКИ: открыта середина шириной open; створки уезжают к краям
+                        double half = doorOpen(cam.floor, mapX, mapY) * 0.5;
+                        bool inGap = (lp > 0.5 - half && lp < 0.5 + half);
+                        if (lp >= 0.0 && lp <= 1.0 && !inGap) {
+                            // texU скользит со створкой (левая +half, правая −half)
+                            double tu = (lp <= 0.5 - half) ? lp + half : lp - half;
+                            hit = diag = true; diagPerp = td; diagTexU = tu;
+                            uint16_t mm = lvl.texorder(cid, 0);
+                            diagMeta = mm ? mm : DOOR_METATEX;
+                        }
+                    }
+                }
+                // не пересёк створку (открытая середина) — луч идёт сквозь
+            } else if (ctc >= 2 && ctc <= 5) {
+                // ДИАГОНАЛЬНАЯ (угловая) стена: пересечение луча с диагональю клетки.
+                // ct2(UR)/ct4(LL) → "\" (x-y=cx-cy); ct3(LR)/ct5(UL) → "/" (x+y=cx+cy+1).
+                bool bs = (ctc == 2 || ctc == 4);                 // "\"
+                double denom = bs ? (rayX - rayY) : (rayX + rayY);
+                if (std::fabs(denom) > 1e-9) {
+                    double td = bs ? (((mapX - mapY) - (cam.px - cam.py)) / denom)
+                                   : (((mapX + mapY + 1) - (cam.px + cam.py)) / denom);
+                    if (td > 1e-4) {
+                        double lx = cam.px + rayX * td - mapX;
+                        double ly = cam.py + rayY * td - mapY;
+                        if (lx >= -1e-6 && lx <= 1.0 + 1e-6 && ly >= -1e-6 && ly <= 1.0 + 1e-6) {
+                            hit = diag = true;
+                            diagPerp = td; diagTexU = lx;
+                            int diagFace = (ctc == 2 || ctc == 5) ? 3 : 0;
+                            diagMeta = lvl.texorder(cid, diagFace);
+                        }
+                    }
+                }
+                // не пересёк диагональ — луч идёт сквозь открытую половину (продолжаем марш)
+            } else if (cellRenderWall(ctc)) {
+                hit = true;                                       // осевая стена
+            }
+        }
+
+        if (culled) { colBackdrop(x); zbuf[x] = 1e9; continue; }  // за дальностью — нет стены, весь столбец фон
+
+        // ---- параметры столбца (осевой хит или диагональ/дверь) ----
+        double perp; uint16_t m; int texX;
+        if (diag) {
+            perp = diagPerp < 1e-4 ? 1e-4 : diagPerp;
+            m = diagMeta;
+            texX = (int)(diagTexU * 128.0); if (texX < 0) texX = 0; if (texX > 127) texX = 127;
+        } else {
+            perp = (side == 0) ? (sideX - dDistX) : (sideY - dDistY);
+            if (perp < 1e-4) perp = 1e-4;
+            bool inb = (mapX >= 0 && mapY >= 0 && mapX < Level::W && mapY < Level::H);
+            uint8_t cell = inb ? lvl.cellId(cam.floor, mapX, mapY) : 0;
+            uint8_t ct   = inb ? lvl.cellType(cam.floor, mapX, mapY) : 1;
+            int face = (side == 1) ? (rayY > 0 ? 0 : 3) : (rayX > 0 ? 1 : 2);
+            m = lvl.texorder(cell, face);
+            if (m == 0 && cellIsDoor(ct)) m = DOOR_METATEX;
+            double wallX = (side == 0) ? (cam.py + perp * rayY) : (cam.px + perp * rayX);
+            wallX -= std::floor(wallX);
+            texX = (int)(wallX * 128.0); if (texX < 0) texX = 0; if (texX > 127) texX = 127;
+            if ((side == 0 && rayX < 0) || (side == 1 && rayY > 0)) texX = 127 - texX;
+        }
+        zbuf[x] = perp;
+        if (x == W/2 && std::getenv("ZTDBG"))
+            std::fprintf(stderr, "DBG center: cam(%.3f,%.3f) ray(%.3f,%.3f) HIT (%d,%d) ct=0x%02X perp=%.3f diag=%d\n",
+                         cam.px, cam.py, rayX, rayY, mapX, mapY, lvl.cellType(cam.floor, mapX, mapY), perp, (int)diag);
+        const uint8_t* mt = meta.get(m);                // 128x64
+        // ТОЧНЫЙ банд ZT по высоте колонны (D0 = 64/forward); дизер hi/lo по чётности тексель-X
+        int band = bandForHeight((int)(64.0 / perp));
+        bool hiNib = !(texX & 1);
+
+        int lineH = (int)(H / perp);
+        const bool elevRide = (cam.elevState != 0);
+        const bool hitInb = (mapX >= 0 && mapY >= 0 && mapX < Level::W && mapY < Level::H);
+        const uint8_t hitCt = hitInb ? lvl.cellType(cam.floor, mapX, mapY) : 1;
+        const bool cabinWall = elevRide && rcElevCell(hitCt);  // стена САМОЙ кабины → статична + синий пол/пот
+        const uint32_t VOID_BLUE = 0xFF002448u;
+        const Panorama* bg = activeBg();
+        const double step = 64.0 / lineH;
+        // СЛОИСТАЯ МОДЕЛЬ (Plane A фон / Plane B градиент+стены). bgAt = ФОН (панорама, универсальный
+        // backdrop; чёрный если фона нет). backdrop = слой пол/потолок-градиента (Plane B): idx0 градиента
+        // (env3-небо) → фон. Стена тексель-0 (ОКНО) → bgAt НАПРЯМУЮ (а не градиент пола, как было).
+        auto bgAt = [&](int x_, int sy) -> uint32_t {
+            return (bg && bg->valid()) ? bgSample(*bg, cam.dirX, cam.dirY, cam.floor, cam.cabin, x_, W, sy, horizon)
+                                       : 0xFF000000u;
+        };
+        auto backdrop = [&](int x_, int sy) -> uint32_t {     // пол/потолок-градиент (Plane B); idx0 → фон
+            uint32_t c = floorCeilColor(wallPal, fc, x_, sy, horizon, H, W);
+            return ((c & 0xFF000000u) == 0) ? bgAt(x_, sy) : c;   // прозрачный (idx0 = env3-небо) → фон (Plane A)
+        };
+
+        if (elevRide && !cabinWall) {
+            // КОРИДОР (вид на выход): СТЕНА едет вверх ПЕРСПЕКТИВНЫМ питчем (lineH·pitch/64, питч=−cabin,
+            // дизасм d214). ГРАДИЕНТ пол/потолок — СТАТИЧНЫЙ фоновый слой (screen-anchored буфер A5 в
+            // дизасме d2d6/d40a: A5[i]→строка i всегда, НЕ скроллится с перспективой!). Снизу (спуск) /
+            // сверху (после свопа) наезжает тёмно-синий МЕЖЭТАЖНЫЙ пол (band), ЗАКРЫВАЯ статичный градиент;
+            // на пике |cabin|=0x40 — весь синий → своп этажа незаметен; затем след. этаж аналогично.
+            int shift = (int)(lineH * cam.pitch / 64.0);
+            int top = H / 2 + shift - lineH / 2;
+            int y0 = top < 0 ? 0 : top;
+            int y1 = top + lineH; if (y1 >= H) y1 = H - 1;
+            int blueLo, blueHi;                       // межэтажный синий: спуск — снизу [..H], после свопа — сверху [0..]
+            if (cam.cabin >= 0) { blueLo = (int)(H * (1.0 - cam.cabin / 64.0)); blueHi = H; }
+            else                { blueLo = 0; blueHi = (int)(H * (-cam.cabin / 64.0)); }
+            for (int y = 0; y < H; ++y) {
+                if (y >= blueLo && y < blueHi) { put(x, y, VOID_BLUE); continue; }   // межэтажный синий пол
+                if (y < y0 || y > y1) { put(x, y, backdrop(x, y)); continue; }       // СТАТИЧНЫЙ градиент (screen y!)
+                int ty = (int)((double)(y - top) * step) & 63;
+                uint8_t idx = mt[ty * 128 + texX];
+                put(x, y, idx == 0 ? bgAt(x, y) : wallPal.c[ramps.map(idx, band, hiNib, doShade)]);  // окно → фон
+            }
+            continue;
+        }
+
+        // СТЕНА КАБИНЫ ЛИФТА (статична, пол/потолок = синий) ИЛИ обычный столбец (лестница/не-лифт: питч).
+        const bool blueFC = cabinWall;                // пол/потолок кабины = тёмно-синий
+        // питч теперь = равномерный сдвиг ГОРИЗОНТА (выше, в horizon), БЕЗ наклона колонн (lineH·pitch — убрано)
+        int top = horizon - lineH / 2;
+        int y0 = top < 0 ? 0 : top;
+        int y1 = top + lineH; if (y1 >= H) y1 = H - 1;
+        for (int y = 0; y < y0; ++y) put(x, y, blueFC ? VOID_BLUE : backdrop(x, y));
+        for (int y = y1 + 1; y < H; ++y) put(x, y, blueFC ? VOID_BLUE : backdrop(x, y));
+        double texPos = (y0 - top) * step;            // пропуск текселей из-за клампа верха
+        for (int y = y0; y <= y1; ++y) {
+            int ty = (int)texPos & 63; texPos += step;
+            uint8_t idx = mt[ty * 128 + texX];
+            if (idx == 0) put(x, y, blueFC ? VOID_BLUE : bgAt(x, y));   // ОКНО (тексель-0) → ФОН (Plane A)
+            else put(x, y, wallPal.c[ramps.map(idx, band, hiNib, doShade)]);
+        }
+    }
+
+    // ДЕКОР-БИЛБОРДЫ (DDA): прямо в фреймбуфер, z-тест против zbuf[x]=forward (меньше=ближе).
+    // screenX по FOV DDA (плоскость 0.66) с растяжкой hs; высота клетки = lineH = H/forward.
+    if (faDecor() && meta.obj && meta.obj->count > 0)
+        drawDecorBillboards(W, H, lvl, cam, *meta.obj, wallPal, ramps, doShade, ddist,
+            [&](int x, int y, uint32_t c) { put(x, y, c); },
+            // z-тест с ДЕПТ-БИАСОМ: спрайт занимает ~0.4кл клетки, поэтому колонку перекрываем ТОЛЬКО если стена
+            // ЗАМЕТНО ближе (>BIAS). Иначе соседняя боковая стена «вровень» (чуть ближе по краю спрайта) срезала
+            // пол-текстуры врага у стены. Стена явно впереди (враг за углом) при разнице >BIAS — всё ещё перекрывает.
+            [&](int x, double f) {
+                const double BIAS = 0.40;                          // ≈ полу-ширина спрайта (кл)
+                return zbuf[x] < f - BIAS;                         // стена СУЩЕСТВЕННО ближе → перекрывает; вровень → спрайт целиком
+            },
+            [&](double f, double l) { return W * 0.5 * (1.0 + hs * l / (0.66 * f)); },
+            [&](double f) { return (double)H / f; });
+}
