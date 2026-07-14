@@ -13,6 +13,7 @@
 #include "gamedata.hpp"
 #include "level.hpp"
 #include "cells.hpp"
+#include "framebuffer.hpp"   // FB (draw-функции инвентаря/HUD рисуют в framebuffer)
 #include "raycaster.hpp"     // pickupHiddenFn — хук «пикап подобран» для рендера билбордов
 #include "actors.hpp"        // система актёров: снаряды/эффекты/враги + урон (damageRay)
 #include <vector>
@@ -41,7 +42,7 @@ static const ItemDef ITEMS[15] = {
     {"LASER GUN",     true,  10, 99},   // idx10 ct0x22 = LASER AIMED GUN (ПП с прицелом, tile5, held block1)
     {"ROCKET",        true,   4, 99},   // idx11 ct0x23 оружие (ракетница)
     {"SHOTGUN",       true,   6, 99},   // idx12 ct0x24 оружие (дробовик) ✓
-    {"FLAMETHROWER",  true,  10, 99},   // idx13 = ОГНЕМЁТ (held block8, авто+пламя, фаер 0x13024)
+    {"FLAMETHROWER",  true,  10, 10},   // idx13 = ОГНЕМЁТ (held block8, авто+пламя); кап 10=100% (ROM @0x11240 = 0x0a00, было 99 — БАГ)
     {"PULSE LASER",   true,   6, 99},   // idx14 = PULSE LASER (лазерн. ВИНТОВКА, held block7); ПИКАП = ct0x36
 };
 inline bool itemIsWeapon(int idx) { return idx >= 0 && idx < 15 && ITEMS[idx].weapon; }
@@ -65,6 +66,7 @@ struct Inventory {
     int    pendingDir= 0;               // направление карусели, применяется в низшей точке слайда (ZT down→swap→up)
     int    fire      = 0;               // счётчик анимации выстрела ($FF105A): 0 покой, 1..4 кадры
     int    punchSide = 0;               // кулаки: 0 правый удар / 1 левый (чередуется)
+    int    punchVariant = 0;            // тип удара (ZT -$6fa4): 0 обычный / 1 верхний (UP) / 2 нога-кик (DOWN)
     double bobPhase  = 0.0;             // фаза покачивания ствола при ходьбе (ZT 0x11286: чередование вида -$58e6)
     double bobAmt    = 0.0;             // текущая амплитуда боба (плавно нарастает при движении, гаснет в покое)
 
@@ -203,29 +205,7 @@ static const int PICK_MEDKIT = -2;
 //  • уже несём → добор боезапаса (consume).
 //  • новый + есть слот → занять слот + боезапас + авто-выбор нового ствола (consume).
 //  • новый + инвентарь ПОЛОН (5, не unlimited) → НЕ подбирать (оставить в мире, return −1).
-inline int rcTryPickup(Inventory& inv, const Level& lvl, int floor, double px, double py) {
-    int x = (int)px, y = (int)py;
-    if (x < 0 || y < 0 || x >= Level::W || y >= Level::H) return -1;
-    uint8_t ct = lvl.cellType(floor, x, y);
-    int k = pickKey(floor, x, y);
-    if (pickedSet().count(k)) return -1;             // уже подобрано
-    if (ct == 0x25) {                                // МЕДПАК (+HP, не инвентарь)
-        if (player().hp >= player().maxHp) return -1;   // полное HP → не подбирать (ZT 0x11b7c)
-        pickedSet().insert(k); healPlayer(20); return PICK_MEDKIT;
-    }
-    int idx = pickupItemIdx(ct);
-    if (idx < 1 || idx >= 15) return -1;
-    bool firstTime = !inv.has(idx);
-    if (firstTime && !inv.addItem(idx)) return -1;   // инвентарь полон → не берём (остаётся в мире)
-    pickedSet().insert(k);                           // занять слот удалось (или добор) → гасим клетку
-    inv.ammo[idx] += ITEMS[idx].ammoPickup;          // добор боезапаса с КАПОМ (таблица @0x11240)
-    if (inv.ammo[idx] > ITEMS[idx].ammoCap) inv.ammo[idx] = ITEMS[idx].ammoCap;
-    if (firstTime && ITEMS[idx].weapon) {            // авто-выбор нового ствола (встать на его слот)
-        for (size_t i = 0; i < inv.carried.size(); ++i) if (inv.carried[i] == idx) { inv.sel = (int)i; break; }
-        inv.syncCurrent(); inv.slide = 1.0;
-    } else inv.syncCurrent();
-    return idx;
-}
+int rcTryPickup(Inventory& inv, const Level& lvl, int floor, double px, double py);   // weapons.cpp
 
 // Выдать оружие/предмет в инвентарь (как rcTryPickup, но без celltype/pickedSet) — для дропа с трупов. true = взято.
 inline bool grantPickup(Inventory& inv, int idx) {
@@ -266,46 +246,43 @@ inline int weaponDamage(int id) {
     switch (id) { case 8: return 1; case 10: return 3; case 12: return 8; case 14: return 8; case 4: return 8; default: return 1; }
 }
 
+// Полуширина КОНУСА автонаведения d1 (ZT fire-хендлеры): handgun 1 (боец0/2 = 4), laser 3, shotgun 8 (боец0 = 12),
+// pulse 8 (боец0 = 12), foam 8. Больше d1 = шире авто-захват цели.
+inline int coneWidth(int id) {
+    int fg = playerFighter();
+    switch (id) {
+        case 8:  return (fg == 0 || fg == 2) ? 4 : 1;   // HANDGUN
+        case 10: return 3;                               // LASER
+        case 12: return (fg == 0) ? 12 : 8;             // SHOTGUN
+        case 14: return (fg == 0) ? 12 : 8;             // PULSE
+        case 4:  return 8;                               // FIRE EXT (пена)
+        default: return 8;
+    }
+}
+// Промах hit-scan (ZT 12ad4): луч ОТ ГЛАЗ до 1-й СОЛИДНОЙ клетки (макс 31 клетка) → спрайт импакта У ГРАНИ стены.
+// ⚠ ROM 12ad4 актёров НЕ проверяет — луч ПРОХОДИТ СКВОЗЬ ТРУПЫ (и живых) прямо к стене; трупы выстрел НЕ
+// задевают/не стопают (фидбэк юзера: «выстрелы задевают трупы — неверно» + «нет импакта по стене за трупом»).
+// Нет солида в 31 клетке → импакта НЕТ (ROM rts). Диагональ учитывается полуплоскостью (cellBlockedAt).
+inline void traceMiss(const Level& lvl, int floor, double px, double py, double dx, double dy) {
+    double x = px, y = py;
+    for (int i = 0; i < 600; ++i) {                               // 31 кл / 0.06 ≈ 517 шагов (+запас)
+        double nx = x + dx * 0.06, ny = y + dy * 0.06; int cx = (int)nx, cy = (int)ny;
+        if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return;
+        if (cellBlockedAt(lvl.cellType(floor, cx, cy), nx - cx, ny - cy)) {   // 1-я солидная клетка = СТЕНА
+            if (wallIsSecret(lvl.cellType(floor, cx, cy))) requestDestruct(floor, cx, cy);  // ТОЛЬКО секрет-стены 0x79/7B/7D/7F (a6bc: смена текстуры). 0x83/84 пуля НЕ ломает — разрушает тревога-камера
+            spawnSparkA(nx, ny, floor); return;                   // ИМПАКТ у грани стены (ZT актёр 15ad6, банк 0x1167be, 3 кадра)
+        }
+        if ((nx - px) * (nx - px) + (ny - py) * (ny - py) > 31.0 * 31.0) return;  // ROM: дальность 31 клетка (0x1f)
+        x = nx; y = ny;
+    }
+}
+
 // ── ВЫСТРЕЛ (спавн актёров) ─────────────────────────────────────────────────────
 // По типу оружия: hit-scan (пистолет 8 / ПП-лазер 10 / дробовик 12 / пульс 14 / огнетушитель 4) — МГНОВЕННО
 // рейкаст-урон D1 (damageRay) → искра у стены ТОЛЬКО при промахе (как ZT: 0x12ad4 спавнит трассер лишь когда
 // враг не задет; на попадании урон применяется напрямую). Ракета/граната — летящий снаряд → взрыв. Огнемёт —
 // пламя. Мина — ставится ВПЕРЁД по трассе (до 8 клеток, ZT 12bfe). Пассивные предметы/кулаки — удар (melee).
-inline void fireSpawn(const Inventory& inv, const Level& lvl, const Camera& cam) {
-    int id = inv.current;
-    int kind = heldDisplayKind(id);
-    if (kind == 0) {                                            // КУЛАКИ/пассивные предметы — УДАР в упор (короткий мили-конус)
-        for (Actor& a : actors()) {                            // (в ZT кулаки урона не наносят; здесь — рабочий удар по просьбе юзера)
-            if (!a.active || a.think != AT_ENEMY || a.floor != cam.floor) continue;
-            double rx = a.x - cam.px, ry = a.y - cam.py, d = std::hypot(rx, ry);
-            if (d < 0.01 || d > 1.3) continue;                 // только вплотную (~1.3 клетки)
-            if ((rx * cam.dirX + ry * cam.dirY) / d > 0.6) { hitEnemy(a, 2, cam.px, cam.py); break; }  // в конусе взгляда → удар (урон 2 + отлёт)
-        }
-        return;
-    }
-    double x = cam.px + cam.dirX * 0.4, y = cam.py + cam.dirY * 0.4;
-    if (id == 2)  {                                             // МИНА — ПРЯМО ПЕРЕД игроком (ZT 0x12bfe: forward/16 ×8 ≈ ½ кл)
-        double mx = cam.px, my = cam.py;
-        for (int i = 0; i < 8; ++i) {                           // мелкий шаг (½/16 ≈ 0.03 кл) до стены — итог ~0.5 кл
-            double nx = mx + cam.dirX * 0.0625, ny = my + cam.dirY * 0.0625;
-            if (cellBlocks(lvl.cellType(cam.floor, (int)nx, (int)ny))) break;
-            mx = nx; my = ny;
-        }
-        spawnMine(mx, my, cam.floor); return;
-    }
-    if (id == 13) { spawnFlameP(x, y, cam.floor, cam.dirX, cam.dirY); return; }                       // огнемёт
-    if (id == 4)  {                                            // ОГНЕТУШИТЕЛЬ (ZT 0x12cfe): ОДИН спрайт пены (БЕЗ разброса), падает вниз, тушит огонь
-        double mx = cam.px + cam.dirX * 0.35, my = cam.py + cam.dirY * 0.35;
-        spawnFoam(mx, my, cam.floor, cam.dirX, cam.dirY);
-        return;
-    }
-    if (id == 7)  { spawnGrenade(cam.px + cam.dirX * 0.3, cam.py + cam.dirY * 0.3, cam.floor, cam.dirX, cam.dirY); return; } // граната
-    if (id == 11) { spawnBullet(x, y, cam.floor, cam.dirX, cam.dirY, 0.35, A_EXPL_TILE, 200); return; } // ракета
-    // hit-scan стрелковое: ДИСТ-урон врагу по кривой оружия (playerWeaponDamage); промах → искра у стены.
-    double hx, hy;
-    if (!damageRay(lvl, cam.floor, cam.px, cam.py, cam.dirX, cam.dirY, id, hx, hy))
-        spawnSparkA(hx, hy, cam.floor);
-}
+void fireSpawn(const Inventory& inv, const Level& lvl, const Camera& cam);   // weapons.cpp
 
 // ── ДЕКОД held-графики: 8×8 4bpp тайлы в COLUMN-MAJOR блоке (порт _colmajor_block) ──
 // tile(col,row) = startTile + col*H + row; каждый тайл — стандартный MD 8×8 (4 б/строка, hi-ниббл=левый).
@@ -446,6 +423,26 @@ inline void drawLaserSight(Put put, int vx, int vy, int vw, int vh, const Invent
     }
 }
 
+// ⭐ПОЗЫ КУЛАКОВ (АВТОГЕН из ROM таблицы 0x1219a): [вариант 0=обычный/1=верхний/2=нога][рука 0=L/1=R][фаза 0-2] →
+// 1-2 VDP-спрайта. ТОЧНЫЕ размеры/тайлы/позиции (SAT из фрейм-таблицы). Обычный=кулак 3×4; верхний=2 кулака
+// (3×4 + предплечье 3×3 tile+12); нога=замах/возврат 4×1 (tile+16 боот) + удар 4×4 (tile+0, выпад). Экран=raw−0x80.
+struct FistSpr { int tileOff, w, h, x, y; bool hflip; };
+struct FistPose { FistSpr s[2]; int n; };
+static const FistPose FIST_POSE[3][2][3] = {
+  { // NORMAL (idle-блок 0x16c2b8, кулак 3×4)
+    { {{{0,3,4,116,96,0},{0,0,0,0,0,0}},1}, {{{0,3,4,128,88,0},{0,0,0,0,0,0}},1}, {{{0,3,4,116,96,0},{0,0,0,0,0,0}},1} },
+    { {{{0,3,4,180,96,1},{0,0,0,0,0,0}},1}, {{{0,3,4,168,88,1},{0,0,0,0,0,0}},1}, {{{0,3,4,180,96,1},{0,0,0,0,0,0}},1} },
+  },
+  { // UPPER (idle-блок, кулак 3×4 + предплечье 3×3 tile+12 НИЖЕ, 2-й спрайт @rs+0x30)
+    { {{{0,3,4,119,84,0},{12,3,3,119,116,0}},2}, {{{0,3,4,134,64,0},{12,3,3,134,96,0}},2}, {{{0,3,4,119,84,0},{12,3,3,119,116,0}},2} },
+    { {{{0,3,4,177,84,1},{12,3,3,177,116,1}},2}, {{{0,3,4,162,64,1},{12,3,3,162,96,1}},2}, {{{0,3,4,177,84,1},{12,3,3,177,116,1}},2} },
+  },
+  { // KICK (action-блок 0x16c038: замах/возврат нога 4×1 tile+16, удар выпад 4×4 tile+0)
+    { {{{16,4,1,112,112,1},{0,0,0,0,0,0}},1}, {{{0,4,4,128,88,1},{0,0,0,0,0,0}},1}, {{{16,4,1,148,112,1},{0,0,0,0,0,0}},1} },
+    { {{{16,4,1,176,112,0},{0,0,0,0,0,0}},1}, {{{0,4,4,160,88,0},{0,0,0,0,0,0}},1}, {{{16,4,1,140,112,0},{0,0,0,0,0,0}},1} },
+  },
+};
+
 // ── ПИКСЕЛЬ-В-ПИКСЕЛЬ оружие в руках для REFERENCE (нативный экран 320×224, scale 1) ──────────────
 // Координаты — ТОЧНО из дизасм-хендлеров (SAT), put(x,y,c) пишет в кадр 320×224, клип к 3D-окну
 // [vx..vx+vw]×[vy..vy+vh] (как кокпит режет низ оружия в оригинале). Анимации: отдача (0x12828), вспышка
@@ -458,9 +455,10 @@ inline void drawHeldNative(Put put, int vx, int vy, int vw, int vh, const GameDa
     int bobY = (int)(std::fabs(std::sin(inv.bobPhase)) * inv.bobAmt * 2.5) + (int)(inv.slide * 40.0);
     int bobX = (int)(std::sin(inv.bobPhase * 0.5) * inv.bobAmt * 3.0);
     // блит блока (startTile..+ntiles, ширина W) в нативные экранные (sx,sy), клип к окну, прозрачный idx0.
-    auto blit = [&](int block, int startTile, int ntiles, int W, int sx, int sy, bool hflip) {
-        if (block < 0 || block >= gd.heldBlocks) return;
-        const uint8_t* bp = gd.heldGfx.data() + (size_t)block * 672;
+    auto blit = [&](int block, int startTile, int ntiles, int W, int sx, int sy, bool hflip, bool action = false) {
+        const uint8_t* bp;
+        if (action) { if (gd.fistAction.empty()) return; bp = gd.fistAction.data(); }   // блок ДЕЙСТВИЯ кулаков (0x16c038)
+        else { if (block < 0 || block >= gd.heldBlocks) return; bp = gd.heldGfx.data() + (size_t)block * 672; }
         int ow = 0, oh = 0;
         std::vector<uint8_t> buf = decodeColMajor(bp, startTile, ntiles, W, ow, oh);
         for (int y = 0; y < oh; ++y) {
@@ -480,14 +478,18 @@ inline void drawHeldNative(Put put, int vx, int vy, int vw, int vh, const GameDa
         if (f == 0) {                                      // статика: два кулака (block0 3×4) X104/X192 Y107
             blit(0, 0, 12, 3, 104, 107, false);
             blit(0, 0, 12, 3, 192, 107, true);
-        } else {                                           // удар: рука+предплечье (2 спрайта), одна сторона
-            int fr = f - 1; if (fr > 2) fr = 2;            // кадры 0..2 (table 0x1219a)
-            static const int PR[3][4] = {{96,180, 84,177}, {88,168, 64,162}, {96,180, 84,177}};  // правый (hflip)
-            static const int PL[3][4] = {{96,116, 84,119}, {88,128, 64,134}, {96,116, 84,119}};  // левый
-            const int* p = inv.punchSide ? PL[fr] : PR[fr];
-            bool hf = (inv.punchSide == 0);
-            blit(0, 0, 12, 3, p[1], p[0], hf);             // нижний (предплечье)
-            blit(0, 0, 12, 3, p[3], p[2], hf);             // верхний (кулак)
+        } else {                                           // ⭐УДАР (ZT table 0x1219a): 5 вариантов, ТОЧНЫЕ спрайты FIST_POSE
+            int fr = f - 1; if (fr < 0) fr = 0; if (fr > 2) fr = 2;   // фаза 0 замах → 1 удар(контакт) → 2 возврат
+            int side = (inv.punchSide != 0) ? 1 : 0;                  // рука (0=L / 1=R)
+            int var  = (inv.punchVariant >= 0 && inv.punchVariant <= 2) ? inv.punchVariant : 0;
+            const FistPose& po = FIST_POSE[var][side][fr];
+            // ⭐БЛОК ГРАФИКИ: ТОЛЬКО КИК (-$6fa4<2) DMA-свапит action-блок 0x16c038 (ZT 11f3c: cmpi #2,-$6fa4;bcc);
+            // обычный/верхний БЕЗ свапа → idle-блок 0x16c2b8 (heldBlock0). Оттого кик читался из idle = мусор.
+            bool useAction = (var == 2);
+            for (int i = 0; i < po.n; ++i) {                          // 1-2 спрайта (верхний = 2), точный размер w×h/тайл
+                const FistSpr& s = po.s[i];
+                blit(0, s.tileOff, s.w * s.h, s.w, s.x, s.y, s.hflip, useAction);
+            }
         }
         return;
     }
@@ -519,72 +521,29 @@ inline void drawHeldNative(Put put, int vx, int vy, int vw, int vh, const GameDa
 // Иконка 32×32 (имя+картинка+ammo запечены) рисуется поверх панели (прозрачный idx0 → видна сетка).
 // Боезапас оружия — МАЛЕНЬКИЙ номер ZT-шрифтом (4×6) в НИЗ-ЛЕВО иконки (как FUN_1DF54: тайл 3 = низ-лев.
 // угол, VRAM 0x9600+slot·0x200+0x68), НЕ широкая полоса (та перекрывала ствол). Неогранич.: окно 5 вокруг sel.
-inline void drawInventoryHud(uint32_t* frame, int FW, int FH, const GameData& gd, const Inventory& inv) {
-    std::vector<int> r = inv.ring();                      // кольцо: значения слотов (−1 = пусто/кулаки)
-    int n = (int)r.size();
-    if (gd.hudIcons.empty() || n == 0) return;
-    static const int SLOT_X[5] = {40, 88, 144, 200, 248};
-    const int SLOT_Y = 3;
-    auto px = [&](int x, int y, uint32_t c) { if (x >= 0 && x < FW && y >= 0 && y < FH) frame[(size_t)y * FW + x] = c; };
-    uint8_t ip[32 * 32];
-    for (int k = 0; k < 5; ++k) {
-        int j = inv.sel + (k - 2);                       // центр (k=2) = текущий
-        if (n >= 5) j = ((j % n) + n) % n;               // карусель-обмотка (окно 5 вокруг текущего)
-        else if (j < 0 || j >= n) continue;              // <5 слотов: пустые края
-        int id = r[j];
-        if (id < 0) continue;                            // пустой слот / кулаки — иконки нет
-        int icon = gd.iconForId(id);
-        if (icon < 0) continue;
-        gd.decodeIcon(icon, ip);
-        int bx = SLOT_X[k];
-        for (int y = 0; y < 32; ++y)
-            for (int x = 0; x < 32; ++x) { uint8_t i = ip[y * 32 + x]; if (i) px(bx + x, SLOT_Y + y, gd.heldPal.c[i]); }
-        // боезапас (только оружие) — маленький номер ZT-шрифтом в НИЗ-ЛЕВО углу (как ZT тайл 3 / FUN_1DF54).
-        if (id >= 1 && id < 15 && ITEMS[id].weapon) {
-            int a = inv.ammo[id]; if (a > 99) a = 99; if (a < 0) a = 0;
-            char b[4]; int len = std::snprintf(b, sizeof b, "%d", a);
-            int dx = bx + 1, dy = SLOT_Y + 25;                         // низ-лев. угол иконки
-            for (int yy = -1; yy < 7; ++yy) for (int xx = -1; xx < len * 4; ++xx) px(dx + xx, dy + yy, 0xFF000000u);  // плашка-тайл
-            for (int c = 0; c < len; ++c) {
-                int d = b[c] - '0';
-                for (int ry = 0; ry < 6; ++ry) for (int rx = 0; rx < 4; ++rx) {
-                    uint8_t pi = gd.digitPx(d, rx, ry);
-                    if (pi) px(dx + c * 4 + rx, dy + ry, gd.heldPal.c[pi]);
-                }
-            }
-        }
-    }
-    // подсветка ТЕКУЩЕГО (центральная панель): тонкая рамка
-    int rx = SLOT_X[2] - 1, ry = SLOT_Y - 1, rw = 34, rh = 34;
-    for (int x = 0; x < rw; ++x) { px(rx + x, ry, 0xFF80FF80u); px(rx + x, ry + rh - 1, 0xFF80FF80u); }
-    for (int y = 0; y < rh; ++y) { px(rx, ry + y, 0xFF80FF80u); px(rx + rw - 1, ry + y, 0xFF80FF80u); }
-}
+void drawInventoryHud(uint32_t* frame, int FW, int FH, const GameData& gd, const Inventory& inv);   // weapons.cpp
 
 // Цвет HP-числа по ZT (d98e: спрайт-палитра 0x20D2 индексы 7/6/5 по HP) — ЖЁЛТ→ОРАНЖ→КРАСН (НЕ зелёный!).
 // Пороги масок: HP>80 idx7, >40 idx6, иначе idx5 (предупр. текст.asm d952<50/d970<15).
 inline uint32_t hpColor(int hp) { return (hp > 60) ? 0xFFFCFC24u : (hp > 20 ? 0xFFD86C24u : 0xFFFC2424u); }
 
-// HP-ИНДИКАТОР (REFERENCE): ЧИСЛО (2 цифры) ШРИФТОМ ЧИСЕЛ ZT (fontNum 0x16E618, как d98e), цвет по HP
-// (спрайт-палитра 0x20D2 idx 7/6/5 = жёлт/оранж/красн, 2-тон ДИЗЕР как маски 0x77→0x55). Не зелёный, не ammo-шрифт.
-inline void drawHpHud(uint32_t* frame, int FW, int FH, const GameData& gd) {
-    const PlayerState& p = player();
-    int hp = p.hp; if (hp < 0) hp = 0; if (hp > 99) hp = 99;            // 2 цифры (ZT d98e: tens+units)
-    int hi, lo;                                                         // дизер-индексы спрайт-палитры по HP (маски d98e)
-    if      (hp > 80) { hi = lo = 7; }                                  // 0x77 жёлтый
-    else if (hp > 60) { hi = 7; lo = 6; }                              // 0x76
-    else if (hp > 40) { hi = lo = 6; }                                  // 0x66 оранжевый
-    else if (hp > 20) { hi = 6; lo = 5; }                              // 0x65
-    else              { hi = lo = 5; }                                  // 0x55 красный
-    uint32_t cHi = gd.heldPal.c[hi], cLo = gd.heldPal.c[lo];
-    const ZtFont& f = gd.fontNum;
+// Общий вывод N цифр значения val шрифтом Numbers ZT (fontNum 0x16E618, как d98e/1e00e) в кадр кокпита
+// 320×224; 2-тон дизер (cHi/cLo по чётности rx+ry). x/y — левый-верхний угол первой цифры, sc — масштаб (ZT=1).
+// bgHi/bgLo != 0 → ЗАЛИВАТЬ плитку (ZT d98e: font|mask — фон плитки в цвет, штрих цифры контрастный);
+// 0 → прозрачный фон (штрих в cHi/cLo, как счётчик врагов 1e00e). Дизер по чётности rx+ry.
+inline void drawHudDigits(uint32_t* frame, int FW, int FH, const ZtFont& f, int x, int y, int sc,
+                          int val, int ndig, uint32_t cHi, uint32_t cLo, uint32_t bgHi = 0, uint32_t bgLo = 0) {
     if (!f.have) return;
-    int x = 254, y = 104, sc = 2;                                       // правый-нижний угол 3D-вида (справа на экране)
-    int digs[2] = { (hp / 10) % 10, hp % 10 };
-    for (int di = 0; di < 2; ++di) {
-        int a = '0' + digs[di]; if (a < 0 || a >= 128 || !f.supported[a]) continue;
+    bool fill = (bgHi != 0 || bgLo != 0);
+    for (int di = 0; di < ndig; ++di) {
+        int place = 1; for (int k = 0; k < ndig - 1 - di; ++k) place *= 10;
+        int a = '0' + (val / place) % 10; if (a < 0 || a >= 128 || !f.supported[a]) continue;
         for (int ry = 0; ry < 8; ++ry) { uint8_t row = f.glyph[a][ry];
-            for (int rx = 0; rx < 8; ++rx) if (row & (1 << rx)) {
-                uint32_t c = ((rx + ry) & 1) ? cHi : cLo;              // 2-тон дизер
+            for (int rx = 0; rx < 8; ++rx) {
+                bool on = row & (1 << rx);
+                if (!on && !fill) continue;                          // прозрачный фон
+                uint32_t c = on ? (((rx + ry) & 1) ? cHi  : cLo)     // штрих цифры
+                                : (((rx + ry) & 1) ? bgHi : bgLo);   // фон плитки (health-тинт)
                 for (int yy = 0; yy < sc; ++yy) for (int xx = 0; xx < sc; ++xx) {
                     int fx = x + (di * 8 + rx) * sc + xx, fy = y + ry * sc + yy;
                     if (fx >= 0 && fx < FW && fy >= 0 && fy < FH) frame[(size_t)fy * FW + fx] = c;
@@ -592,19 +551,49 @@ inline void drawHpHud(uint32_t* frame, int FW, int FH, const GameData& gd) {
             } }
     }
 }
+// HP-ИНДИКАТОР (REFERENCE, ZT d98e): 2 цифры Plane A @VRAM 0xC4CA = кол 37, ряд 9 = ЭКРАН (296,72), 8×8 тайлы —
+// в ЖЁЛТОМ LCD-слоте справа сверху кокпита. Цвет по HP (спрайт-палитра 0x20D2 idx 7/6/5, дизер 0x77→0x55).
+// (Прежняя позиция (254,104) sc=2 была неверна — не совпадала со слотом кокпита.)
+inline void drawHpHud(uint32_t* frame, int FW, int FH, const GameData& gd) {
+    const PlayerState& p = player();
+    int hp = p.hp; if (hp < 0) hp = 0; if (hp > 99) hp = 99;            // ZT d98e: (HP*100-1)/100 → макс 99 (2 цифры)
+    int hi, lo;                                                         // дизер-индексы спрайт-палитры по HP (маски d98e)
+    if      (hp > 80) { hi = lo = 7; }                                  // 0x77 жёлтый
+    else if (hp > 60) { hi = 7; lo = 6; }                              // 0x76
+    else if (hp > 40) { hi = lo = 6; }                                  // 0x66 оранжевый
+    else if (hp > 20) { hi = 6; lo = 5; }                              // 0x65
+    else              { hi = lo = 5; }                                  // 0x55 красный
+    // ZT d98e (font|mask): ШТРИХ цифры = health-цвет idx 7/6/5 (ЖЁЛТ→ОРАНЖ→КРАСН по HP), ФОН плитки = idx 0xF (#000000).
+    uint32_t black = gd.heldPal.c[0xF];
+    drawHudDigits(frame, FW, FH, gd.fontNum, 296, 72, 1, hp, 2, gd.heldPal.c[hi], gd.heldPal.c[lo], black, black);
+}
+// СЧЁТЧИК НЕУБИТЫХ ВРАГОВ (REFERENCE, ZT 1e00e): 2 цифры Plane A @VRAM 0xC482 = кол 1, ряд 9 = ЭКРАН (8,72),
+// 8×8 тайлы — в БЕЛОМ readout-слоте слева сверху кокпита (палитра 3). Значение = enemyCountRemaining (кламп 99).
+inline void drawEnemyCountHud(uint32_t* frame, int FW, int FH, const GameData& gd, int floor) {
+    int n = enemyCountRemaining(floor);
+    uint32_t yellow = gd.heldPal.c[7], black = gd.heldPal.c[0xF];      // ЖЁЛТЫЕ штрихи на чёрной плитке (как HP полн., idx 7 #FCFC24)
+    drawHudDigits(frame, FW, FH, gd.fontNum, 8, 72, 1, n, 2, yellow, yellow, black, black);
+}
 
 // ВСПЫШКА УРОНА (палитра d800/d98e): тинт кадра — КРАСНЕЕТ + БЕЛЕЕТ с интенсивностью ~ УРОНУ (не только
 // длительность). Большой урон → ярко-белая вспышка, малый → красноватая; затухает (p.flash убывает в updateActors).
+// ⭐ FAITHFUL (d98e крутит CRAM, не пиксели): вспышка в оригинале — модификация ПАЛИТРЫ (3-битные уровни),
+// значит цвета ВСЕГДА на нелинейной DAC-лестнице. Тинтим RGB, но СНАПИМ каждый канал к ближайшему MD DAC-уровню
+// {0,52,87,116,144,172,206,255} — вспышка «ступенчатая», как CRAM оригинала (а не гладкий off-ladder градиент).
 inline void applyDamageFlash(uint32_t* buf, int n) {
     const PlayerState& p = player();
     if (p.flash <= 0) return;
+    static const int DAC[8] = { 0, 52, 87, 116, 144, 172, 206, 255 };   // нелинейный DAC МД (как cramToArgb)
+    auto snap = [](int v) { int best = 0, bd = 1 << 30;                 // ближайший DAC-уровень (CRAM всегда на них)
+        for (int k = 0; k < 8; ++k) { int d = v - DAC[k]; if (d < 0) d = -d; if (d < bd) { bd = d; best = DAC[k]; } }
+        return best; };
     double a = p.flash / 15.0; if (a > 1.0) a = 1.0;                     // интенсивность ~ урон (затухает с flash)
     double amt = a * 0.6;                                                // сила тинта
     int wht = (int)(a * 210);                                           // белизна по интенсивности (больш.урон → белее)
     int tr = 255, tg = 30 + wht, tb = 30 + wht;                         // база красная + подмешать белый
     for (int i = 0; i < n; ++i) {
         uint32_t c = buf[i]; int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
-        r = r + (int)((tr - r) * amt); g = g + (int)((tg - g) * amt); b = b + (int)((tb - b) * amt);
+        r = snap(r + (int)((tr - r) * amt)); g = snap(g + (int)((tg - g) * amt)); b = snap(b + (int)((tb - b) * amt));
         buf[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
     }
 }

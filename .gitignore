@@ -1,9 +1,22 @@
-# build output / вывод сборки
-build/
+# build output / вывод сборки (любой каталог сборки: build/, build_ref/, build-debug/ …)
+build*/
 *.o
 *.obj
 *.a
 *.dylib
+*.dSYM/
+# in-source CMake artefacts (на случай сборки прямо в корне) / артефакты CMake в дереве
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/Makefile
+
+# IDE / tooling — machine-specific / IDE и тулзы — привязаны к машине
+.vscode/
+.idea/
+compile_commands.json
+.cache/
+.clangd/
 
 # ROMs & game data — never commit / ромы и игровые данные — не коммитить
 *.gen

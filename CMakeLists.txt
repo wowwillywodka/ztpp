@@ -10,9 +10,22 @@ endif()
 
 option(ZTPP_NO_SDL "Собрать без SDL (только режим --dump)" OFF)
 
+# ── Multi-TU: исходники собираются из нескольких единиц трансляции ──────────────
+# Раньше проект был unity-build (один main.cpp инклудил все .hpp). Теперь определения
+# живут в .cpp (заголовки — только объявления), что даёт РАЗДЕЛЬНУЮ компиляцию и быструю
+# инкрементальную пересборку. Слои: src/rom (ROM→ассеты декодер, переносим в новый движок),
+# src/render (рендер/рантайм ztpp), src/ (приложение/точка входа).
+file(GLOB_RECURSE ZTPP_CXX_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/*.cpp)
+
 # Nuked-OPN2 (Yamaha YM2612/YM3438) — vendored C-эмулятор чипа (LGPL 2.1).
-add_executable(ztpp src/main.cpp src/opn2/ym3438.c)
-target_include_directories(ztpp PRIVATE src)
+add_executable(ztpp ${ZTPP_CXX_SOURCES} src/opn2/ym3438.c)
+
+# Заголовки модулей резолвятся плоско: `#include "gfx.hpp"` находит src/rom/gfx.hpp и т.д.
+# (физический каталог задаёт границу модуля; общий include-путь избавляет от правки всех #include).
+target_include_directories(ztpp PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/src/rom
+  ${CMAKE_SOURCE_DIR}/src/render)
 
 if(ZTPP_NO_SDL)
   target_compile_definitions(ztpp PRIVATE ZTPP_NO_SDL)

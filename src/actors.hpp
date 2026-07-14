@@ -61,6 +61,8 @@ struct Actor {
     uint8_t srcType = 0;       // исходный celltype врага
     int     drop = -1;         // ТРУП: оброненное оружие (id 1..14), подбирается при шаге на труп; −1 = нет
     bool    burned = false;    // обгорел в огне → труп «сожжённый» (тёмный/обугленный)
+    int      gunBurst = 0;     // ОЧЕРЕДЬ выстрела hitscan-человека: 0x68+0x97 ×3, интервал ~120мс (MAME: 0.1-0.15с). По ВРЕМЕНИ — think идёт на переменном FPS (по умолч. 15!)
+    uint32_t gunBurstNext = 0; // SDL_GetTicks() времени следующего залпа
 };
 
 // ── ПУЛ (ZT: 64 слота). ФИКСИРОВАННЫЙ размер (без push_back!) — спавн во время think не должен
@@ -100,20 +102,41 @@ struct PlayerState {
 inline PlayerState& player() { static PlayerState p; return p; }
 inline void resetPlayerHP() { PlayerState& p = player(); p.hp = p.maxHp; p.iframe = 0; p.flash = 0; p.dead = false;
     p.knockVx = p.knockVy = 0; p.knockTimer = 0; p.knockPitch = 0; p.jumpVel = p.jumpY = 0; p.crouchY = 0; }
+inline int& playerFighter();   // fwd (тело ниже) — боец U-RON для перка урона в damagePlayer
 // Урон игроку (как d800): i-frame + броня + вспышка палитры + ОТСКОК от источника (sx,sy) + смерть.
 // godmode = ЗАМОРОЗКА HP: удар ОБРАБАТЫВАЕТСЯ (вспышка/отскок/i-frame), но HP не уменьшается.
 inline void damagePlayer(int dmg, double px, double py, double sx, double sy) {
     PlayerState& p = player();
     if (p.iframe > 0 || p.hp <= 0 || dmg <= 0) return;
+    // ⭐СТОЙКА модифицирует СЫРОЕ X ДО таблицы урона/нокбэка (ZT d800 @d80e, до d834). dmg = 16−(X>>6) → X ≈ (16−dmg)<<6.
+    //   ПРЫЖОК (jumpY>0, d816 X×0.75) → X МЕНЬШЕ → урон И НОКБЭК БОЛЬШЕ (в воздухе рискованнее). ПРИСЕД (crouchY<0, d820 X×1.5)
+    //   → X БОЛЬШЕ → урон+нокбэк МЕНЬШЕ, при X≥0x400 — УВОРОТ без урона (d82a RTS). ⚠ Прежняя правка «стойка на УРОН ×0.75/×1.5»
+    //   имела ОБРАТНОЕ направление (память неверно прочла d816: `d1-=d1/4` = X×0.75, а не «урон ×0.75»). X реконструирован из
+    //   dmg (низкие 6 бит теряются → порог уворота приближён; для пиксель-точного присед-уворота нужно передавать сырое X).
+    int X = (16 - dmg) << 6;
+    double stance = p.jumpY + p.crouchY;
+    if      (stance > 0.0) X -= X / 4;       // ПРЫЖОК: X×0.75 (d816)
+    else if (stance < 0.0) X += X / 2;       // ПРИСЕД: X×1.5 (d820)
+    if (X >= 0x400) return;                  // d82a: X≥0x400 → УВОРОТ (присед уводит от слабых атак; без урона/нокбэка)
+    int idx = X >> 6; if (idx < 0) idx = 0; if (idx > 15) idx = 15;   // индекс таблицы = X_стойка >> 6
+    int hpDmg = 16 - idx;                    // урон после стойки (d840: 16 − X_стойка>>6)
+    int fg = playerFighter();
+    if      (fg == 3) hpDmg -= hpDmg / 4;    // боец3 перк: урон ×0.75 (d84e)
+    else if (fg == 4) hpDmg >>= 1;           // боец4: урон ×0.5 (d85c)
+    if (hpDmg < 0) hpDmg = 0;
     // БРОНЯ поглощает удар ЦЕЛИКОМ (HP не падает), −10% за попадание; кончилась → урон идёт в HP (юзер verif.).
     bool absorbed = false;
     if (!p.godmode && p.armor > 0) { p.armor -= 10; if (p.armor < 0) p.armor = 0; absorbed = true; }
-    if (!p.godmode && !absorbed) { p.hp -= dmg; if (p.hp < 0) p.hp = 0; }   // god: HP заморожен; броня: HP не трогаем
+    if (!p.godmode && !absorbed) { p.hp -= hpDmg; if (p.hp < 0) p.hp = 0; }   // god: HP заморожен; броня: HP не трогаем
     p.iframe = 20;
-    p.flash = 6 + (dmg < 9 ? dmg : 9); if (p.flash > 15) p.flash = 15; p.flashPeak = p.flash;  // сила вспышки ~ урон
+    // ⭐БАГ-ФИКС: с жилетом ветка красной вспышки -$6f8e/d98e ПРОПУСКАЕТСЯ (ZT d876 bpl d88e, d8e8 bpl d8f6) — экран НЕ краснеет, пока броня держит.
+    if (!absorbed) { p.flash = 6 + (hpDmg < 9 ? hpDmg : 9); if (p.flash > 15) p.flash = 15; p.flashPeak = p.flash; }  // сила вспышки ~ урон
+    // ⭐НОКБЭК (d800 @D89E, ТАБЛИЦА @0xD900): сила = |force[idx]|/256 кл/тик, idx = X_стойка>>6 → ВАРЬИРУЕТСЯ ПО СТОЙКЕ (юзер:
+    //   «в игре вариабельно»): Hydaca стоя idx10=81 / прыжок idx8=100 (сильнее) / присед — слабее/уворот. Затухание ×¾/кадр (dd46). Вектор ОТ источника.
+    static const int KNOCK_FORCE[16] = {136,135,133,130,126,121,115,108,100,91,81,70,58,45,31,16};  // |force| из D900[idx]+$2
     double dx = px - sx, dy = py - sy, d = std::hypot(dx, dy);   // отскок ОТ источника
-    if (d > 0.01) { double k = 0.06 + 0.004 * dmg; if (k > 0.16) k = 0.16; p.knockVx = dx / d * k; p.knockVy = dy / d * k; }
-    if (dmg >= 6) p.knockTimer = 20;                             // СИЛЬНЫЙ удар (взрыв/босс) → НОКДАУН (ZT word0≥7: -0x71dc=0x14)
+    if (d > 0.01) { double k = KNOCK_FORCE[idx] / 256.0; p.knockVx = dx / d * k; p.knockVy = dy / d * k; }
+    if (idx <= 2) p.knockTimer = 20;         // НОКДАУН (питч в пол) при stun≥7 (D900 idx≤2 = сильнейшие: взрывы; ZT d8d2)
     if (p.hp == 0) p.dead = true;
 }
 inline void healPlayer(int amt) { PlayerState& p = player(); p.hp += amt; if (p.hp > p.maxHp) p.hp = p.maxHp; }
@@ -121,8 +144,9 @@ inline void healPlayer(int amt) { PlayerState& p = player(); p.hp += amt; if (p.
 // ── ЭФФЕКТ-параметры ──
 static const int A_EXPL_FRAMES  = 8;
 static const int A_SPARK_FRAMES = 6;     // искра стрелкового: 3 кадра анимации 63→64→65 (по 2 тика)
-static const int A_FIRE_LIFE    = 20;    // огонь огнемёта горит ~20 кадров и тухнет (lifetime $34, дизасм 0x142c6)
+static const int A_FIRE_LIFE    = 16;    // наземный огонь живёт 16 тиков ($1e 0→0x10, дизасм think 0x1423a) + сжимается с возрастом
 static const uint8_t A_EXPL_TILE  = 1;   // огненный шар (взрыв ракеты/гранаты)
+static const uint8_t A_FLAME_TILE = 1;   // частица огнемёта (ZT draw 0x14150 → объект-тайл 1, как ракета/шар)
 static const uint8_t A_SPARK_SEQ[3] = {63, 64, 65};  // искра пули: вспышка→кольцо→рассеивание (объект-банк)
 static const uint8_t A_FIRE_TILE  = 0;   // пламя/огонь (объект-банк 0)
 
@@ -131,10 +155,18 @@ inline void spawnBullet(double x, double y, int f, double dx, double dy, double 
     Actor& a = allocActor(); a.think = AT_BULLET; a.x = x; a.y = y; a.vx = dx * sp; a.vy = dy * sp;
     a.floor = f; a.tile = tile; a.timer = life;
 }
-// Огнемёт: частица пламени летит вперёд, жжёт врагов, ГАСНЕТ за lifetime или у стены (стены НЕ поджигаются).
+inline uint32_t enemyRng();  // fwd-декл (тело ниже) — для разброса частиц огнемёта
+// ⭐ОГНЕМЁТ (ZT draw 0x1282e + think 0x142c6): КАЖДЫЙ кадр спавнит частицу-пламя. Velocity = view-dir/4 (0.25 кл/кадр)
+// + СЛУЧАЙНЫЙ разброс ±0x10 units (±0.0625 кл) по каждой оси (RNG a5c) = «дрожащая струя». z на уровне глаз,
+// z-vel −2 units → всплывает, гравитация +1/кадр опускает. Тайл = 1 (объект-банк, ZT draw 14150, как ракета).
+// Частица САМА жжёт врагов в ≤1 клетке (не отдельный трейл). Спрайты стены НЕ поджигает.
 inline void spawnFlameP(double x, double y, int f, double dx, double dy) {
-    Actor& a = allocActor(); a.think = AT_FLAME; a.x = x; a.y = y; a.vx = dx * 0.26; a.vy = dy * 0.26;
-    a.floor = f; a.tile = A_FIRE_TILE; a.timer = 12;         // ~12 кадров горит на лету и тухнет
+    Actor& a = allocActor(); a.think = AT_FLAME; a.x = x; a.y = y; a.floor = f;
+    double sx = ((int)(enemyRng() & 0x1f) - 0x10) / 256.0;  // ZT: ±0x10 units разброса (jsr a5c)
+    double sy = ((int)(enemyRng() & 0x1f) - 0x10) / 256.0;
+    a.vx = dx * 0.25 + sx; a.vy = dy * 0.25 + sy;           // dir/4 + разброс
+    a.z = 0.45; a.vz = 0.03;                                // из ствола (чуть ниже глаз); zVel вверх (ROM 0x1299a: zVel=−2) → всплыв→опад
+    a.tile = A_FLAME_TILE; a.timer = 15; a.frameT = 0;      // тайл пламени 1; макс ~15 кадров (обычно приземляется раньше)
 }
 // ОГОНЬ-ОБЪЕКТ (ZT think 0x142c6): горит на месте, жжёт горючих в ~1кл. fuse<0 = ВЕЧНЫЙ (клетка-хазард 0x18),
 // иначе lifetime (огонь от огнемёта). playerSafe=true (огонь ИГРОКА из огнемёта) → НЕ жжёт игрока (нет само-урона);
@@ -159,9 +191,9 @@ inline void spawnMine(double x, double y, int f) {
     a.timer = 21;   // АРМИНГ (ZT 0x12bfe: ставит actor+$1f=0x14 → первый think через ~21 кадр) — НЕ детонирует сразу на ставившем
 }
 // Граната (think 0x13adc): бросается с дугой (z вверх + гравитация), горизонт. скорость, фитиль $34=50.
-inline void spawnGrenade(double x, double y, int f, double dx, double dy, int owner = 0) {
+inline void spawnGrenade(double x, double y, int f, double dx, double dy, int owner = 0, double rangeMul = 1.0) {
     Actor& a = allocActor(); a.think = AT_GRENADE; a.x = x; a.y = y; a.floor = f;
-    a.vx = dx * 0.12; a.vy = dy * 0.12;     // горизонт. бросок
+    a.vx = dx * 0.12 * rangeMul; a.vy = dy * 0.12 * rangeMul;     // горизонт. бросок (боец1: дальность ×2, ZT 12e7c)
     a.z = 0.35; a.vz = 0.028;               // из руки, невысокая дуга
     a.timer = 50; a.tile = 16;              // фитиль 50 тиков ($34); ЛЕТЯЩАЯ граната = декор-тайл 16 (ZT draw 0x13f3e bank 0x1109be); пикап-граната=13, проектиль=16!
     a.state = owner;                        // 0=граната игрока (детонир. у врага), 1=граната врага (детонир. у игрока)
@@ -183,17 +215,38 @@ inline void spawnDeath(double x, double y, int f) {
 static const uint8_t A_BLOOD_FLY  = 61;   // 0x10E9BE + 61·0x200 = 0x1163BE — летящая капля (спрей)
 static const uint8_t A_BLOOD_SPLAT = 62;  // 0x10E9BE + 62·0x200 = 0x1165BE — пятно-клякса (стена/пол)
 inline double bloodRnd() { static uint32_t s = 0x2468ace1u; s = s * 1664525u + 1013904223u; return ((int)((s >> 16) & 0xFF) - 128) / 128.0; }   // −1..~+1
+// Число частиц крови по ROM-урону d0 (ZT 0x157ca: d7=((d0−0x338)>>6)+1; отсечка d7<0 или d7>4 → 0 частиц;
+// затем dbra d7 крутит цикл d7+1 раз). Итог 1..5 частиц за вызов на урон ≥~0x2F8.
+inline int bloodParticleCount(int romDmg) {
+    int d7 = ((romDmg - 0x338) >> 6) + 1;                     // asr.w #6 — арифметический сдвиг (для отрицательных)
+    if (d7 < 0 || d7 > 4) return 0;                            // bmi / bhi #4 → крови нет
+    return d7 + 1;                                             // dbra d7 → d7+1 итераций
+}
+// ⭐КЛАССИФИКАЦИЯ КРОВИ [VERIFIED 2026-07-14 по objdef-таблице ROM @0xAB0C (receive = think+8) + ИСЧЕРПЫВАЮЩЕМУ скану
+// 11 вызовов 0x157ca в 0x14000-0x1c000, вкл. СПРЯТАННЫЕ в code-as-data]. ⚠Прежняя запись была НЕВЕРНА (текст-grep видел
+// лишь 6 из 11 — 5 в data-масках; ошибочно: Revenant кровил, Imp/Dog нет). Кровят РОВНО «органика», Hydaca/Revenant (роботы) — НЕТ:
+//   hit-gib (одиночный, count по урону, receive зовёт 0x157ca 1× при убойном ≥0x338): Sgt 0x29 (0x1b824), FH 0x2A (0x187c8),
+//   Imp 0x2B (0x18b12), Dog 0x68 (0x1999a), FH-SF 0x69 (0x1a154).
+inline bool enemyBleeds(uint8_t ct) {
+    return ct==0x29 || ct==0x2A || ct==0x2B || ct==0x68 || ct==0x69;   // Sgt, FH, Imp, Dog, FH-SF
+}
+// БОССЫ: receive на убойном ударе (HP из ≥0 в <0) — ДВОЙНОЙ 0x157ca с d0=0x400 → фонтан (~8-10 частиц), БЕЗ гейта ≥0x338:
+//   Boss1 0x67 (0x1947e→0x194da/e2), Boss2 0x6B (0x18f9e→0x18ffa/02), Boss3 0x6A (0x1a84a→0x1a8a6/ae). НЕ hit-gib (тут death-only).
+inline bool enemyDeathGush(uint8_t ct) {
+    return ct==0x67 || ct==0x6A || ct==0x6B;   // Boss1, Boss2, Boss3
+}
 inline void spawnBlood(double x, double y, int f, double dirX, double dirY, int count) {
     if (!faBlood()) return;
-    int live = 0;                                              // кап: ≤10 частиц одновременно (в оригинале крови НЕМНОГО)
+    int live = 0;                                              // кап: ≤16 частиц одновременно (ZT −$700a == 0x10)
     for (auto& a : actors()) if (a.active && a.think == AT_BLOOD) ++live;
     double dl = std::hypot(dirX, dirY); if (dl > 0.01) { dirX /= dl; dirY /= dl; } else { dirX = dirY = 0; }
-    for (int i = 0; i < count && live < 10; ++i, ++live) {
+    for (int i = 0; i < count && live < 16; ++i, ++live) {
         Actor& a = allocActor(); a.think = AT_BLOOD; a.x = x; a.y = y; a.floor = f; a.state = 0; a.timer = 0; a.frameT = 0;
-        // ZT 0x157ca: vel = base d3/d4 + rnd((&0x7f)−0x40) = ±0x40/256 = ±0.25 кл/кадр (разброс ШИРОКИЙ, доминирует);
-        // z-off $24 = rnd((&0xf)−8) = −8..7 → /64; z-vel $2e = rnd((&0xf)−9) = −9..6 → /64 (лёгкий разлёт, гравитация тянет).
-        a.vx = dirX * 0.06 + bloodRnd() * 0.25;               // широкий конус по направлению удара
-        a.vy = dirY * 0.06 + bloodRnd() * 0.25;
+        // ZT 0x157ca: vel $2a/$2c = d3/d4 + rnd((&0x7f)−0x40). d3/d4 = НОРМАЛИЗОВАННЫЙ вектор удара ×256 (receive 0x187e4:
+        //   `<<8; divs dist`) → база = 1.0·unit кл/кадр = СТРУЯ по направлению удара (ДОМИНИРУЕТ), разброс = ±0x40/256 = ±0.25 кл.
+        //   ⚠ Прежде база = 0.06 (в 16× слабее — кровь «пшикала» у врага; автор ошибочно счёл d3/d4 малым). z-off $24=rnd(−8..7), z-vel $2e=rnd(−9..6).
+        a.vx = dirX * 1.0 + bloodRnd() * 0.25;                // СТРУЯ по направлению удара (256·unit /256) + разброс ±0.25
+        a.vy = dirY * 1.0 + bloodRnd() * 0.25;
         a.z  = 0.5 + bloodRnd() * 0.12;                        // около центра тела ($24 −8..7 /64)
         a.vz = bloodRnd() * 0.12 - 0.02;                      // $2e −9..6 /64: чаще вверх, слегка вниз-смещён
         a.tile = A_BLOOD_FLY;
@@ -223,7 +276,8 @@ inline void spawnCorpse(double x, double y, int f, uint8_t ct, double kvx = 0, d
     Actor& a = allocActor(); a.think = AT_CORPSE; a.x = x; a.y = y; a.floor = f; a.srcType = ct; a.variant = variant;
     a.vx = kvx; a.vy = kvy; a.timer = 14;   // труп отлетает от смертельного удара и скользит ~14 кадров (трейс: 0.25-0.4 кл/кадр, затух.)
     a.drop = drop; a.burned = burned;       // сожжён огнём → обугленный труп
-    snd::ev(snd::SFX_ENEMY_DEATH);          // ЗВУК смерти врага (ZT 0x2d, FH death 0x184e6)
+    a.frameT = 0; a.state = 0;              // frameT = тик анимации трупа (FH/Hydaca дёргаются); state = фаза $35 (простреленный кадр)
+    snd::playSfx(snd::enemyDeathSfx(ct));   // ЗВУК смерти — УНИКАЛЕН по типу врага (enemy_ai.asm)
 }
 // Подбор оброненного оружия при шаге на труп: ищет труп под игроком с drop≥0, возвращает id (и снимает drop). cb добавляет в инвентарь.
 template <typename AddFn>
@@ -284,21 +338,84 @@ inline int zdamage(double distCells) {
     int dmg = 16 - (int)(distCells * 4.0);
     return dmg < 0 ? 0 : dmg;
 }
-// УРОН ОРУЖИЯ ИГРОКА врагу (ZT хендлеры 0x12eac/0x1303c/…): враг получает (0x400 − X)/100, где X — дист-функция оружия:
-//   handgun/laser X=dist²/512 (квадрат. спад, ~2.8кл), shotgun X=dist (лин., 4кл), pulse X=dist/2 (дальнобой, 8кл),
-//   огнетушитель X=0x3e8 (фикс, почти 0). HP врага = ROM/100. Любое попадание в дальности → ≥1.
-inline int playerWeaponDamage(int id, double distCells) {
-    double du = distCells * 256.0, X;
-    switch (id) {
-        case 8: case 10: X = du * du / 512.0; break;   // HANDGUN/LASER — квадратичный
-        case 12:         X = du;             break;     // SHOTGUN — линейный
-        case 14:         X = du * 0.5;       break;     // PULSE LASER — дальнобойный (½)
-        case 4:          if (distCells > 1.17) return 0; X = 1000.0; break;  // FIRE EXT — фикс, дальность <0x12c
+// ИНДЕКС БОЙЦА U-RON ($FF1030 = -$6fd0): 0..4, влияет на ПЕРКИ оружия (дизасм 12eac/1303c/130de/11f3c).
+// 0 = Ishii MARKSMAN (усилен. handgun). Меняется на брифинге (§9.5) — пока дефолт 0, ставится --fighter/консолью.
+inline int& playerFighter() { static int f = 0; return f; }
 
-        default:         X = du;             break;     // прочий hitscan ≈ shotgun
+// УРОН ОРУЖИЯ ИГРОКА врагу (ZT 187c8): HP−=(0x400−X), где X — дист-функция ствола (д7c0 дистанция). HP/урон в порте
+// оба /100 → соотношение сохранено. ⭐ПЕРКИ БОЙЦА (verified 12eac/1303c/130de): фолофф X÷2 → дальнобойнее+сильнее:
+//   handgun X=du²/512 (боец0/2 ÷2), laser X=du²/512, shotgun X=du (боец0 ÷2), pulse X=du/2 (боец0 ÷2), fire-ext X=0x3e8@<1.17кл.
+inline int playerWeaponRawDamage(int id, double distCells) {
+    double du = distCells * 256.0, X;
+    int fg = playerFighter();
+    switch (id) {
+        case 8:  X = du * du / 512.0; if (fg == 0 || fg == 2) X *= 0.5; break;   // HANDGUN (боец0/2 фолофф÷2)
+        case 10: X = du * du / 512.0; break;                                     // LASER GUN
+        case 12: X = du;              if (fg == 0)            X *= 0.5; break;    // SHOTGUN (боец0 ÷2)
+        case 14: X = du * 0.5;        if (fg == 0)            X *= 0.5; break;    // PULSE LASER (боец0 ÷2)
+        case 4:  if (distCells > 1.17) return 0; X = 1000.0; break;              // FIRE EXT — фикс 0x3e8, дальность <0x12c
+        default: X = du; break;                                                  // прочий hitscan ≈ shotgun
     }
     if (X >= 1024.0) return 0;                           // вне дальности (X ≥ 0x400)
-    int dmg = (int)((1024.0 - X) / 100.0);
+    return (int)(1024.0 - X);
+}
+inline bool enemyLOS(const Level& lvl, int floor, double ex, double ey, double px, double py);  // fwd-декл (тело ниже)
+// ⭐КОНУС-АВТОНАВЕДЕНИЕ (ZT 0x167b0, verified): БЛИЖАЙШИЙ живой враг на этаже в конусе оружия. По дизасму:
+//   fwd = rel·dir (проекция на взгляд), scale = 64/fwd, lat = rel⊥dir; попадание если 64·|lat|/fwd ≤ scale/8 + d1.
+//   d1 = полуширина конуса (handgun 1, laser 3, shotgun/pulse/foam 8; боец-перки шире). Берётся цель с МАКС scale
+//   (ближайшая) среди попавших в конус. minScale>0 = порог ближней дальности (для мили-кулаков). Возврат idx или −1.
+// ⭐СТОЙКА-МАСКА игрока (ROM 167ce, по питчу -0x71e6): прыжок(питч>0)→0x80, стойка(≈0)→0x40, присед(питч<0)→0x08.
+// Актёр поражаем конусом ⟺ у него взведён бит текущей стойки (167e8: +0x4 & маска ≠ 0). Берём jump/crouch игрока
+// (не cam.pitch — тот включает лифт/лестницу/нокбэк).
+inline int playerStanceMask() {
+    const PlayerState& p = player();
+    if (p.jumpY   >  2.0) return 0x80;   // прыжок / целясь ВВЕРХ
+    if (p.crouchY < -2.0) return 0x08;   // присед / целясь ВНИЗ
+    return 0x40;                          // стойка
+}
+// ⭐БИТЫ СТОЙКИ актёра (ROM +0x4 = objdef+0x10, VERIFIED @0xAB0C): из какой стойки он поражаем.
+inline int actorStanceBits(const Actor& a) {
+    if (a.think == AT_CORPSE) return 0x08;                 // ТРУП: только присед (death andi #$ff2f → остаётся 0x08)
+    if (a.think != AT_ENEMY)  return 0xc8;                 // прочее — стойкой не фильтруем
+    if (a.srcType == 0x68)    return 0x48;                 // Pink Dog (objdef 0x5c): стоя+присед, НЕТ прыжка → перепрыгивается
+    if (a.srcType == 0x65) {                               // Hydaca: поза по Z (пол↔потолок)
+        if (a.z < 0.25) return 0x48;                       // низко/на полу → стоя+присед, НЕ прыжок (перепрыгивается)
+        if (a.z > 0.75) return 0xc0;                       // высоко/на потолке → стоя+прыжок, НЕ присед
+        return 0xc8;                                       // лезет/в прыжке между позами → все
+    }
+    return 0xc8;                                           // обычный враг (objdef 0xdc) → все стойки
+}
+inline int coneTargetEnemy(const Level& lvl, int floor, double px, double py, double dirX, double dirY,
+                           int d1, int minScale = 0) {
+    // БИТ-ТОЧНО как ZT 167b0 (integer 68k-ops): позиции ×256 (units), cos/sin амплитуда 256.
+    long cs = std::lround(dirX * 256.0), sn = std::lround(dirY * 256.0);
+    int best = -1, bestScale = minScale;                 // ZT держит МАКС scale (ближайшую цель)
+    const int mask = playerStanceMask();                 // стойка игрока → какие актёры поражаемы
+    auto& A = actors();
+    for (int i = 0; i < (int)A.size(); ++i) {
+        const Actor& a = A[i];
+        bool liveEnemy = (a.think == AT_ENEMY && a.hp > 0);
+        bool corpse    = (a.think == AT_CORPSE);           // ТРУП тоже цель конуса (поражаем из приседа) — ROM 167b0
+        if (!a.active || a.floor != floor || (!liveEnemy && !corpse)) continue;
+        if ((actorStanceBits(a) & mask) == 0) continue;    // СТОЙКА-ФИЛЬТР (ROM 167e8): нет бита текущей стойки → пропуск
+        long dx = std::lround((a.x - px) * 256.0), dy = std::lround((a.y - py) * 256.0);
+        long d4 = (dx * cs + dy * sn) >> 6;              // forward_dot >> 6 (проекция на взгляд)
+        if (d4 < 2) continue;                            // враг позади/впритык
+        int scale = (int)(0x10000 / d4);                 // ZT scale = 0x10000/d4 (= 64/fwd_клетки)
+        if (scale <= bestScale) continue;                // не ближе уже найденной (ZT bls skip)
+        long ldot = dy * cs - dx * sn;                   // боковой dot
+        int d6 = (int)(ldot / d4); if (d6 < 0) d6 = -d6; // |lateral/d4| (усечение как divs)
+        int tol = (scale >> 3) + d1;                     // допуск = scale/8 + конус оружия
+        if (d6 > tol) continue;                          // вне конуса
+        if (!enemyLOS(lvl, floor, a.x, a.y, px, py)) continue;  // ZT ищет по ВИДИМЫМ → не бить сквозь стены
+        best = i; bestScale = scale;
+    }
+    return best;
+}
+inline int playerWeaponDamage(int id, double distCells) {
+    int raw = playerWeaponRawDamage(id, distCells);
+    if (raw <= 0) return 0;                              // вне дальности
+    int dmg = raw / 100;                                 // HP врага = ROM/100
     return dmg < 1 ? 1 : dmg;
 }
 // Параметры движения врага. ВЕРИФ. ПО ДИЗАСМУ: think вызывается КАЖДЫЙ кадр (планировщик 0x1327a: subq.b #1,$1f;
@@ -315,8 +432,10 @@ inline EMove enemyMove(uint8_t ct) {
         case EC_GRENADIER:   return {1.0/8,   0x2d/256.0*E};  // FH-SF: >>3, ±0x2d
         case EC_MELEE:       return {1.0/4,   0x1e/256.0*E};  // Imp: >>2, ±0x1e
         case EC_HOPPER:      return {1.0/8,   0x28/256.0*E};  // Hydaca chase: >>3, ±0x28
+        case EC_DOG:         return {1.0/2,   0x48/256.0*E};  // Dog ПОГОНЯ: >>1 (быстро!), ±0x48 (ZT 0x195ba asr#1 / 0x195d2 кламп 0x48). Патруль медленнее — через scale.
         case EC_BOSS_PROJ:   return {1.0/8,   0x0c/256.0*E};  // Boss1: >>3, ±0x0c (медленный)
-        case EC_BOSS_MELEE:  return {1.0/4,   0x20/256.0*E};  // Boss3: >>2, ±0x20 (быстрый чардж)
+        case EC_BOSS_MELEE:  return (ct == 0x6B) ? EMove{1.0/8, 0x10/256.0*E}   // Boss2: >>3, ±0x10 (медленный, ZT 0x18c98/0x18ca4)
+                                                 : EMove{1.0/4, 0x20/256.0*E};  // Boss3: >>2, ±0x20 (быстрый чардж, ZT 0x1a422)
         default:             return {1.0/8,   0x28/256.0*E};  // FH/Sgt: >>3, ±0x28
     }
 }
@@ -333,8 +452,49 @@ inline double enemySpeed(uint8_t ct) {
         default:   return 0.034;            // FH/Sgt/Revenant/FH-SF
     }
 }
+// HYDACA wall-check (ZT 0x150de/1512e/1517e/151ce → 0x1521e): стена ВПЛОТНУЮ = точка на 0x24 (36 units=0.14 кл)
+// в сторону = стена (celltype LUT==1), И суб-позиция у соотв. КРАЯ клетки ($21/$23 ≤0x20=0.125). Возвращает направление
+// стены (0=W 1=E 2=N 3=S) или −1. ⚠ Порт раньше брал nearWall (стена в любой соседней клетке) → Hydaca цеплялась
+// ИЗДАЛЕКА (в центре клетки у стены-соседа). ZT цепляется лишь ВПЛОТНУЮ к грани.
+// Стена, по которой Hydaca ЛАЗИТ (ZT wall-check 0x1521e: celltype LUT==1 = солидная стена). ⚠ ДИАГОНАЛИ (icon 2-5) ИСКЛЮЧЕНЫ
+// (в ROM LUT≠1 → не лазит) — иначе Hydaca застревает в climb-петле у диагонали (юзер); двери тоже нет. Базовая/спец/разруш. стены.
+inline bool hydClimbWall(uint8_t ct) { int ic = cellIcon(ct); return ic == 1 || ic == 12 || ic == 14; }
+// ⭐ВЫБОР ПОЗЫ ЛАЗАНИЯ Hydaca (ZT draw 0x1539e states 3-A): per-state геометрия (dx=posX−camX восток+, dy=posY−camY юг+) →
+// climbDir-индекс (поза a1=0,a2=1,a3=2,a4=3,a6=4,a7=5). Зависит от СТЕНЫ+ЛАТЕРАЛИ (state 3-10) и РАКУРСА к камере, НЕ только atan2.
+inline int hydClimbPose(int state, double dx, double dy) {
+    double adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+    switch (state) {
+        case 3:  if (dy <= 0 && adx < ady) return 3;  return dx > 0 ? 1 : 4;   // N→E: a4 / a2,a6
+        case 4:  if (dy <= 0 && adx < ady) return 2;  return dx > 0 ? 0 : 5;   // N→W: a3 / a1,a7
+        case 5:  if (dy >= 0 && adx < ady) return 2;  return dx > 0 ? 5 : 0;   // S→E: a3 / a7,a1
+        case 6:  if (dy >= 0 && adx < ady) return 3;  return dx < 0 ? 1 : 4;   // S→W: a4 / a2,a6
+        case 7:  if (dx >= 0 && ady < adx) return 2;  return dy < 0 ? 5 : 0;   // E→N: a3 / a7,a1
+        case 8:  if (dx >= 0 && ady < adx) return 3;  return dy > 0 ? 1 : 4;   // E→S: a4 / a2,a6
+        case 9:  if (dx <= 0 && ady < adx) return 3;  return dy < 0 ? 1 : 4;   // W→N: a4 / a2,a6
+        case 10: if (dx <= 0 && ady < adx) return 2;  return dy > 0 ? 5 : 0;   // W→S: a3 / a7,a1
+    }
+    return 0;
+}
+inline int hydacaWallDir(const Level& lvl, int floor, double x, double y) {
+    double fx = x - std::floor(x), fy = y - std::floor(y);       // суб-позиция в клетке 0..1
+    const double R = 36.0 / 256.0;                                // 0x24 units
+    if (fx <= 0.125 && hydClimbWall(lvl.cellType(floor, (int)std::floor(x - R), (int)y))) return 0;  // W
+    if (fx >= 0.875 && hydClimbWall(lvl.cellType(floor, (int)std::floor(x + R), (int)y))) return 1;  // E
+    if (fy <= 0.125 && hydClimbWall(lvl.cellType(floor, (int)x, (int)std::floor(y - R)))) return 2;  // N
+    if (fy >= 0.875 && hydClimbWall(lvl.cellType(floor, (int)x, (int)std::floor(y + R)))) return 3;  // S
+    return -1;
+}
 // PRNG для ИИ врага (как ZT jsr $a5c — случайный сдвиг точки прицела ±1 клетка). LCG, детерминир.
 inline uint32_t enemyRng() { static uint32_t s = 0x13579bdfu; s = s * 1664525u + 1013904223u; return s; }
+// СТЕЛС-ГЕЙТ ПОПАДАНИЯ стрелков (ZT 0x1846e/0x1b342/0x19cf2/0x1aa76/0x18dec/0x1a626 — идентичен у всех):
+// порог d3 по СТОЙКЕ+СВЕТУ, rnd&0x3ff >= d3 → ПРОМАХ. стоя-свет 0x400 (всегда попал) / стоя-тьма 0x300 (25% промах) /
+// присед-свет 0x200 (50%) / присед-тьма 0x17b (~63%). «Тьма» = тёмный режим этажа (ZT -$714e; порт: envMode≥2).
+inline bool enemyShotMiss(int envMode) {
+    bool crouch = (player().crouchY < -2.0);
+    bool dark   = (envMode >= 2);
+    int thr = crouch ? (dark ? 0x17b : 0x200) : (dark ? 0x300 : 0x400);
+    return (int)(enemyRng() & 0x3ff) >= thr;
+}
 // Графика врага (объект-банк, ПЛЕЙСХОЛДЕР, по типу). Реальные спрайт-банки (0x1B7B38…, дерево 3 уровня
 // 32×32 column-major, кадр 0x26 б) — отдельная graphics-задача (TODO).
 inline uint8_t enemyTileForCt(uint8_t ct) {
@@ -359,10 +519,15 @@ inline bool enemyLOS(const Level& lvl, int floor, double ex, double ey, double p
     if (d < 0.01) return true;
     dx /= d; dy /= d;
     for (double t = 0.2; t < d; t += 0.2) {
-        int cx = (int)(ex + dx * t), cy = (int)(ey + dy * t);
+        double wx = ex + dx * t, wy = ey + dy * t;
+        int cx = (int)wx, cy = (int)wy;
         if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return false;
         uint8_t ct = lvl.cellType(floor, cx, cy);
-        if (cellBlocks(ct)) return false;                         // стена закрывает обзор
+        // ДИАГОНАЛЬ (0x02-0x05) = ТОНКАЯ ГИПОТЕНУЗА для зрения (ROM enemy-LOS 0166e8: полуплоскость по субкоордам
+        // 16794/1677e/1678a/16772) — обзор проходит сквозь ПУСТУЮ половину клетки. Раньше cellBlocks квадратил →
+        // враг «слеп» у диагонали (баг «детект у диагоналей»). Движение врагов ОСТАЁТСЯ квадратом (ROM 14858, faithful).
+        if (ct >= 2 && ct <= 5) { if (cellBlockedAt(ct, wx - cx, wy - cy)) return false; }
+        else if (cellBlocks(ct)) return false;                    // сплошная стена закрывает обзор
         if (cellIsDoor(ct) && doorOpen(floor, cx, cy) < 0.4) return false;  // ЗАКРЫТАЯ дверь блокирует; ОТКРЫТАЯ — пропускает
     }
     return true;
@@ -375,7 +540,8 @@ inline void spawnEnemyShot(double x, double y, int f, double dx, double dy, int 
     a.state = mode;
     if (mode == 2) { a.vx = dx * 0.10; a.vy = dy * 0.10; a.z = 0.12; a.vz = 0.045;  // граната: дуга, медленнее
                      a.tile = A_EXPL_TILE; a.timer = 110; }
-    else           { a.vx = dx * 0.16; a.vy = dy * 0.16; a.tile = A_SPARK_SEQ[0]; a.timer = 80; }
+    else           { a.vx = dx * 0.25; a.vy = dy * 0.25; a.tile = A_SPARK_SEQ[0]; a.timer = 80;  // Boss1: прямой, ~0.25кл/кадр (ZT 0x192aa dx·64/dist)
+                     a.z = 8.0; a.vz = (double)((int)(enemyRng() & 7) - 4); }  // ⭐Z-полоса снаряда (ROM 15f38: Z=8, zVel=(rnd&7)−4) — для верт.ДОЖА
 }
 
 // Создать ОДНОГО врага в клетке (x,y) этажа.
@@ -388,7 +554,8 @@ inline void spawnOneEnemy(const Level& lvl, int floor, int x, int y) {
     // Sgt (0x29): таймер трансформации в FH-SF (ZT state6 0x1b51a — морф человека в инопланетянина по истечении времени).
     a.xformT = (ct == 0x29) ? (240 + ((x * 11 + y * 17) % 180)) : 0;       // ~4-7с до морфа (дизасм +0x41=50-81 тиков)
     a.variant = (ct == 0x2A) ? (uint8_t)((x * 5 + y * 3) & 1) : 0;         // только FH: 2 визуальные вариации (Hydaca драйвит variant по z)
-    if (ct == 0x65) { a.z = 1.0; a.variant = 1; }                          // Hydaca стартует НА ПОТОЛКЕ (висит, потом падает)
+    if (ct == 0x65) { bool onCeil = ((x * 5 + y * 3) & 1); a.z = onCeil ? 1.0 : 0.0; a.variant = onCeil ? 1 : 0; }  // Hydaca: ПОЛ/ПОТОЛОК 50/50 (ZT init $34=rnd&1)
+    { int as = snd::enemyAppearSfx(ct); if (as >= 0) snd::playSfx(as); }  // ЗВУК ПОЯВЛЕНИЯ врага (подтверждён на слух в оригинале)
 }
 // Спавн врага ЗАДАННОГО типа в точке (для консоли). ct — celltype врага (0x29..0x6b).
 inline void spawnEnemyByType(int floor, double x, double y, uint8_t ct) {
@@ -396,7 +563,8 @@ inline void spawnEnemyByType(int floor, double x, double y, uint8_t ct) {
     a.x = x; a.y = y; a.hp = enemyHp(ct); a.srcType = ct; a.tile = enemyTileForCt(ct);
     a.homeX = x; a.homeY = y; a.state = 0; a.timer = 0; a.fireCd = 20;
     a.xformT = (ct == 0x29) ? 300 : 0;
-    if (ct == 0x65) { a.z = 1.0; a.variant = 1; }
+    if (ct == 0x65) { bool onCeil = (((int)x * 5 + (int)y * 3) & 1); a.z = onCeil ? 1.0 : 0.0; a.variant = onCeil ? 1 : 0; }  // пол/потолок 50/50
+    { int as = snd::enemyAppearSfx(ct); if (as >= 0) snd::playSfx(as); }  // ЗВУК ПОЯВЛЕНИЯ (objdef+0x25)
 }
 // ПРОКСИ-СПАВН (ZT 0x15d18: скан 11×11 ±5 кл вокруг игрока — враги ПОЯВЛЯЮТСЯ когда подходишь, не все при загрузке!).
 // Маркеры этажа собираются в pending; updateEnemySpawns каждый кадр спавнит те, что в радиусе. Это убирает «враги
@@ -419,6 +587,12 @@ inline void spawnMapFires(const Level& lvl, int floor) {
                 spawnFire(x + 0.5, y + 0.5, floor, -1);                              // вечный огонь-хазард
             }
 }
+// «НЕУБИТЫЕ ВРАГИ» для счётчика кокпита (ZT 57e0c): живые актёры-враги этажа + ещё НЕ РАЗБУЖЕННЫЕ маркеры
+// в гриде (спящие ct 0x29-0x2B/0x65-0x6B, у нас = pendingSpawns). Кламп 99 (2 цифры, ZT 1e00e).
+inline int enemyCountRemaining(int floor) {
+    int n = aliveEnemies(floor) + (int)pendingSpawns().size();
+    return n > 99 ? 99 : n;
+}
 inline void updateEnemySpawns(const Level& lvl, int floor, double px, double py, double range = 5.5) {
     auto& p = pendingSpawns();
     for (size_t i = 0; i < p.size(); ) {                              // спавн маркеров в радиусе (box ±range) от игрока
@@ -430,6 +604,11 @@ inline void updateEnemySpawns(const Level& lvl, int floor, double px, double py,
     }
 }
 // Враги ОТКРЫВАЮТ дверь, на/у которой стоят (чтобы проходить через двери, как игрок — а не клипать закрытую).
+// Враги, ОТКРЫВАЮЩИЕ двери (ZT 5 зовов b1c4/b202): Sgt 0x29, FH-SF 0x69, Boss1 0x67, Boss2 0x6B, Boss3 0x6A.
+// FH 0x2A, Imp 0x2B, Hydaca 0x65, Revenant 0x66, Dog 0x68 — НЕ открывают (закрытая дверь их блокирует).
+inline bool enemyOpensDoors(uint8_t ct) {
+    return ct == 0x29 || ct == 0x67 || ct == 0x69 || ct == 0x6A || ct == 0x6B;
+}
 inline void openDoorsAtEnemies(const Level& lvl, int floor) {
     auto& m = doorMap();
     for (auto& a : actors()) {
@@ -448,25 +627,167 @@ inline void spawnEnemiesFromLevel(const Level& lvl, int floor) {
             if (cellIcon(lvl.cellType(floor, x, y)) == 9) spawnOneEnemy(lvl, floor, x, y);
 }
 
+// ── КАМЕРА-ТРЕВОГА (celltype 0x26; ZT actor think 15b1e, детект 15bc2, тревога 15b52) ──────────────
+// ЕДИНСТВЕННЫЙ легитимный источник разрушения стен/перманентного открытия дверей в игре.
+// Детект (state0): игрок ≤0x300 (3кл; боец4 ≤0x180=1.5кл) + LOS(166a0) → взвод $35=0x21 (33 тика; боец4 0x31=49), $34=1.
+// Взвод (state1): −1/тик, писк 0x71 каждые 8 тиков; $35→0 → ТРЕВОГА: 15c74 открыть/разрушить двери+стены 11×11
+// (b130/b168 → пусто НАВСЕГДА) + 15d18 разбудить врагов 11×11 + сирена 0x70/дверь 0x67. Одноразово (state2).
+// Простреливание (hHit 15e4e): 1 HP → взрыв 0x8A + падение с потолка, тревога НЕ срабатывает (destroyAlarmCam).
+// Рендер: реальный мигающий спрайт камеры (draw 15d84, tile 19/20 банка объектов) — см. pushCameraBillboards.
+struct AlarmCam { int x, y, floor; int state = 0; int timer = 0; bool dead = false; };
+inline std::vector<AlarmCam>& alarmCams() { static std::vector<AlarmCam> v; return v; }
+inline void collectAlarmCams(const Level& lvl, int floor) {           // при загрузке/смене этажа: собрать камеры 0x26
+    auto& v = alarmCams(); v.clear();
+    for (int y = 0; y < Level::H; ++y)
+        for (int x = 0; x < Level::W; ++x)
+            if (lvl.cellType(floor, x, y) == 0x26) v.push_back({x, y, floor, 0, 0, false});
+}
+// ЖИВАЯ камера в клетке (для хитскана/взрыва) → индекс или −1.
+inline int liveAlarmCamAt(int floor, int cx, int cy) {
+    auto& v = alarmCams();
+    for (size_t i = 0; i < v.size(); ++i)
+        if (v[i].floor == floor && !v[i].dead && v[i].x == cx && v[i].y == cy) return (int)i;
+    return -1;
+}
+inline bool alarmCamDeadAt(int floor, int cx, int cy) {              // для рендера: скрыть СБИТУЮ камеру
+    for (auto& c : alarmCams()) if (c.floor == floor && c.x == cx && c.y == cy) return c.dead;
+    return false;
+}
+// СБИТЬ камеру (ZT hHit 15e4e: 1 хит → взрыв 0x8A + падение, тревога НЕ срабатывает).
+inline void destroyAlarmCam(int idx) {
+    auto& c = alarmCams()[idx];
+    c.dead = true; c.state = 2;                                      // мертва + «сработавшей» (updateAlarmCams пропустит)
+    spawnExplosionA(c.x + 0.5, c.y + 0.5, c.floor, 0.7);            // взрыв на высоте камеры
+    snd::ev(snd::SFX_EXPLOSION);
+}
+// ТРЕВОГА (ZT 15b52): открыть/разрушить двери+стены 11×11 (15c74) + разбудить врагов 11×11 (15d18).
+inline void triggerAlarm(const Level& lvl, int floor, int cx, int cy, double px, double py) {
+    for (int dy = -5; dy <= 5; ++dy)                                  // 15c74: скан 11×11 (±5)
+        for (int dx = -5; dx <= 5; ++dx) {
+            int x = cx + dx, y = cy + dy;
+            if (x < 0 || y < 0 || x >= Level::W || y >= Level::H) continue;
+            uint8_t ct = lvl.cellType(floor, x, y);
+            if (ct == 0x06 || ct == 0x07 || ct == 0x83 || ct == 0x84) // двери 06/07 (b130/b168) + стены 83/84
+                requestDestruct(floor, x, y);                         // → 0x2D/0x2E → пусто НАВСЕГДА (applyDestruct)
+        }
+    auto& p = pendingSpawns();                                        // 15d18: разбудить/заспавнить спящих врагов 11×11
+    for (size_t i = 0; i < p.size();) {
+        if (std::abs(p[i].x - cx) <= 5 && std::abs(p[i].y - cy) <= 5) {
+            spawnOneEnemy(lvl, floor, p[i].x, p[i].y); p[i] = p.back(); p.pop_back();
+        } else ++i;
+    }
+    for (auto& a : actors()) {                                        // все враги радиуса → бегут к игроку (тревога = знают где ты)
+        if (!a.active || a.think != AT_ENEMY || a.floor != floor) continue;
+        if (std::abs((int)a.x - cx) <= 5 && std::abs((int)a.y - cy) <= 5 && a.state == 0) {
+            a.state = 1; a.aimX = px; a.aimY = py;
+        }
+    }
+    snd::playSfx(0x70);                                               // сирена тревоги
+    snd::playSfx(0x67);                                               // звук двери
+}
+// ⭐СТРОГИЙ 5-ЛУЧЕВОЙ LOS камеры (ROM 166a0): камера видит игрока ⟺ ВСЕ 5 лучей чисты — центр + смещения ТОЧКИ
+// КАМЕРЫ на ±0x1c (±0.109 кл) по X и по Y. Строже одиночного луча: убирает срабатывания из-за угла/сбоку (fidelity;
+// каждый луч = enemyLOS = порт-версия ROM-луча 166e8: cell-march, блок на стенах/закрытых дверях, диагонали полуплоскостью).
+inline bool cameraLOS(const Level& lvl, int floor, double cx, double cy, double px, double py) {
+    const double o = 0x1c / 256.0;                                   // 0.109375 кл (ROM ±0x1c к endpoint камеры)
+    return enemyLOS(lvl, floor, cx,     cy,     px, py)
+        && enemyLOS(lvl, floor, cx + o, cy,     px, py)
+        && enemyLOS(lvl, floor, cx - o, cy,     px, py)
+        && enemyLOS(lvl, floor, cx,     cy + o, px, py)
+        && enemyLOS(lvl, floor, cx,     cy - o, px, py);
+}
+inline void updateAlarmCams(const Level& lvl, int floor, double px, double py) {
+    int fg = playerFighter();
+    double range = (fg == 4) ? (0x180 / 256.0) : (0x300 / 256.0);     // боец4 (стелс) детектится ближе (1.5кл), иначе 3кл
+    for (auto& c : alarmCams()) {
+        if (c.floor != floor || c.state == 2) continue;              // state2 = уже сработала (одноразово)
+        double dist = gameDist(px - (c.x + 0.5), py - (c.y + 0.5));  // октаг. d7c0
+        if (c.state == 0) {                                          // ДЕТЕКТ: дистанция + строгий 5-лучевой LOS (166a0)
+            if (dist <= range && cameraLOS(lvl, floor, c.x + 0.5, c.y + 0.5, px, py)) {
+                c.state = 1; c.timer = (fg == 4) ? 0x31 : 0x21;      // ВЗВОД: 49/33 тика
+            }
+        } else {                                                     // state1: ВЗВОД
+            if (--c.timer <= 0) { triggerAlarm(lvl, floor, c.x, c.y, px, py); c.state = 2; }
+            else if ((c.timer & 7) == 0) snd::playSfx(0x71);         // ПИСК каждые 8 тиков
+        }
+    }
+}
+// РЕНДЕР камер: пушим ЖИВЫЕ камеры этажа в worldFx как высоко-настенные билборды (сбитые — не пушим → исчезают).
+// РЕАЛЬНЫЙ спрайт (draw 15d84, eda0-билборд как декор): камера безопасности с МИГАЮЩИМ объективом —
+// банк объектов 0x10E9BE, tile 19 = 0x110FBE (диод ВЫКЛ) ↔ tile 20 = 0x1111BE (диод ВКЛ), чередуются по
+// `btst #1, -$714a` (бит1 глобального тик-счётчика = decorFrame) → блинк с периодом 4 тика. Мигание НЕ зависит
+// от состояния тревоги (draw не меняется между детект/взвод/выстрел — камера всегда мигает; только выстрел → взрыв).
+// Геометрия из draw-математики 15d84: −0x20 в pitch-терме → topOff16=−S/2=−8 (верх у потолка); высота 3·S/8 → hFrac16=6.
+// Ширина: eda0 d4=3·S/16 в 128-колоночном пространстве райкастера, а дисплей растягивает горизонталь ×2 (128 лучей→256)
+// → на экране ширина = 3·S/8 = высота → спрайт КВАДРАТНЫЙ (тайл 32×32). worldFx-путь square=true считает width от S (без
+// ×2 декора-cwd), поэтому wFrac16=6 (= hFrac16), а НЕ 3 (иначе вдвое узко — как старый баг спрайтов 1:2). Шейдинг/z-тест — общий (eda0 CLUT).
+inline void pushCameraBillboards(int floor) {
+    const uint8_t tile = ((decorFrame() >> 1) & 1) ? 20 : 19;            // 15d84: btst #1 тик-счётчика → 19↔20
+    for (auto& c : alarmCams()) {
+        if (c.floor != floor || c.dead) continue;
+        WorldFx fx; fx.wx = c.x + 0.5; fx.wy = c.y + 0.5; fx.floor = floor;
+        fx.tile = tile; fx.topOff16 = -8; fx.hFrac16 = 6; fx.wFrac16 = 6;  // потолочная камера безопасности (eda0 0x110FBE/0x1111BE), квадрат 32×32
+        worldFx().push_back(fx);
+    }
+}
+
 // УРОН ВРАГУ (ZT damage-handler 0x1B824): HP−=dmg; KNOCKBACK (отлёт ОТ источника, ∝ урону) + стаггер +
 // искра-импакт; смерть HP≤0 → ТРУП (не взрыв). fromX/fromY = источник урона (для направления отлёта).
 // ZT receive-handler (sub_0187c8): на КАЖДОМ попадании ставит state=2 (СТАГГЕР), обнуляет+задаёт нокбэк-вектор
 // v=unit(от источника)·(урон>>3), вычитает HP (может уйти В МИНУС). СМЕРТЬ НЕ мгновенная — труп появляется в think
 // ТОЛЬКО когда нокбэк-скорость ЗАТУХАЕТ ниже 0x0a И HP<0 (sub_01887a $188b2: tst $36; bmi death). Поэтому ПОКА
 // СТРЕЛЯЕШЬ — каждый выстрел освежает скорость → враг ДЕРЖИТСЯ в стаггере; перестал → скорость села → труп.
-inline void hitEnemy(Actor& a, int dmg, double fromX, double fromY) {
+inline void hitEnemy(Actor& a, int dmg, double fromX, double fromY, int romDmg = -1) {
+    if (romDmg < 0) romDmg = dmg * 100;                                   // реконструкция ROM-урона (порт-урон = ROM/100)
     a.hp -= dmg;
     double dx = a.x - fromX, dy = a.y - fromY, d = std::hypot(dx, dy);    // отлёт ОТ источника
-    spawnBlood(a.x, a.y, a.floor, dx, dy, a.hp <= 0 ? 4 : 1);             // КРОВЬ: МАЛО (ZT: основной всплеск на убойный) — 1 капля/хит, 4 на смерть
-    if (a.hp <= 0 && a.think == AT_ENEMY && a.srcType == 0x6A && !a.revived) {  // BOSS3: воскресает ОДИН раз (ZT 0x1a40c)
-        a.revived = true; a.hp = enemyHp(0x6A) / 8; a.hitT = 1;            // ROM HP 0x3e8=1000 = 1/8 от полных 8000 → слабее фаза
-        spawnSparkA(a.x, a.y, a.floor); return;
+    // КРОВЬ-ВСПЛЕСК (ZT hHit 0x187c8→0x157ca): брызги ТОЛЬКО на СМЕРТЕЛЬНОМ ударе (killing blow) с уроном ≥0x338 —
+    // дизасм: `tst $36; bmi skip; sub d0,$36; bpl skip` = splat лишь когда HP переходит ≥0→<0 (НЕ живые удары, НЕ труп).
+    // Постоянная «кровь трупа» — это АНИМАЦИЯ СПРАЙТА (напр. FH модель B, кадры a4 с брызгами), а не частицы.
+    bool killedNow = (a.hp <= 0 && a.hp + dmg > 0);                       // этот удар убил (был жив, стал мёртв)
+    if (enemyBleeds(a.srcType) && romDmg >= 0x338 && killedNow) {
+        int n = bloodParticleCount(romDmg);
+        if (n > 0) spawnBlood(a.x, a.y, a.floor, dx, dy, n);
     }
+    // СМЕРТЕЛЬНЫЙ ФОНТАН БОССОВ: на УБОЙНОМ ударе (HP из ≥0 в <0) — двойной вызов d0=0x400 (ZT receive: 0x194da/e2, 0x18ffa/02,
+    // 0x1a8a6/ae), ~10 частиц. БЕЗ гейта ≥0x338 (форс d0=0x400). Гейт killedNow — НЕ повторять на трупе (ZT: `bmi` если HP уже <0).
+    if (killedNow && enemyDeathGush(a.srcType)) {
+        int n = bloodParticleCount(0x400);
+        spawnBlood(a.x, a.y, a.floor, dx, dy, n); spawnBlood(a.x, a.y, a.floor, dx, dy, n);
+    }
+    if (a.hp <= 0 && a.think == AT_ENEMY && a.srcType == 0x6A && !a.revived) {  // BOSS3: первая «смерть» → ПРИТВОРЯЕТСЯ МЁРТВЫМ
+        a.state = 99; a.timer = 25; a.vx = a.vy = 0; a.hitT = 0; a.fireAnimT = 0;  // ZT 0x1a3aa: state6, лежит 25 тиков → воскресает (в AT_ENEMY think)
+        return;
+    }
+    // ⭐HYDACA (ZT hHit 0x1575c): попадание СБИВАЕТ в state2 (z-vel=0 → ПАДЕНИЕ гравитацией), НЕ обычный xy-стаггер.
+    // На ПОЛУ ($24=−24, z≈0) → z-vel=+8 = ПОДПРЫГ вверх. Иначе (потолок/висит) → падает вниз. Горизонт гасится (ZT asr).
+    if (a.think == AT_ENEMY && a.srcType == 0x65) {
+        a.state = 1;                                              // активна, БАЛЛИСТИКА (не climb=state2)
+        if (a.z <= 0.05) a.vz = 8.0 / 48.0;                       // на ПОЛУ → ПОДПРЫГ вверх (ZT 0x1575c: z-vel=+8; шкала 48 units)
+        else if (a.vz >= 0.0) a.vz = -0.0001;                     // на ПОТОЛКЕ/висит → начать ПАДАТЬ из покоя (ZT z-vel=0, гравитация разгонит)
+        a.vx = a.vy = 0; a.hitT = 0;                              // без xy-скольжения — движение чисто вертикальное (ZT гасит горизонт)
+        return;                                                   // (смерть решится при приземлении по HP)
+    }
+    // REVENANT (ZT hHit→стаггер state A→recover 1abd8→re-engage 1abe0): подстреленный ВСТУПАЕТ В БОЙ (даже издалека),
+    // НО пак-алерт (1ab6c) НЕ зовёт → соседей-патрульных не будит (можно снять одного снайпингом, группа спит).
+    if (a.think == AT_ENEMY && a.srcType == 0x66 && a.state < 8) a.state = 1;  // → revEngage в combat-блоке
     // НОКБЭК ZT: v = (вектор от источника)·(урон>>3). Порт-урон = ROM/100 → v ≈ dmg·0.049 кл/кадр; затух. ÷2/кадр.
     double k = dmg * 0.049; if (k > 0.55) k = 0.55;
     if (d > 0.01) { a.vx = dx / d * k; a.vy = dy / d * k; } else { a.vx = a.vy = 0; }
     if (a.hitT <= 0) a.hitT = 1;                                          // ВХОД в стаггер (выход — по затуханию v, не таймеру)
     // (НЕТ импакт-искры по врагу: искра 0x12ad4 — только промах в СТЕНУ; по врагу = стаггер-аним/кровь)
+}
+
+// ВЫСТРЕЛ В ТРУП (ZT corpse-hHit 0x18832 и клоны): отлёт ОТ игрока по ОРУЖИЮ + $35++ → у трупов с кадром-по-$35
+// (Sgt/Imp/FH-SF/FH) спрайт меняется на «простреленный». Труп снова заскользит (timer).
+// ⭐raw = 0x400−X = дист-кривая ОРУЖИЯ (playerWeaponRawDamage). ROM: v = unit·(0x400−X)/16 world-units → /256 клетки
+// (вдвое слабее живого /8). Дальше/слабее оружие → меньше отлёт (было: КОНСТАНТА 0.18 — потеряна зависимость).
+// ROM corpse-hHit НЕ спавнит искру (только отлёт + $35++) — spawnSparkA убрана.
+inline void corpseHit(Actor& a, double fromX, double fromY, int raw) {
+    double dx = a.x - fromX, dy = a.y - fromY, d = std::hypot(dx, dy);
+    double k = (raw > 0 ? raw : 0) / 16.0 / 256.0;                      // (0x400−X)/16 units → клетки
+    if (d > 0.01) { a.vx = dx / d * k; a.vy = dy / d * k; } else { a.vx = a.vy = 0; }
+    a.timer = 8; ++a.state;                                             // снова скользит + фаза $35 (смена кадра «простреленный»)
 }
 
 // ── HIT-SCAN УРОН: луч от (px,py) вдоль (dx,dy) — если встречает врага раньше стены, наносит урон. ──
@@ -475,26 +796,55 @@ inline bool damageRay(const Level& lvl, int floor, double px, double py, double 
                       int weaponId, double& hx, double& hy) {
     double x = px, y = py;
     for (int i = 0; i < 1024; ++i) {
-        // враг в текущей клетке луча?
+        // враг в текущей клетке луча? (живой — приоритет)
         for (auto& a : actors()) {
             if (!a.active || a.think != AT_ENEMY || a.floor != floor) continue;
             if (std::fabs(a.x - x) < 0.5 && std::fabs(a.y - y) < 0.5) {
                 hx = a.x; hy = a.y;
                 double dd = gameDist(a.x - px, a.y - py);              // дистанция (октаг. d7c0) → дист-урон оружия
-                hitEnemy(a, playerWeaponDamage(weaponId, dd), px, py); // урон + отлёт + труп/искра
+                int raw = playerWeaponRawDamage(weaponId, dd);         // ROM-урон (для гейта крови ≥0x338)
+                int dmg = raw > 0 ? (raw / 100 < 1 ? 1 : raw / 100) : 0;
+                hitEnemy(a, dmg, px, py, raw);                         // урон + отлёт + кровь(по raw) + труп/искра
                 return true;
+            }
+        }
+        // труп в клетке луча (нет живого врага тут) → простреливание (смена кадра), луч останавливается
+        for (auto& a : actors()) {
+            if (!a.active || a.think != AT_CORPSE || a.floor != floor) continue;
+            if (std::fabs(a.x - x) < 0.5 && std::fabs(a.y - y) < 0.5) {
+                corpseHit(a, px, py, playerWeaponRawDamage(weaponId, gameDist(a.x - px, a.y - py))); hx = a.x; hy = a.y; return true;
             }
         }
         double nx = x + dx * 0.06, ny = y + dy * 0.06;
         int cx = (int)nx, cy = (int)ny;
         if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) break;
+        int ci = liveAlarmCamAt(floor, cx, cy);                                   // КАМЕРА-ТРЕВОГА в клетке луча → СБИТЬ (1 хит), тревога не сработает
+        if (ci >= 0) { destroyAlarmCam(ci); hx = cx + 0.5; hy = cy + 0.5; return true; }
         if (cellBlockedAt(lvl.cellType(floor, cx, cy), nx - cx, ny - cy)) {        // ДИАГОНАЛЬ учитывается (полуплоскость)
-            if (wallIsDestructible(lvl.cellType(floor, cx, cy))) requestDestruct(floor, cx, cy);  // выстрел в разруш./секрет-стену
+            if (wallIsSecret(lvl.cellType(floor, cx, cy))) requestDestruct(floor, cx, cy);  // ТОЛЬКО секрет-стены (a6bc: смена текстуры); 0x83/84 пуля НЕ ломает (тревога-камера)
             break;
         }
         x = nx; y = ny;
     }
     hx = x; hy = y;
+    return false;
+}
+
+// ⭐ ВЫСТРЕЛ ПО КАМЕРЕ-ТРЕВОГЕ (celltype 0x26): камера смонтирована ВЫСОКО (спрайт у потолка), её флаги +0x4 = 0x84
+// (бит 0x80). ROM cone-hitscan 167e8 поражает актёра ⟺ `+0x4 & стойка-маска ≠ 0`. Стойка-маски: прыжок 0x80 / стойка
+// 0x40 / присед 0x08 (167ce по питчу). 0x84 & 0x80 = 0x80, & 0x40 = 0, & 0x08 = 0 → камеру можно сбить ТОЛЬКО В ПРЫЖКЕ
+// (целясь вверх). Трасса луча по клеткам до 1-й стены; живая камера в клетке до стены → destroyAlarmCam (1 хит → взрыв,
+// тревога НЕ срабатывает, ZT hHit 15e4e). Гейт по стойке — у вызывающего (fireSpawn проверяет playerStanceMask()==0x80).
+inline bool traceCameraHit(const Level& lvl, int floor, double px, double py, double dx, double dy) {
+    double x = px, y = py;
+    for (int i = 0; i < 600; ++i) {                              // до 1-й стены (как traceMiss, ~31 кл)
+        double nx = x + dx * 0.06, ny = y + dy * 0.06; int cx = (int)nx, cy = (int)ny;
+        if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return false;
+        int ci = liveAlarmCamAt(floor, cx, cy);                  // ЖИВАЯ камера в клетке луча → сбить
+        if (ci >= 0) { destroyAlarmCam(ci); return true; }
+        if (cellBlockedAt(lvl.cellType(floor, cx, cy), nx - cx, ny - cy)) return false;  // стена раньше камеры → мимо
+        x = nx; y = ny;
+    }
     return false;
 }
 
@@ -510,16 +860,26 @@ inline int damageEnemiesAt(int floor, double x, double y, double r, int dmg) {
 
 // Взрыв гранаты/ракеты/мины (ZT radius 0x16294): радиус 4 кл, урон = ДИСТАНЦИЯ-FALLOFF (0x400−dist врагу, 16−dist·4
 // игроку) → у центра убивает, на 4 кл — 0. Нокбэк = через hitEnemy (стаггер-отлёт). + area-разрушение стен.
-inline void explodeAt(double x, double y, int f, const Camera& cam, double z = 0.5) {  // z = высота очага (0 пол / 0.5 глаз)
+inline void explodeAt(const Level& lvl, double x, double y, int f, const Camera& cam, double z = 0.5) {  // z = высота очага (0 пол / 0.5 глаз)
     spawnExplosionA(x, y, f, z);
     snd::ev(snd::SFX_EXPLOSION);                                 // звук взрыва
-    for (auto& a : actors()) {                                   // ВРАГИ в радиусе 4 кл: урон (0x400−dist)/100 + отлёт
+    // ЗT 9e1e: взрыв «ПРОЯВЛЯЕТ» латентных врагов у очага (спавн pending-маркеров в радиусе, БЕЗ LOS-гейта) —
+    // чтобы дремлющий враг, ещё не видевший игрока и потому не инстанцированный, попал под урон ниже.
+    { auto& p = pendingSpawns();
+      for (size_t i = 0; i < p.size();) {
+          if (std::abs(p[i].x + 0.5 - x) < 4.0 && std::abs(p[i].y + 0.5 - y) < 4.0) {
+              spawnOneEnemy(lvl, f, p[i].x, p[i].y); p[i] = p.back(); p.pop_back();   // материализуем (state0 — НЕ авто-агро)
+          } else ++i;
+      } }
+    for (auto& a : actors()) {                                   // ВРАГИ в радиусе 4 кл С LOS: урон (0x400−dist)/100 + отлёт (ZT 16294)
         if (!a.active || a.think != AT_ENEMY || a.floor != f) continue;
         double dd = gameDist(a.x - x, a.y - y);                 // октаг. дистанция от центра взрыва
-        if (dd < 4.0) { int dmg = (int)((1024.0 - dd * 256.0) / 100.0); if (dmg < 1) dmg = 1; hitEnemy(a, dmg, x, y); }
-        // ВЗРЫВ = ШУМ: будит врагов в радиусе слышимости (>урон-радиуса) → агро к игроку (ZT: урон→стаггер→AI, +алерт-союзников).
-        // Дремлющие (state 0) триггерятся и СБЕГАЮТСЯ на взрыв/игрока.
-        if (dd < 7.0 && a.state == 0) { a.state = 1; a.aimX = cam.px; a.aimY = cam.py; if (a.timer < 20) a.timer = 30; }
+        // LOS-гейт (ZT 166e8): взрыв НЕ бьёт сквозь стены. Фильтра по AI-состоянию НЕТ → дремлющий враг тоже гибнет.
+        if (dd < 4.0 && enemyLOS(lvl, f, x, y, a.x, a.y)) {
+            int raw = (int)(1024.0 - dd * 256.0); int dmg = raw / 100; if (dmg < 1) dmg = 1; hitEnemy(a, dmg, x, y, raw);
+        }
+        // ⚠ НЕТ wake-агро на взрыв: в ZT (16294) звукового агро/алерта не существует (проверено дизасмом). Враги
+        //   агрятся только по дистанции+LOS штатным AI; «проявление» латентных = грид-reveal выше, не бег на шум.
     }
     if (f == cam.floor) { double dd = gameDist(cam.px - x, cam.py - y);     // ИГРОК: zdamage(dist) = 16−dist·4 (до 16 в упор)
         int dmg = zdamage(dd); if (dmg > 0) damagePlayer(dmg, cam.px, cam.py, x, y); }
@@ -534,10 +894,14 @@ inline void explodeAt(double x, double y, int f, const Camera& cam, double z = 0
         if (a.x == x && a.y == y) continue;                     // не сам очаг
         if (gameDist(a.x - x, a.y - y) >= 2.0) continue;        // ZT 0x200 = 2 кл
         double ex = a.x, ey = a.y; int ef = a.floor; a.active = false;
-        explodeAt(ex, ey, ef, cam);                             // вторичный взрыв (рекурсия безопасна: пул фикс., снят до вызова)
+        explodeAt(lvl, ex, ey, ef, cam);                        // вторичный взрыв (рекурсия безопасна: пул фикс., снят до вызова)
     }
-    for (int dyc = -1; dyc <= 1; ++dyc)                          // ВЗРЫВ ломает разруш./секрет-стены вокруг (ZT скан 0x15c74)
-        for (int dxc = -1; dxc <= 1; ++dxc) requestDestruct(f, (int)x + dxc, (int)y + dyc);
+    { auto& vc = alarmCams();                                   // ВЗРЫВ валит камеры-тревоги в радиусе (ZT 16294 → receive/hHit 15e4e = 1 хит)
+      for (size_t i = 0; i < vc.size(); ++i)
+          if (!vc[i].dead && vc[i].floor == f && gameDist(vc[i].x + 0.5 - x, vc[i].y + 0.5 - y) < 4.0
+              && enemyLOS(lvl, f, x, y, vc[i].x + 0.5, vc[i].y + 0.5)) destroyAlarmCam((int)i);
+    }
+    // ⚠ ВЗРЫВ НЕ РАЗРУШАЕТ стены/двери (ZT 16294 деструкцию не зовёт). Разрушает ТОЛЬКО тревога-камера (updateAlarmCams).
 }
 
 // АНТИ-ОВЕРЛАП враг↔игрок (ZT 0x146fe: при дист<0x20 толкает актёра наружу к player+unit·0x20). В порте враг,
@@ -553,436 +917,4 @@ inline void enemyPlayerStandoff(Actor& a, const Camera& cam) {
 }
 
 // ── THINK + рендер всех актёров (раз в кадр). cam — игрок (для AI). Наполняет worldFx (очередь спрайтов). ──
-inline void updateActors(const Level& lvl, const Camera& cam) {
-    auto& v = actors();
-    // скорость игрока (для УПРЕЖДЕНИЯ точки прицела врага, как ZT добавляет target.vx/vy): дельта позы за кадр
-    static double s_ppx = cam.px, s_ppy = cam.py;
-    double pvx = cam.px - s_ppx, pvy = cam.py - s_ppy; s_ppx = cam.px; s_ppy = cam.py;
-    { PlayerState& p = player(); if (p.iframe > 0) --p.iframe; if (p.flash > 0) --p.flash;
-      double tgt = (p.knockTimer > 0) ? -16.0 : 0.0;             // НОКДАУН: питч в пол (ZT -0x71e4=-0x10), потом восстанавливается
-      if (p.knockTimer > 0) --p.knockTimer;
-      if (p.knockPitch < tgt) { p.knockPitch += 4; if (p.knockPitch > tgt) p.knockPitch = tgt; }   // ±4/кадр (ZT)
-      else if (p.knockPitch > tgt) { p.knockPitch -= 4; if (p.knockPitch < tgt) p.knockPitch = tgt; } }
-    for (auto& a : v) {
-        if (!a.active) continue;
-        switch (a.think) {
-            case AT_BULLET: {                            // летит → взрыв о стену / по ВРАГУ / по истечении
-                double nx = a.x + a.vx, ny = a.y + a.vy;
-                int cx = (int)nx, cy = (int)ny;
-                bool hit = (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) ||
-                           cellBlockedAt(lvl.cellType(a.floor, cx, cy), nx - cx, ny - cy);  // диагональ-полуплоскость
-                // РАКЕТА В ВРАГА (ZT снаряд 15f6e: актёр в ≤0x40≈0.25кл → детонация) — иначе пролетала насквозь.
-                // НЕ снапим в позицию врага (иначе спрайт взрыва ложится ПОВЕРХ врага) — взрыв на месте ракеты, радиус достанет.
-                if (!hit) for (auto& e : v) if (e.active && e.think == AT_ENEMY && e.floor == a.floor &&
-                                                gameDist(e.x - nx, e.y - ny) < 0.5) { hit = true; break; }
-                if (hit) {                                // взрыв ЧУТЬ ПЕРЕД стеной (иначе z-режется стеной)
-                    double sp = std::hypot(a.vx, a.vy);
-                    if (sp > 0 && (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H ||
-                                   cellBlockedAt(lvl.cellType(a.floor, cx, cy), nx - cx, ny - cy)))
-                        { a.x -= a.vx / sp * 0.4; a.y -= a.vy / sp * 0.4; }
-                    a.active = false; explodeAt(a.x, a.y, a.floor, cam);   // взрыв ракеты: урон врагам/игроку (снять ДО — анти-цепь-рекурсия)
-                } else { a.x = nx; a.y = ny; if (--a.timer <= 0) { a.active = false; explodeAt(a.x, a.y, a.floor, cam); } }
-                break;
-            }
-            case AT_GRENADE: {                           // ФИЗИКА (0x13adc): дуга+гравитация+отскок, фитиль → взрыв
-                bool nearTgt = false;                     // взрыв по условию: цель рядом
-                if (a.state == 1) {                       // граната ВРАГА → детонирует у ИГРОКА
-                    nearTgt = (a.floor == cam.floor && std::hypot(cam.px - a.x, cam.py - a.y) < 0.7);
-                } else {                                  // граната ИГРОКА → детонирует у ВРАГА
-                    for (auto& e : v) if (e.active && e.think == AT_ENEMY && e.floor == a.floor &&
-                                          std::hypot(e.x - a.x, e.y - a.y) < 0.6) { nearTgt = true; break; }
-                }
-                if (--a.timer <= 0 || nearTgt) { explodeAt(a.x, a.y, a.floor, cam, a.z); a.active = false; break; }  // взрыв на ВЫСОТЕ гранаты (z), не у глаз
-                double nx = a.x + a.vx, ny = a.y + a.vy;   // горизонталь + отскок от стен (reflect+damp, как neg/asr)
-                bool bounced = false;
-                if (cellBlocks(lvl.cellType(a.floor, (int)nx, (int)a.y))) { a.vx = -a.vx * 0.5; nx = a.x; bounced = true; }
-                if (cellBlocks(lvl.cellType(a.floor, (int)a.x, (int)ny))) { a.vy = -a.vy * 0.5; ny = a.y; bounced = true; }
-                if (nx >= 0 && ny >= 0 && nx < Level::W && ny < Level::H) { a.x = nx; a.y = ny; }
-                a.vz -= 0.0035; a.z += a.vz;               // гравитация ($2e -= ; $24 += )
-                if (a.z <= 0) { a.z = 0; if (a.vz < -0.02) { a.vz = -a.vz * 0.4; a.vx *= 0.7; a.vy *= 0.7; bounced = true; } else a.vz = 0; }  // отскок от пола
-                if (bounced && a.floor == cam.floor) snd::ev(snd::SFX_GRENADE_BOUNCE);   // ЗВУК отскока гранаты о стену/пол
-                break;
-            }
-            case AT_FLAME: {                             // СТРУЯ огнемёта: летит, оставляет ОГОНЬ-ТРЕЙЛ вдоль пути, ГАСНЕТ у стены.
-                // НЕ бьёт игрока (своё пламя) и не наносит прямой урон врагам — урон только от огня-трейла (AT_FIRE).
-                if ((a.frameT++ & 1) == 0)                                            // каждый 2-й кадр оставляет огонь (трейл вдоль струи)
-                    spawnFire(a.x, a.y, a.floor, 18, true);                           // player-safe: своё пламя не жжёт игрока
-                double nx = a.x + a.vx, ny = a.y + a.vy;
-                int cx = (int)nx, cy = (int)ny;
-                if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H ||
-                    cellBlocks(lvl.cellType(a.floor, cx, cy)) || --a.timer <= 0) a.active = false;  // тухнет у СТЕНЫ (не проходит) или по таймеру
-                else { a.x = nx; a.y = ny; }
-                break;
-            }
-            case AT_FIRE: {                              // ОГОНЬ-ОБЪЕКТ (ZT 0x142c6): жжёт горючих в ~1кл; вечный(карта)/фитиль(огнемёт)
-                ++a.frameT;
-                if (a.fireCd > 0) { if (--a.fireCd <= 0) a.active = false; break; }  // ЗАТУХАНИЕ от пены: гаснет, не жжёт
-                if ((a.frameT & 7) == 0) {               // периодический урон (не каждый кадр)
-                    for (auto& e : v) if (e.active && e.think == AT_ENEMY && e.floor == a.floor &&
-                                          std::hypot(e.x - a.x, e.y - a.y) < 1.0) { e.burned = true; hitEnemy(e, 2, a.x, a.y); }
-                    // игрока жжёт ТОЛЬКО хазард-огонь (state==0, карта 0x18), без огнеупор-костюма. Своё пламя (state 1) — нет.
-                    // ⚠ РАДИУС ИГРОКА = 0x30/256 ≈ 0.19 кл (ZT 0x143cc cmpi #$30) — НАМНОГО меньше, чем врагам (1 кл 0x100):
-                    // к огню можно подойти ВПЛОТНУЮ и почти не гореть (фикс «можно подойти ближе»).
-                    if (a.state == 0 && !player().fireImmune && a.floor == cam.floor &&
-                        std::hypot(cam.px - a.x, cam.py - a.y) < 0.19) damagePlayer(8, cam.px, cam.py, a.x, a.y);
-                }
-                if (a.timer >= 0 && --a.timer <= 0) a.active = false;          // фитиль (огнемёт); карта (timer<0) — вечно
-                break;
-            }
-            case AT_FOAM: {                              // ПЕНА огнетушителя: ПАДАЕТ вниз, ТУШИТ огонь, БЕЗ урона
-                for (auto& e : v) if (e.active && (e.think == AT_FIRE || e.think == AT_FLAME) && e.floor == a.floor &&
-                                      std::hypot(e.x - a.x, e.y - a.y) < 0.6) {
-                    if (e.think == AT_FIRE && e.timer < 0)                       // вечный карта-огонь → запомнить как потушенный
-                        fireExtinguished().insert(e.floor * 1024 + (int)e.y * 32 + (int)e.x);
-                    if (e.think == AT_FIRE && e.fireCd <= 0) e.fireCd = 10;      // СВОЯ АНИМ-ЗАТУХАНИЯ: огонь гаснет ~10 кадров (не мгновенно)
-                    else if (e.think == AT_FLAME) e.active = false;             // летящее пламя огнемёта — мгновенно
-                }
-                a.z += a.vz; a.vz -= 0.012;              // ПАДЕНИЕ вниз (ZT draw смещает пену вниз с возрастом)
-                double nx = a.x + a.vx, ny = a.y + a.vy;
-                int cx = (int)nx, cy = (int)ny;
-                if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H ||
-                    cellBlocks(lvl.cellType(a.floor, cx, cy)) || --a.timer <= 0) { a.active = false; }
-                else { a.x = nx; a.y = ny; a.vx *= 0.9; a.vy *= 0.9; }
-                break;
-            }
-            case AT_EXPLOSION: if (++a.timer >= A_EXPL_FRAMES)  a.active = false; break;
-            case AT_SPARK:     if (++a.timer >= A_SPARK_FRAMES) a.active = false; break;
-            case AT_DEATH:     if (++a.timer >= A_EXPL_FRAMES)  a.active = false; break;
-            case AT_BLOOD: {                              // КРОВЬ (ZT think 0x158cc): лёт→гравитация→пятно о стену/пол
-                if (a.state != 0) { if (++a.timer >= 48) a.active = false; break; }   // ПЯТНО стареет ~48 кадров и пропадает
-                bool hitWall = false;
-                for (int s = 0; s < 4; ++s) {            // 4 подшага с проверкой стены (ZT 16 подшагов, dbra d7)
-                    double nx = a.x + a.vx * 0.25, ny = a.y + a.vy * 0.25;
-                    int cx = (int)nx, cy = (int)ny;
-                    if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H ||
-                        cellBlocks(lvl.cellType(a.floor, cx, cy))) { hitWall = true; break; }
-                    a.x = nx; a.y = ny;
-                }
-                a.z += a.vz; a.vz -= 0.03125;            // гравитация (ZT $24 += $2e; $2e -= 2 → /64)
-                a.vx *= 0.75; a.vy *= 0.75;              // гориз. трение (ZT vel -= vel>>2 при отсутствии столкновения)
-                if (hitWall)        { a.state = 1; a.vx = a.vy = a.vz = 0; a.tile = A_BLOOD_SPLAT; a.timer = 0; }       // пятно о СТЕНУ ($1a=0x16f02)
-                else if (a.z <= 0)  { a.z = 0; a.state = 2; a.vx = a.vy = a.vz = 0; a.tile = A_BLOOD_SPLAT; a.timer = 0; } // пятно на ПОЛУ ($1a=0x16f2c)
-                else if (++a.frameT > 40) a.active = false;   // страховка от «вечно висящей» капли
-                break;
-            }
-            case AT_MINE: {                              // детонация: враг ИЛИ игрок ближе 1 кл → взрыв + урон
-                if (a.timer > 0) { --a.timer; break; }   // АРМИНГ (ZT $1f=0x14): пока инертна — НЕ детонирует (защита ставившего)
-                bool trig = (a.floor == cam.floor && gameDist(cam.px - a.x, cam.py - a.y) < 1.0);  // ZT 0x100 = 1 кл (игрок)
-                if (!trig) for (auto& e : v) if (e.active && e.think == AT_ENEMY && e.floor == a.floor &&
-                                                 gameDist(e.x - a.x, e.y - a.y) < 1.0) { trig = true; break; }  // или враг
-                if (trig) { explodeAt(a.x, a.y, a.floor, cam, 0.0); a.active = false; }  // мина на ПОЛУ → взрыв низко
-                break;
-            }
-            case AT_ENEMY: {                             // AI: ДИСПЕТЧ ПО КЛАССУ (по разбору capstone think-функций каждого типа)
-                if (a.floor != cam.floor) break;
-                // Sgt → FH-SF: трансформация человека в инопланетянина по истечении времени (ZT state6 0x1b51a).
-                // Меняем srcType → класс остаётся EC_GRENADIER, а gfx-слот (Sgt→FH-SF) и спрайты сменяются автоматически.
-                if (a.xformT > 0 && !enemiesFrozen()) {
-                    if (--a.xformT == 0 && a.srcType == 0x29) {
-                        a.srcType = 0x69; a.tile = enemyTileForCt(0x69);  // стал Former Human SF
-                        a.state = 0; a.timer = 0; a.fireCd = 30;          // сброс боевого цикла после морфа
-                    }
-                }
-                EClass ec = enemyClass(a.srcType);
-                if (a.hitT > 0) {                                        // СТАГГЕР (ZT state 2, sub_01887a): выход по ЗАТУХАНИЮ скорости
-                    double sp = std::hypot(a.vx, a.vy);
-                    if (sp >= 0.039) {                                   // ZT 0x0a/256≈0.039 кл/кадр: ещё «летит» → скользим + ÷2, держимся в стаггере
-                        double nx = a.x + a.vx, ny = a.y + a.vy;
-                        if (!cellBlockedForEnemy(lvl.cellType(a.floor, (int)nx, (int)a.y), nx - (int)nx, a.y - (int)a.y)) a.x = nx;
-                        if (!cellBlockedForEnemy(lvl.cellType(a.floor, (int)a.x, (int)ny), a.x - (int)a.x, ny - (int)ny)) a.y = ny;
-                        enemyPlayerStandoff(a, cam);                     // анти-оверлап и в стаггере (не слиться с игроком)
-                        a.vx *= 0.5; a.vy *= 0.5;                        // ZT: asr.w (÷2) скорости каждый кадр
-                        ++a.hitT;                                        // кадр анимации стаггера (растёт пока держится)
-                        break;
-                    }
-                    // скорость СЕЛА (ZT $188b2): решаем смерть / восстановление
-                    if (a.hp <= 0) {                                     // HP<0 → СМЕРТЬ → труп на месте (ZT $189e4, v уже мала)
-                        int dr = enemyWeaponDrop(a.srcType);            // солдаты роняют ствол (невидимо; подбор шагом на труп)
-                        if (dr == -2) dr = (enemyRng() & 0x10) ? 10 : 7;  // Sergeant/FH-SF: btst #4 → laser(10) иначе grenade(7) (дизасм 0x1b716)
-                        spawnCorpse(a.x, a.y, a.floor, a.srcType, a.vx, a.vy, a.variant, dr, a.burned);  // burned → обугленный труп
-                        a.active = false; break;
-                    }
-                    a.hitT = 0; a.vx = a.vy = 0;                         // ВЫЖИЛ → восстановление к обычному AI (ZT $34=0)
-                    break;                                              // пауза кадр на восстановление
-                }
-                if (enemiesFrozen()) break;                              // чит: враги замерли
-                double rx = cam.px - a.x, ry = cam.py - a.y;
-                double de = std::hypot(rx, ry);                              // евклид — ТОЛЬКО для единичного вектора прицела
-                double ux = (de > 0.01) ? rx / de : 0.0, uy = (de > 0.01) ? ry / de : 0.0;
-                double d = gameDist(rx, ry);                                 // ГЕЙМПЛЕЙНАЯ дистанция (октаг. d7c0) — все пороги/урон ниже
-                bool los = enemyLOS(lvl, a.floor, a.x, a.y, cam.px, cam.py);
-                if (a.fireCd > 0) --a.fireCd;
-                if (a.fireAnimT > 0) --a.fireAnimT;                      // таймер анимации стрельбы/удара
-                EMove mv = enemyMove(a.srcType);
-                // движение к точке (tx,ty): v=clamp((t-pos)·gain, ±vmax) per-axis, коллизия по осям → липнет к стенам
-                auto moveTo = [&](double tx, double ty, double scale) {
-                    double avx = (tx - a.x) * mv.gain, avy = (ty - a.y) * mv.gain, vm = mv.vmax * scale;
-                    if (avx >  vm) avx =  vm; else if (avx < -vm) avx = -vm;
-                    if (avy >  vm) avy =  vm; else if (avy < -vm) avy = -vm;
-                    a.vx = avx; a.vy = avy;
-                    // КОЛЛИЗИЯ С МАРЖОЙ (ZT 0x145aa/0x146fe клампят суб-позицию $21/$23 к [0x40,0xbf] = радиус ~0.25кл от стены):
-                    // проверяем ВЕДУЩИЙ КРАЙ (pos+sign·R), иначе центр заходил в стену вплотную → спрайт врага обрезался стеной.
-                    const double R = 0.26;
-                    double nx = a.x + a.vx, ny = a.y + a.vy;
-                    double ex = nx + (a.vx > 0 ? R : -R);               // передний край по X
-                    if (a.vx != 0 && !cellBlockedForEnemy(lvl.cellType(a.floor, (int)ex, (int)a.y), ex - (int)ex, a.y - (int)a.y)) a.x = nx;
-                    double ey = ny + (a.vy > 0 ? R : -R);               // передний край по Y
-                    if (a.vy != 0 && !cellBlockedForEnemy(lvl.cellType(a.floor, (int)a.x, (int)ey), a.x - (int)a.x, ey - (int)ey)) a.y = ny;
-                    enemyPlayerStandoff(a, cam);                         // АНТИ-ОВЕРЛАП (ZT 0x146fe): не проваливаться в игрока
-                    if (std::hypot(a.vx, a.vy) > 0.004) a.frameT += 2;   // кадр ходьбы (anim0) при движении
-                };
-
-                // ═══ DOG (0x19540): ДРЕМЛЕТ У ДОМА → погоня по ЖИВОМУ игроку при ОБНАРУЖЕНИИ → прыжок-укус ═══
-                if (ec == EC_DOG) {
-                    if (a.state == 0) {                                  // ПАТРУЛЬ У ДОМА (НЕ дрейф к игроку!): бродит ±1кл у спавна
-                        if (los && d < 6.0) { a.state = 1; }             // ОБНАРУЖИЛ (LOS + близко) → погоня
-                        else { moveTo(a.aimX, a.aimY, 0.22);
-                            if (--a.timer <= 0) { a.aimX = a.homeX + ((int)(enemyRng() & 0x1ff) - 256) / 256.0;  // у ДОМА
-                                                   a.aimY = a.homeY + ((int)(enemyRng() & 0x1ff) - 256) / 256.0; a.timer = 70; } }
-                        break;
-                    }
-                    if (d > 11.0 && !los) { a.state = 0; a.timer = 1; break; }   // потерял → назад к дому
-                    if (a.state == 1) { moveTo(cam.px, cam.py, 1.0);     // погоня — трек ЖИВОГО игрока, быстро
-                        if (d < 1.2) { a.state = 2; a.timer = 14; a.aimX = cam.px; a.aimY = cam.py; } }
-                    else { moveTo(a.aimX, a.aimY, 1.0);                  // прыжок к запомненной точке
-                        if (d < 0.7 && a.fireCd <= 0) { damagePlayer(6, cam.px, cam.py, a.x, a.y); a.fireCd = 48; a.fireAnimT = 12; }
-                        if (--a.timer <= 0) a.state = 1; }
-                    break;
-                }
-
-                // ═══ HYDACA (0x14c2a): живёт на ПОТОЛКЕ (a.z=1, спрайт a5), ОТЦЕПЛЯЕТСЯ и ПАДАЕТ на пол (a.z→0, БЕЗ стены),
-                //   на ПОЛУ (a.z=0, спрайт a0) краулит к игроку и БЫСТРО кусает; обратно на потолок — ТОЛЬКО лезя по СТЕНЕ
-                //   (вертик. спрайт a1, animSt=4). НЕ умеет «всплыть» с пола без стены. ZT +0x24 высота / wall-check 0x150de. ═══
-                if (ec == EC_HOPPER) {
-                    if (a.state == 0) { if (los && d < 9.0) { a.state = 1; a.timer = 40; } else break; }   // ОБНАРУЖЕНИЕ
-                    if (d > 16.0 && !los) { a.state = 0; a.vx = a.vy = 0; break; }                         // потерял — замирает где есть
-                    int cx = (int)a.x, cy = (int)a.y;
-                    bool nearWall = cellRenderWall(lvl.cellType(a.floor, cx + 1, cy)) || cellRenderWall(lvl.cellType(a.floor, cx - 1, cy))
-                                  || cellRenderWall(lvl.cellType(a.floor, cx, cy + 1)) || cellRenderWall(lvl.cellType(a.floor, cx, cy - 1));
-                    if (a.vz < 0.0) {                                    // ПАДЕНИЕ с потолка (быстро, без стены) — отцепился
-                        a.z += a.vz; a.vz -= 0.004;                      // ускоряется вниз (гравитация)
-                        moveTo(cam.px, cam.py, 0.5);                     // чуть доводит к игроку в падении
-                        if (a.z <= 0.0) { a.z = 0.0; a.vz = 0.0; a.variant = 0; a.timer = 60 + (int)(enemyRng() % 50); }  // приземлился
-                        a.frameT += 2; break;
-                    }
-                    if (a.vz > 0.0) {                                    // ЛАЗАНЬЕ ВВЕРХ по стене (медленно) — вертик. спрайт (animSt=4)
-                        a.z += a.vz;
-                        if (a.z >= 1.0) { a.z = 1.0; a.vz = 0.0; a.variant = 1; a.timer = 70 + (int)(enemyRng() % 50); }  // на потолке
-                        a.frameT += 2; break;
-                    }
-                    if (a.z > 0.5) {                                     // НА ПОТОЛКЕ: краул к игроку, потом отцепиться-упасть
-                        a.variant = 1;
-                        moveTo(cam.px, cam.py, 0.8);
-                        if (--a.timer <= 0 || d < 1.2) a.vz = -0.02;     // ОТЦЕП → падение (над игроком — сразу)
-                    } else {                                            // НА ПОЛУ: краул к игроку + БЫСТРЫЙ укус
-                        a.variant = 0;
-                        moveTo(cam.px, cam.py, 1.0);
-                        if (d < 0.6 && a.fireCd <= 0) { damagePlayer(6, cam.px, cam.py, a.x, a.y); a.fireCd = 12; a.fireAnimT = 10; }  // укус: ZT X=0x2bc→6, быстро
-                        if (--a.timer <= 0) { if (nearWall) a.vz = 0.03; else a.timer = 22; }  // обратно на потолок ТОЛЬКО у стены
-                    }
-                    a.frameT += 2;
-                    break;
-                }
-
-                // ═══ REVENANT (0x1a92a): СЕТОЧНЫЙ ПАТРУЛЬ (идёт ПРЯМО в одном из 8 направлений, на клетке поворачивает —
-                //   НЕ движется к игроку!) → при ОБНАРУЖЕНИИ (LOS+радиус) РЫВОК к игроку, контакт-урон. ZT нав 0x1ac76
-                //   (8 направлений по state, ±0x10, ре-навигация в центре клетки). Юзер: «идёт по линейной траектории». ═══
-                if (ec == EC_RANGED_FAST) {
-                    static const int RDX[8] = {1,1,0,-1,-1,-1,0,1}, RDY[8] = {0,1,1,1,0,-1,-1,-1};
-                    if (a.state == 0) {                                  // ПАТРУЛЬ
-                        // ZT 0x1ac4e/0x1ad72: триггер БОЯ только ВБЛИЗИ + LOS (было 6.0кл — «выскакивал издалека»);
-                        // радиус чуть больше дизасм-минимума (0x180=1.5) по просьбе — комфортная дистанция обнаружения.
-                        if (los && d < 2.6) { a.state = 1; }             // подошёл близко → рывок
-                        else {
-                            double tdx = a.aimX - a.x, tdy = a.aimY - a.y;
-                            if ((a.aimX == 0 && a.aimY == 0) || std::hypot(tdx, tdy) < 0.15) {  // достиг клетки → ре-навигация
-                                int cx = (int)a.x, cy = (int)a.y;
-                                auto walk = [&](int dir){ int tx = cx + RDX[dir], ty = cy + RDY[dir];
-                                    return !cellBlockedForEnemy(lvl.cellType(a.floor, tx, ty), 0.5, 0.5); };
-                                int nd = -1;
-                                if (walk(a.patrolDir) && (enemyRng() & 7)) nd = a.patrolDir;  // предпочесть ПРЯМО (линейно)
-                                else { int s = (int)(enemyRng() & 7);                          // иначе выбрать новое проходимое
-                                       for (int k = 0; k < 8; k++) if (walk((s + k) & 7)) { nd = (s + k) & 7; break; } }
-                                if (nd < 0) { a.aimX = a.x; a.aimY = a.y; a.timer = 10; }       // заперт — стоит
-                                else { a.patrolDir = (uint8_t)nd; a.aimX = (cx + RDX[nd]) + 0.5; a.aimY = (cy + RDY[nd]) + 0.5; }
-                            }
-                            moveTo(a.aimX, a.aimY, 0.30);                // медленно по прямой к клетке (патруль)
-                            break;
-                        }
-                    }
-                    if (d > 4.0 || (d > 2.5 && !los)) { a.state = 0; a.aimX = 0; a.aimY = 0; break; }  // оторвался → назад в патруль
-                    moveTo(cam.px, cam.py, 1.0);                         // РЫВОК к игроку (полная скорость ±0x40)
-                    if (d < 0.5 && a.fireCd <= 0) { damagePlayer(2, cam.px, cam.py, a.x, a.y); a.fireCd = 30; a.fireAnimT = 12; }  // ZT X=0x384→2, контакт ≤0.25кл
-                    break;
-                }
-
-                // ═══ ОБЩАЯ aim-wander (дальние/гренадёр/Imp/боссы) ═══
-                bool melee = (ec == EC_MELEE || ec == EC_HOPPER);
-                auto reaim = [&]() {                                     // ZT 0x18334: прицел = игрок + (упреждение) + rnd
-                    uint32_t r1 = enemyRng(), r2 = enemyRng();
-                    double mag = melee ? 0.5 : 1.0;                      // Imp/Hydaca ±0.5кл; дальние/боссы ±1кл
-                    double offx = ((int)((r1 >> 9) & 0x1ff) - 256) / 256.0 * mag;
-                    double offy = ((int)((r2 >> 9) & 0x1ff) - 256) / 256.0 * mag;
-                    bool lead = !melee;                                  // дальние/боссы упреждают скорость игрока
-                    a.aimX = cam.px + (lead ? pvx * 6.0 : 0.0) + offx;
-                    a.aimY = cam.py + (lead ? pvy * 6.0 : 0.0) + offy;
-                    int base = (ec == EC_RANGED_FAST) ? 20 : 35;        // Revenant перецеливается чаще → стреляет ~2× чаще
-                    a.state = 1; a.timer = base + (int)(enemyRng() % (base + 20));
-                };
-                if (a.state == 0) { if (los && d < 8.0) reaim(); else break; }   // ОБНАРУЖЕНИЕ (LOS + ≤8кл): до того стоит
-                if (d > 14.0 && !los) { a.state = 0; a.vx = a.vy = 0; break; }
-                // Revenant («робот», ZT 0x1ac68): ВДАЛИ (d>1.2кл = 0x12c) крадётся МЕДЛЕННО (шаг ±0x10), рывок ±0x40
-                //   только ВБЛИЗИ → «не несётся издали, атакует только когда близко» (юзер verif. трейсом).
-                double mscale = (ec == EC_RANGED_FAST && d > 1.2) ? 0.25 : 1.0;
-                moveTo(a.aimX, a.aimY, mscale);
-                bool bossCls = (ec == EC_BOSS_PROJ || ec == EC_BOSS_MELEE);
-                if (--a.timer <= 0) {                                    // state1 advance → state2 fire-окно → reaim
-                    if (a.state == 1) { a.state = 2; a.timer = bossCls ? 60 : 50; }
-                    else reaim();
-                }
-                // ── АТАКА: РОВНЫЙ интервал = fireCd (РАЗВЯЗАНО от фаз движения; раньше огонь требовал state2+timer≤25,
-                //    а при fireCd>цикла окна пропускались → атаки «скакали». Теперь cd ставится ТОЛЬКО при выстреле в радиусе). ──
-                (void)bossCls;
-                if (a.fireCd <= 0 && los) {
-                    bool crouchMiss = (player().crouchY < -2.0) && ((enemyRng() & 1) == 0);  // присед → ~50% промах (ZT питч<0)
-                    int fa0 = a.fireAnimT;                       // для детекции «только что выстрелил» (fireAnimT→12)
-                    switch (ec) {
-                        case EC_MELEE:                                   // Imp: контакт ≤0.7кл, урон 12 (ZT d0=0x100)
-                            if (d < 0.7) { damagePlayer(12, cam.px, cam.py, a.x, a.y); a.fireAnimT = 12; a.fireCd = 22; } break;
-                        case EC_RANGED_FAST:                             // Revenant: контакт-рывок ≤1.6кл (ZT engage 0x12c)
-                            if (d < 1.6 && !crouchMiss) { damagePlayer(zdamage(d), cam.px, cam.py, a.x, a.y); a.fireAnimT = 12; a.fireCd = 30; } break;
-                        case EC_RANGED:                                  // FH: HITSCAN ≤4кл, falloff 16−дист·4
-                            if (d < 4.0 && !crouchMiss) { damagePlayer(zdamage(d), cam.px, cam.py, a.x, a.y); a.fireAnimT = 12; a.fireCd = 55; } break;
-                        case EC_GRENADIER:                               // Sgt(человек)/FH-SF: ЧАЩЕ hitscan, ИНОГДА НАСТОЯЩАЯ граната (~1/4)
-                            if (d < 5.0) {
-                                if (d < 4.0 && !crouchMiss) damagePlayer(zdamage(d), cam.px, cam.py, a.x, a.y);  // выстрел
-                                if (d < 9.0 && (enemyRng() & 3) == 0) spawnGrenade(a.x, a.y, a.floor, ux, uy, 1);  // граната как обычная (дуга+отскок+фитиль), детонир. у игрока
-                                a.fireAnimT = 12; a.fireCd = 55;
-                            } break;
-                        case EC_BOSS_PROJ:                               // Boss1: САМОНАВОДЯЩИЙСЯ снаряд
-                            if (d < 12.0) { spawnEnemyShot(a.x, a.y, a.floor, ux, uy, 1); a.fireAnimT = 12; a.fireCd = 60; } break;
-                        case EC_BOSS_MELEE: {                            // Boss3(0x6A) контакт X=0x100→12; Boss2(0x6B) даль(4кл) X=0x1f4→9
-                            int bd = (a.srcType == 0x6A) ? 12 : 9; double br = (a.srcType == 0x6A) ? 1.0 : 4.0;
-                            if (d < br) { damagePlayer(bd, cam.px, cam.py, a.x, a.y); a.fireAnimT = 12; a.fireCd = 45; } } break;
-                        default: break;
-                    }
-                    if (a.fireAnimT > fa0 && a.floor == cam.floor &&        // ВРАГ ТОЛЬКО ЧТО ВЫСТРЕЛИЛ → звук выстрела врага (ранговые)
-                        (ec == EC_RANGED || ec == EC_RANGED_FAST || ec == EC_GRENADIER || ec == EC_BOSS_PROJ))
-                        snd::ev(snd::SFX_ENEMY_FIRE);
-                }
-                break;
-            }
-            case AT_ENEMY_SHOT: {                        // снаряд врага (Boss1 самонавод / FH-SF граната): летит → урон / искра
-                if (a.state == 1 && a.floor == cam.floor) {             // САМОНАВЕДЕНИЕ (Boss1 0x15f6e): довод курса к игроку
-                    double hx = cam.px - a.x, hy = cam.py - a.y, hd = std::hypot(hx, hy);
-                    if (hd > 0.01) { double sp = 0.16;                  // плавный поворот к цели, держим скорость
-                        a.vx = (a.vx * 0.8 + hx / hd * sp * 0.2); a.vy = (a.vy * 0.8 + hy / hd * sp * 0.2); }
-                } else if (a.state == 2) {                              // ГРАНАТА (FH-SF): дуга — z вверх + гравитация
-                    a.z += a.vz; a.vz -= 0.004; if (a.z < 0) a.z = 0;
-                }
-                if (a.floor == cam.floor && gameDist(cam.px - a.x, cam.py - a.y) < 0.5) {     // достал игрока (октаг. ≤0x40)
-                    damagePlayer(9, cam.px, cam.py, a.x, a.y); a.active = false; break;       // снаряд: урон 9 (ZT d0=0x1f4→16−7)
-                }
-                double nx = a.x + a.vx, ny = a.y + a.vy;
-                int cx = (int)nx, cy = (int)ny;
-                uint8_t sct = (cx >= 0 && cy >= 0 && cx < Level::W && cy < Level::H) ? lvl.cellType(a.floor, cx, cy) : 1;
-                if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H ||
-                    cellBlockedAt(sct, nx - cx, ny - cy) || cellIsDoor(sct) || --a.timer <= 0) {  // дверь тоже останавливает
-                    spawnSparkA(a.x, a.y, a.floor); a.active = false;
-                } else { a.x = nx; a.y = ny; }
-                break;
-            }
-            case AT_CORPSE: {                            // труп СКОЛЬЗИТ от смертельного отлёта, затухает, упирается в стены
-                if (a.timer > 0 && std::abs(a.vx) + std::abs(a.vy) > 0.004) {
-                    double nx = a.x + a.vx, ny = a.y + a.vy;
-                    if (!cellBlockedForEnemy(lvl.cellType(a.floor, (int)nx, (int)a.y), nx - (int)nx, a.y - (int)a.y)) a.x = nx;
-                    if (!cellBlockedForEnemy(lvl.cellType(a.floor, (int)a.x, (int)ny), a.x - (int)a.x, ny - (int)ny)) a.y = ny;
-                    a.vx *= 0.5; a.vy *= 0.5; --a.timer;                 // затухание ÷2/кадр (ZT asr.w скорости стаггера)
-                }
-                break;
-            }
-            default: break;
-        }
-    }
-
-    // ОЧЕРЕДЬ СПРАЙТОВ: каждый актёр → билборд в worldFx (рисуется drawDecorBillboards с z-тестом по стенам).
-    auto& fx = worldFx(); fx.clear();
-    for (const Actor& a : v) {
-        if (!a.active) continue;
-        switch (a.think) {
-            case AT_EXPLOSION: case AT_DEATH: {            // взрыв: БЫСТРО раскрывается (2 кадра) → сжимается (квадрат)
-                int t = a.timer, sz = (t < 2) ? (4 + t * 4) : (12 - (t - 2) * 2); if (sz < 2) sz = 2;
-                int c = (int)(8 - a.z * 16);               // ВЫСОТА очага: z=0 пол (низ экрана) … z=0.5 ур.глаз (горизонт)
-                fx.push_back({a.x, a.y, a.floor, a.tile, (int8_t)(c - sz/2), (uint8_t)sz, (uint8_t)sz}); break; }
-            case AT_SPARK: { uint8_t t = A_SPARK_SEQ[a.timer / 2 < 3 ? a.timer / 2 : 2];               // анимация 63→64→65
-                int sz = 3 + a.timer; fx.push_back({a.x, a.y, a.floor, t, (int8_t)(-sz/2), (uint8_t)sz, (uint8_t)sz}); break; }  // мелкая, квадрат
-            case AT_BLOOD: {                                // КРОВЬ: лёт=тайл61 мелкий на высоте z; пятно=тайл62, тускнеет (↓размер)
-                if (a.state == 0) { int sz = 2; int c = (int)(8 - a.z * 16);  // летящая капля
-                    fx.push_back({a.x, a.y, a.floor, A_BLOOD_FLY, (int8_t)(c - sz/2), (uint8_t)sz, (uint8_t)sz}); }
-                else { int life = 48 - a.timer; int sz = (life > 12) ? 4 : (life > 4 ? 3 : 2);  // пятно: уменьшается к концу
-                    int c = (a.state == 2) ? 8 : (int)(8 - a.z * 16);        // пол: на полу (c=8); стена: на высоте z
-                    fx.push_back({a.x, a.y, a.floor, A_BLOOD_SPLAT, (int8_t)(c - sz/2), (uint8_t)sz, (uint8_t)sz}); }
-                break; }
-            case AT_FLAME: { int sz = 3 + a.timer / 3;     // пламя в полёте, мелкое, квадрат, к концу мельчает
-                fx.push_back({a.x, a.y, a.floor, a.tile, (int8_t)(-sz/2), (uint8_t)sz, (uint8_t)sz}); break; }
-            case AT_FIRE: {                                // ОГОНЬ на полу: 2-КАДРОВАЯ анимация (ZT 0x14292: тайл N / N+1 по счётчику&1)
-                int frame = (a.frameT >> 2) & 1;          // чередование 2 кадров (тайл 0 / тайл 1) — «живое» пламя
-                uint8_t t = frame ? (uint8_t)(A_FIRE_TILE + 1) : A_FIRE_TILE;
-                int sz = 8 + frame;
-                if (a.fireCd > 0) sz = sz * a.fireCd / 10; // ЗАТУХАНИЕ от пены: огонь УМЕНЬШАЕТСЯ за ~10 кадров
-                if (sz < 1) sz = 1; int c = 8 - sz;        // низом на полу, лёгкий пульс размера между кадрами
-                fx.push_back({a.x, a.y, a.floor, t, (int8_t)c, (uint8_t)sz, (uint8_t)(sz > 1 ? sz - 1 : 1)}); break; }
-            case AT_FOAM: {                                // ПЕНА: ФОРМА декор-тайла 0 (ZT draw 0x14272), но СИНЕ-БЕЛАЯ палитра (ZT
-                int sz = 3 + a.timer / 2; if (sz > 9) sz = 9; if (sz < 2) sz = 2;   // line 0x20d2 — не огненная 0x20f2); сжимается с возрастом
-                int c = (int)(7 - a.z * 16);                                        // ПАДАЕТ: z↓ → ниже по экрану
-                WorldFx wf{a.x, a.y, a.floor, 0, (int8_t)(c - sz/2), (uint8_t)sz, (uint8_t)sz};
-                wf.foam = true; fx.push_back(wf); break; }                          // foam=true → рендер тайла 0 в пене-палитре
-            case AT_BULLET:    fx.push_back({a.x, a.y, a.floor, a.tile, (int8_t)-1, 2, 2}); break;
-            case AT_ENEMY_SHOT:                          // снаряд врага: граната (state2) — крупнее + дуга по z; иначе мелкий
-                if (a.state == 2) { int sz = 5, c = (int)(2 - a.z * 16);
-                    fx.push_back({a.x, a.y, a.floor, a.tile, (int8_t)(c - sz/2), (uint8_t)sz, (uint8_t)sz}); }
-                else fx.push_back({a.x, a.y, a.floor, a.tile, (int8_t)-2, 3, 3});
-                break;
-            case AT_GRENADE: { int c = (int)(8 - a.z * 16);   // граната летит по дуге (выше при z>0); ZT draw 0x13f3e: тайл 16, ~d5/4
-                fx.push_back({a.x, a.y, a.floor, a.tile, (int8_t)(c - 2), 5, 5}); break; }   // ~0.3кл квадрат (был тайл13 sz6 — неверно)
-            case AT_MINE: {                              // МИНА на полу: ZT draw 0x1402e = декор-тайл 8↔9 АНИМАЦИЯ (мигает),
-                uint8_t mt = (uint8_t)(8 + ((decorFrame() >> 2) & 1));  // bit1 счётчика -$7149 → чередование 8/9
-                fx.push_back({a.x, a.y, a.floor, mt, (int8_t)6, 3, 6}); break; }  // ПЛОСКАЯ 2:1 на полу (ZT_OBJECT_ASPECT мина=2:1, было «вытянуто вверх»)
-            case AT_ENEMY: {                              // реальный спрайт врага: ХОДЬБА(по направл)/СТРЕЛЬБА/СТАГГЕР
-                int slot = enemyGfxSlot(a.srcType);
-                if (slot >= 0 && slot < 16 && g_enemyAnim[slot].ok) {
-                    EnemyAnimSet& A = g_enemyAnim[slot];
-                    uint8_t animSt = (a.hitT > 0) ? 2 : (a.fireAnimT > 0 ? 1 : 0);     // стаггер > стрельба/удар > ходьба
-                    if (a.srcType == 0x65 && a.vz > 0.0 && a.hitT <= 0 && !A.climb.empty()) animSt = 4;  // Hydaca лезет по стене → вертик. спрайт
-                    uint8_t dir = (uint8_t)enemyDirIndex(a.vx, a.vy, cam.px - a.x, cam.py - a.y, A.walkDirs);  // поворот по углу
-                    int nf = (animSt == 1) ? (int)A.fire.size() : (animSt == 2) ? (int)A.hit.size()
-                                           : (animSt == 4) ? (int)A.climb.size()
-                                           : (int)A.walk[dir < A.walkDirs ? dir : 0].size();
-                    if (nf < 1) nf = 1;
-                    uint8_t efr = (animSt == 1) ? (uint8_t)(((12 - a.fireAnimT) / 3) % nf)   // стрельба: прогон кадров
-                                : (animSt == 2) ? (uint8_t)((a.hitT / 3) % nf)                // стаггер (hitT растёт)
-                                : (nf > 1 ? (uint8_t)((a.frameT / 6) % nf) : 0);              // ходьба: по движению
-                    fx.push_back({a.x, a.y, a.floor, 0, (int8_t)-8, 16, 7, slot, efr, false, (float)a.z, dir, animSt, a.variant});
-                } else
-                    fx.push_back({a.x, a.y, a.floor, a.tile, (int8_t)-8, 16, 7});
-                break; }
-            case AT_CORPSE: {                             // труп: последний кадр death-анима (лежит); нет death → сплющ. ходьба
-                int slot = enemyGfxSlot(a.srcType);
-                if (slot >= 0 && slot < 16 && g_enemyAnim[slot].ok) {
-                    EnemyAnimSet& A = (a.variant && g_enemyAnimVar2[slot].ok) ? g_enemyAnimVar2[slot] : g_enemyAnim[slot];
-                    bool hasDeath = !A.death.empty();
-                    uint8_t efr = hasDeath ? (uint8_t)(A.death.size() - 1) : 0;
-                    fx.push_back({a.x, a.y, a.floor, 0, (int8_t)-8, 16, 7, slot, efr, !hasDeath, (float)a.z, 0,
-                                  (uint8_t)(hasDeath ? 3 : 0), a.variant, false, a.burned});   // burned → обугленный труп
-                }
-                // ОБРОНЕННОЕ ОРУЖИЕ = ВИДИМЫЙ пикап на полу у трупа (ZT death-think: cmd 0x13 → объект-пикап в 0x1c03a,
-                // НЕ бросок-анимация). Тайл объект-банка по item-id (как itemBillboardForCt). Подбор шагом (rcTryCorpsePickup).
-                if (a.drop >= 1 && a.drop < 15) {
-                    static const uint8_t ITILE[15] = {0,3,8,10,11,15,4,13,14,7,5,6,12,18,19};   // item-id → объект-банк тайл
-                    fx.push_back({a.x, a.y, a.floor, ITILE[a.drop], (int8_t)4, 4, 4});           // ~S/4, низом на полу
-                }
-                break; }
-            default: break;
-        }
-    }
-}
+void updateActors(const Level& lvl, const Camera& cam);   // тело в actors.cpp

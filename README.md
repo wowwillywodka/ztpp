@@ -19,8 +19,10 @@ C++/SDL2 — a first-person engine rebuilt from behaviour, not a decompilation. 
 > untested — patches welcome.
 
 ## Goal
-Build a reasonably faithful, original-accurate port that can be **extended and modded**. Right now it
-looks more like a developer demo than a game — so there is **no release** yet.
+Build a port that is as **accurate to the original as possible** — reference-faithful to the Mega Drive
+game — plus modern **quality-of-life** features that don't change the game itself (rebindable controls,
+gamepad, save games, resolution / full-screen options, …). Right now it looks more like a developer demo
+than a game — so there is **no release** yet.
 
 ## What works
 - Rendering as close to the original as possible, reconstructed from the reverse-engineered draw algorithm
@@ -29,31 +31,30 @@ looks more like a developer demo than a game — so there is **no release** yet.
 - Enemies — partially implemented
 - Enemy AI ~80% matching the reverse
 - Weapons, behaviour ~70% matching the reverse
+- Melee / fist-fight mechanic
 - All maps from all episodes
 - Weapon pickups from corpses
 - GZDoom-style console
 - Mouse control
 - 5-slot inventory, with an option to remove the limit
-- Blood physics ~50% matching the original
+- Blood physics and rendering as in the original
+- Proper HUD readouts — alive enemies on the level and health
+- The original radar (with minor discrepancies)
+- Audio playback through a **YM2612 / YM3438** chip emulator
 
 ## Not done yet
 - Resolution settings
 - Character selection
 - Cutscenes / intros
-- Remaining-enemy display and the episode-completion mechanic
+- The episode-completion mechanic
 - Stairs and elevator graphics
-- Original-accurate blood physics
-- Proper HUD readouts — alive enemies on the level and health (currently looks cursed)
 - Item readouts and their limit
 - Boss behaviour
-- Sound
-- Melee / fist-fight mechanic
 - Fire-extinguisher graphics
 - Properly working enemy animations
 - Passwords
 - Pause map
 - Snipers
-- Original radar
 
 ## Planned
 - Support for **Zero Tolerance** (original & German builds), **Zero Tolerance Underground**, and
@@ -61,15 +62,10 @@ looks more like a developer demo than a game — so there is **no release** yet.
 - Both the original graphics mode and a configurable full-screen mode
 - Save games
 - Tuning of clock-dependent mechanics
-- Modding
-- Audio through a **YM2612 / YM3438** chip emulator
 - Playback of audio files
 - Gamepad support with rumble
-- Mechanics that push past the engine's and the Mega Drive's limits, e.g.:
-  - A fully working train in ZTU and BZT
-  - Floor / ceiling texturing
-  - Particles
-  - A "what if the game had shipped on Sega CD / 32X" mode
+- A "what if the game had shipped on Sega CD / 32X" mode — a purely visual what-if on the more capable
+  hardware; gameplay and mechanics stay identical to the original.
 
 ## Requirements
 - A C++17 compiler and **CMake ≥ 3.16**
@@ -92,9 +88,14 @@ looks more like a developer demo than a game — so there is **no release** yet.
 3. **Configure & build:**
    ```bash
    cmake -B build
-   cmake --build build
+   cmake --build build --parallel
    ```
    On macOS you can instead just run `./build.sh` — it does both steps.
+
+The project is built as **several translation units** (`src/`, `src/rom/`, `src/render/`) rather than one
+unity file, so incremental rebuilds are quick and `--parallel` speeds up a clean build. Sources are globbed
+with `CONFIGURE_DEPENDS`, so adding or removing a `.cpp` is picked up on the next build without re-running
+`cmake` by hand.
 
 The resulting binary is `build/ztpp` (see [Run](#run) below).
 On Windows pass your toolchain, e.g. `cmake -B build -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake`.
@@ -158,8 +159,10 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
 > CMake + SDL2), но не проверялись — патчи приветствуются.
 
 ## Цель
-Сделать достаточно близкий к оригиналу порт с возможностью **расширения и моддинга**. Сейчас это
-выглядит скорее как демка для разработчиков, чем как игра, — поэтому **релиза нет**.
+Сделать максимально **точный порт оригинала** — референс-достоверность к игре на Mega Drive — плюс современные
+**quality-of-life** фичи, которые не меняют саму игру (переназначаемое управление, геймпад, сохранения, настройки
+разрешения / полноэкранного режима, …). Сейчас это выглядит скорее как демка для разработчиков, чем как игра, —
+поэтому **релиза нет**.
 
 ## Что готово
 - Максимально близкий к оригиналу рендер, воссозданный на основе реверса оригинального алгоритма отрисовки
@@ -168,31 +171,30 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
 - Враги — частично реализованы
 - ИИ врагов, на ~80% совпадающий с реверсом
 - Оружие, поведение на ~70% совпадающее с реверсом
+- Механика кулачного боя
 - Все карты из всех эпизодов
 - Пикапы оружия с трупов
 - Консоль в стиле GZDoom
 - Управление мышью
 - 5-слотовый инвентарь с возможностью снять ограничение
-- Физика крови, на ~50% совпадающая с оригиналом
+- Физика и отображение крови как в оригинале
+- Нормальное отображение показателей — живых врагов на уровне и здоровья
+- Оригинальный радар (с мелкими несоответствиями)
+- Воспроизведение звука через эмулятор чипа **YM2612 / YM3438**
 
 ## Что не сделано
 - Настройки разрешения
 - Выбор персонажа
 - Заставки
-- Отображение неубитых врагов и механика завершения эпизодов
+- Механика завершения эпизодов
 - Графика лестниц и лифтов
-- Физика крови как в оригинале
-- Нормальное отображение показателей — живых врагов на уровне и здоровья (выглядит проклято)
 - Показатели предметов и их лимит
 - Поведение боссов
-- Звук
-- Механика кулачного боя
 - Графика огнетушителя
 - Нормально работающие анимации врагов
 - Пароли
 - Карта с паузы
 - Снайперы
-- Оригинальный радар
 
 ## Планируется
 - Поддержка **Zero Tolerance** (оригинальный и немецкий билды), **Zero Tolerance Underground** и
@@ -200,15 +202,10 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
 - Оригинальный режим отображения графики и полноэкранный настраиваемый
 - Сохранения
 - Настройка клок-зависимых механик
-- Моддинг
-- Воспроизведение звука через эмулятор чипа **YM2612 / YM3438**
 - Воспроизведение аудиофайлов
 - Поддержка геймпадов и вибрации
-- Механики, позволяющие выйти за ограничения движка и Mega Drive, например:
-  - Полноценный поезд в ZTU и BZT
-  - Текстурирование пола / потолка
-  - Частицы
-  - Режим «если бы игра вышла на Sega CD / 32X»
+- Режим «что, если бы игра вышла на Sega CD / 32X» — чисто визуальный what-if на более мощном железе;
+  геймплей и механики — как в оригинале, без изменений.
 
 ## Требования
 - Компилятор C++17 и **CMake ≥ 3.16**
@@ -231,9 +228,14 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
 3. **Конфигурация и сборка:**
    ```bash
    cmake -B build
-   cmake --build build
+   cmake --build build --parallel
    ```
    На macOS можно вместо этого просто запустить `./build.sh` — он делает оба шага.
+
+Проект собирается из **нескольких единиц трансляции** (`src/`, `src/rom/`, `src/render/`), а не одним
+unity-файлом, — поэтому инкрементальная пересборка быстрая, а `--parallel` ускоряет чистую сборку.
+Исходники подхватываются через `CONFIGURE_DEPENDS`, так что добавление/удаление `.cpp` подхватится при
+следующей сборке без ручного перезапуска `cmake`.
 
 Готовый бинарник — `build/ztpp` (см. [Запуск](#запуск) ниже).
 На Windows укажи тулчейн, напр. `cmake -B build -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake`.

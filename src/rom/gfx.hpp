@@ -5,12 +5,14 @@
 #include <cstdint>
 
 // Mega Drive CRAM-слово (0000 BBB0 GGG0 RRR0): 3-битные R/G/B -> ARGB8888.
+// DAC МЕГАДРАЙВА НЕЛИНЕЙНЫЙ: 8 уровней = {0,52,87,116,144,172,206,255} (как VDP/MAME), НЕ линейный v*255/7
+// (тот давал 36,73,109,... = все цвета порта были чуть неверные vs железо). Вскрыто числовой сверкой с MAME.
 inline uint32_t cramToArgb(uint16_t w) {
+    static const uint32_t L[8] = { 0, 52, 87, 116, 144, 172, 206, 255 };  // МД DAC (normal-priority)
     uint8_t r = (w & 0x00E) >> 1;
     uint8_t g = (w & 0x0E0) >> 5;
     uint8_t b = (w & 0xE00) >> 9;
-    auto sc = [](uint8_t v) -> uint32_t { return static_cast<uint32_t>((v * 255) / 7); };
-    return 0xFF000000u | (sc(r) << 16) | (sc(g) << 8) | sc(b);
+    return 0xFF000000u | (L[r] << 16) | (L[g] << 8) | L[b];
 }
 
 struct Palette {

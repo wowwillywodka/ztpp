@@ -9,7 +9,7 @@
 #include "gfx.hpp"
 #include "level.hpp"
 #include "cells.hpp"
-#include "background.hpp"
+#include "background_fx.hpp"   // рантайм-хелперы фона (bgSample/bgGradient/activeBg); Panorama — транзитивно из rom/background.hpp
 #include "gamedata.hpp"          // GameData/WallBank (ЭТАП 0: данные, не Rom+адреса)
 #include <cmath>
 #include <cstdint>
@@ -99,7 +99,8 @@ inline bool itemBillboardForCt(uint8_t ct, DecorDef& d) {
     int idx = (int)ct - 0x18;
     uint8_t tile;
     if (idx >= 0 && idx < 15)      tile = TILE[idx];
-    else if (ct == 0x36)           tile = 17;           // ЛАЗЕРНАЯ ВИНТОВКА (хендлер дисплея 0x115ea → tile17)
+    else if (ct == 0x36)           tile = 17;           // ПУЛЬС-ЛАЗЕР — пикап ct0x36 (хендлер 0x115ea → 0x110bbe → tile17)
+    else if (ct == 0x82)           tile = 60;           // ОГНЕМЁТ — пикап ct0x82 (хендлер 0x115cc → 0x1161be → tile60)
     else return false;
     uint8_t h = 4, w = 4;                                // ~S/4 квадрат (позиционер 0x11a52)
     if (tile == 15) { w = 6; h = 3; }                   // FireSuit — широкий 2:1
@@ -119,18 +120,7 @@ inline std::vector<WorldFx>& worldFx() { static std::vector<WorldFx> v; return v
 
 #include "tuning.hpp"   // gameDist/playerPhysics/gameDistOctagonal — общие тумблеры reference-точности
 
-struct Camera {
-    double px = 1.5, py = 1.5;
-    double dirX = 1.0, dirY = 0.0;
-    double planeX = 0.0, planeY = 0.66;
-    int    floor = 0;
-    // ZT-ИНЕРЦИЯ движения (DAB8): три плавно разгоняемых значения (eased) — угл.скорость / вперёд / стрейф.
-    double turnVel = 0.0, fwdVel = 0.0, strafeVel = 0.0;
-    // Межэтажные переходы (см. rcUpdateTransit): питч вида + автомат лифта.
-    double pitch = 0;       // вертикальный сдвиг вида (ZT-ед., ±64≈одна высота стены); = -cabin
-    double cabin = 0;       // счётчик кабины/наклона лестницы (ZT $FF116E, -64..+64)
-    int    elevState = 0;   // 0 idle, +1 поездка вниз по зданию (floor++), -1 вверх (floor--)
-};
+#include "camera.hpp"   // struct Camera (вынесена в отдельный заголовок)
 
 // Кэш метатекстур стены 128x64 (4x2 тайла 32x32). Ключ — индекс метатекстуры эпизода.
 // Раскладка: тайл i -> col=i/2, row=i%2 (верх=0,2,4,6 / низ=1,3,5,7) — как _build_metatexture.
@@ -250,40 +240,7 @@ inline uint32_t shade(uint32_t c, double f) {
 }
 
 // Стартовая клетка: самая «открытая» пустая клетка (icon 0); взгляд вдоль длинного коридора.
-inline void rcSpawn(Camera& cam, const Level& lvl) {
-    int bx = -1, by = -1;
-    // ТОЧКА СПАВНА игрока = ПЕРВАЯ (row-major) клетка с иконкой 8 «player start» (ZT celltype 0x77).
-    // Точно как ZT (скан этажа @0x12cc: первый ct 0x77 → центр клетки) и ztextractor (oztd_export: icon==8).
-    for (int y = 0; y < Level::H && by < 0; ++y)
-        for (int x = 0; x < Level::W; ++x)
-            if (cellIcon(lvl.cellType(cam.floor, x, y)) == 8) { bx = x; by = y; break; }
-    if (bx < 0) {                                   // ФОЛБЭК (нет точки спавна на этаже): самая открытая пустая клетка
-        int best = -1;
-        for (int y = 0; y < Level::H; ++y)
-            for (int x = 0; x < Level::W; ++x) {
-                if (cellIcon(lvl.cellType(cam.floor, x, y)) != 0) continue;
-                int sc = 0;
-                for (int dy = -2; dy <= 2; ++dy)
-                    for (int dx = -2; dx <= 2; ++dx)
-                        if (!rcSolidRay(lvl, cam.floor, x + dx, y + dy)) ++sc;
-                if (sc > best) { best = sc; bx = x; by = y; }
-            }
-    }
-    if (bx < 0) { cam.px = cam.py = 1.5; cam.dirX = 1; cam.dirY = 0; cam.planeX = 0; cam.planeY = 0.66; return; }
-    cam.px = bx + 0.5; cam.py = by + 0.5;
-    static const int D[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-    int bd = 0, bc = -1;
-    for (int d = 0; d < 4; ++d) {
-        int cnt = 0;
-        for (int s = 1; s <= 12; ++s) {
-            if (rcSolidRay(lvl, cam.floor, bx + D[d][0] * s, by + D[d][1] * s)) break;
-            ++cnt;
-        }
-        if (cnt > bc) { bc = cnt; bd = d; }
-    }
-    cam.dirX = D[bd][0]; cam.dirY = D[bd][1];
-    cam.planeX = -cam.dirY * 0.66; cam.planeY = cam.dirX * 0.66;
-}
+void rcSpawn(Camera& cam, const Level& lvl);   // тело в raycaster.cpp
 
 // ── Межэтажные переходы: ЛИФТЫ и ЛЕСТНИЦЫ (по дизасму ZT) ────────────────────
 // Этаж = индекс (cam.floor 0..15); карта = lvl.cellId(floor,...). В ZT: индекс этажа $FF1028,
@@ -347,81 +304,27 @@ inline void rcStairTrans(Camera& c, double sub, bool needHigh) {
         if (needHigh ? !high : high) { c.cabin = -64.0; if (c.floor < 15) c.floor++; }   // этаж+1 (вниз)
     }
 }
+// ── КЛАССЫ КЛЕТОК ЛИФТА (ZT step-on таблица @e420, автомат b768/b7aa) ──────────
+// up-кабина: старт UP (elevState=+1, floor--). ОНА ЖЕ клетка-прибытия для DOWN-поездки (b7da).
+inline bool ctElevUp  (uint8_t ct){ return ct==0x32||ct==0x51||ct==0x55||ct==0x59; }
+// down-кабина: старт DOWN (elevState=-1, floor++). ОНА ЖЕ клетка-прибытия для UP-поездки (b798).
+inline bool ctElevDown(uint8_t ct){ return ct==0x33||ct==0x52||ct==0x56||ct==0x5a; }
+inline bool ctElevUpdn(uint8_t ct){ return ct==0x34||ct==0x53||ct==0x57||ct==0x5b; }  // updown → toggle (e75e)
+inline bool ctElevArea(uint8_t ct){ return ct==0x31||ct==0x50||ct==0x54||ct==0x58; }  // площадка → стоп (e7d6)
+
+// Лестничный наклон cabin по суб-позиции игрока (ZT @b51a: b612/b664/... задают $FF116E из subpos).
+// Возвращает false, если ct — не лестничная клетка.
+bool rcStairCabin(Camera& c, uint8_t ct, double subX, double subY);   // тело в raycaster.cpp
+
+// ── ROM-ТОЧНЫЙ АВТОМАТ ПЕРЕХОДОВ (faElevZT) ───────────────────────────────────
+// Дизасм ZT (тройная сверка): step-on e3f8→@e420 (старт/стоп), b4e4→b768/b7aa (рампа кабины +
+// своп этажа), a3ec (центрирование). elevState: 0 idle | ±1 едет | ±2 приехал-стоп. cabin −64..+64.
+// ⚠ Знак elevState = ROM-семантика (+1=UP/floor--, -1=DOWN/floor++); вне этой функции нигде не читается.
+bool rcUpdateTransitZT(Camera& c, const Level& lvl, bool enteredNewCell);   // тело в raycaster.cpp
+
 // Вызывать КАЖДЫЙ кадр. enteredNewCell=true в кадре, когда игрок вошёл в новую клетку (x,y).
-// Возвращает true, если движение игрока заблокировано (идёт поездка лифта).
-inline bool rcUpdateTransit(Camera& c, const Level& lvl, bool enteredNewCell) {
-    int cx = (int)c.px, cy = (int)c.py;
-    bool inb = (cx >= 0 && cy >= 0 && cx < Level::W && cy < Level::H);
-    uint8_t ct = inb ? lvl.cellType(c.floor, cx, cy) : 0;
-    double subX = (c.px - cx) * 256.0, subY = (c.py - cy) * 256.0;
-
-    // ── ЛИФТ: поездка в процессе ──
-    if (c.elevState != 0) {
-        int dir = c.elevState;
-        // ВЫХОД на промежуточном этаже: игрок сошёл с КАБИНЫ (на площадку area / в коридор) → стоп.
-        // (Возможно только когда |cabin|<0x18 — у этажа центрирование снято, см. ниже.)
-        if (!rcElevCabin(ct)) {
-            c.elevState = 0;                            // далее cabin сам плавно затухнет до 0
-        } else {
-            // Центрирование кабины ТОЛЬКО в середине перехода (|cabin|>=0x18, как a3ec @0xa3ec):
-            // у этажа игрок свободен и может «выскочить» вперёд (идя вперёд) — лифт медленный.
-            if (c.cabin >= 24.0 || c.cabin <= -24.0) {
-                double fx = c.px - cx, fy = c.py - cy;
-                if (fx < 0.125) c.px = cx + 0.125; else if (fx > 0.871) c.px = cx + 0.871;
-                if (fy < 0.125) c.py = cy + 0.125; else if (fy > 0.871) c.py = cy + 0.871;
-            }
-            if (dir > 0) {                              // вниз по зданию (floor++)
-                c.cabin += 4.0;
-                if (rcElevArrival(ct, dir)) { if (c.cabin >= 0.0) { c.cabin = 0.0; c.elevState = 0; } }
-                else if (c.cabin > 64.0)    { c.cabin = -64.0; if (c.floor < 15) c.floor++; }
-            } else {                                    // вверх по зданию (floor--)
-                c.cabin -= 4.0;
-                if (rcElevArrival(ct, dir)) { if (c.cabin <= 0.0) { c.cabin = 0.0; c.elevState = 0; } }
-                else if (c.cabin < -64.0)   { c.cabin = 64.0;  if (c.floor > 0)  c.floor--; }
-            }
-            c.pitch = -c.cabin;
-            return true;
-        }
-    }
-
-    // ── ЛИФТ: старт по входу в клетку-departure ──
-    int dep = rcElevDepart(ct);
-    if (dep == 0 && (ct == 0x34 || ct == 0x53 || ct == 0x57 || ct == 0x5b)) {  // up/down: по соседу
-        if (c.floor < 15 && rcElevCell(lvl.cellType(c.floor + 1, cx, cy))) dep = +1;
-        else if (c.floor > 0 && rcElevCell(lvl.cellType(c.floor - 1, cx, cy))) dep = -1;
-    }
-    if (dep != 0 && enteredNewCell) {
-        c.elevState = dep; c.cabin = 0.0; c.px = cx + 0.5; c.py = cy + 0.5; c.pitch = 0.0;
-        return true;
-    }
-
-    // ── ЛЕСТНИЦЫ: наклон по суб-позиции + своп на клетке-перехода ──
-    bool onStair = true;
-    switch (ct) {
-        case 0x12: c.cabin = (subY - 255.0) / 4.0; break;   // b612
-        case 0x14: c.cabin = (255.0 - subY) / 4.0; break;   // b664
-        case 0x3c: c.cabin = (-subY) / 4.0;        break;   // b626
-        case 0x3e: c.cabin = ( subY) / 4.0;        break;   // b67a
-        case 0x44: c.cabin = (-subX) / 4.0;        break;   // b638
-        case 0x46: c.cabin = ( subX) / 4.0;        break;   // b68a
-        case 0x4c: c.cabin = (subX - 255.0) / 4.0; break;   // b64a
-        case 0x4e: c.cabin = (255.0 - subX) / 4.0; break;   // b69a
-        case 0x13: case 0x3d: case 0x45: case 0x4d: c.cabin = 0.0; break;  // площадка (b65e)
-        case 0x15: c.cabin = -64.0; break;                  // interstorey-up (b6b0)
-        case 0x16: c.cabin =  64.0; break;                  // interstorey-down (b6b8)
-        case 0x17: rcStairTrans(c, subX, true);  break;     // переход, ось X, high (b6c0)
-        case 0x3f: rcStairTrans(c, subX, false); break;     // переход, ось X, low  (b6ea)
-        case 0x47: rcStairTrans(c, subY, true);  break;     // переход, ось Y, high (b714)
-        case 0x4f: rcStairTrans(c, subY, false); break;     // переход, ось Y, low  (b73e)
-        default:   onStair = false; break;
-    }
-    if (!onStair) {                                          // не на лестнице → питч плавно к 0
-        if (c.cabin > 0.0) { c.cabin -= 4.0; if (c.cabin < 0.0) c.cabin = 0.0; }
-        else if (c.cabin < 0.0) { c.cabin += 4.0; if (c.cabin > 0.0) c.cabin = 0.0; }
-    }
-    c.pitch = -c.cabin;
-    return false;
-}
+// Возвращает true, если движение игрока заблокировано (идёт поездка лифта; в ROM-режиме — всегда false).
+bool rcUpdateTransit(Camera& c, const Level& lvl, bool enteredNewCell);   // тело в raycaster.cpp
 
 inline void rcRotate(Camera& c, double a) {
     double s = std::sin(a), co = std::cos(a);
@@ -458,6 +361,22 @@ namespace ztmove {
     constexpr double FWD = 40 * U, FWD_RUN = 45 * U, BACK = -20 * U, BACK_RUN = -35 * U, STRAFE = 40 * U;
     constexpr double TURN = 16 * A;              // пиковая цель угл.скорости
 }
+// КВАНТ. УГЛА 512 ШАГОВ (ROM: угол 0..511 andi #$1ff, dir/plane из LUT sin/cos @0x8124). Аккумулятор ang512
+// копит ПЛАВНУЮ угл.скорость (turnVel), а dir берётся от ОКРУГЛЁННОГО до целого шага угла → 512 дискретных
+// направлений (дискретный поворот оригинала). angDelta512 — приращение угла в 512-ед. (turnVel рад → 512-ед).
+inline void camSetAngleU(Camera& c, double ang512) {
+    while (ang512 < 0.0)     ang512 += 512.0;
+    while (ang512 >= 512.0)  ang512 -= 512.0;
+    c.ang512 = ang512;
+    int q = ((int)std::lround(ang512)) & 511;                  // ОКРУГЛЕНИЕ до шага (512 дискретных)
+    double th = q * (ztmove::PI2 / 512.0);
+    c.dirX = std::cos(th); c.dirY = std::sin(th);
+    c.planeX = -c.dirY * 0.66; c.planeY = c.dirX * 0.66;
+}
+inline double camDirToAng512(const Camera& c) {
+    double a = std::atan2(c.dirY, c.dirX); if (a < 0) a += ztmove::PI2;
+    return a / ztmove::PI2 * 512.0;
+}
 // ZT-ease: цель≠0 → cur += (цель−cur)·accel (разгон); цель=0 → cur ·= 0.5 (затухание/2, инерция выбега).
 inline double ztEase(double cur, double target, double accel) {
     if (target != 0.0) { cur += (target - cur) * accel; }
@@ -465,26 +384,7 @@ inline double ztEase(double cur, double target, double accel) {
     return cur;
 }
 // Полный шаг движения с ИНЕРЦИЕЙ. Явные намерения ввода (уже разрешённые из раскладки клавиш).
-inline void rcMovePhysics(Camera& c, const Level& lvl, bool fwd, bool back, bool strafeL, bool strafeR,
-                          bool turnL, bool turnR, bool runMod, bool halveMove, bool noclip) {
-    using namespace ztmove;
-    double fwdT = 0.0, strafeT = 0.0, turnT = 0.0;
-    if (strafeL) strafeT += STRAFE;                   // влево (+ = вектор «влево» sx)
-    if (strafeR) strafeT -= STRAFE;
-    if (turnL)   turnT   -= TURN;
-    if (turnR)   turnT   += TURN;
-    if (fwd)  fwdT = runMod ? FWD_RUN : FWD;
-    if (back) fwdT = runMod ? BACK_RUN : BACK;        // назад вдвое медленнее вперёда (40 vs 20)
-    if (halveMove) { fwdT *= 0.5; strafeT *= 0.5; }   // присед/нокдаун ÷2
-    c.turnVel   = ztEase(c.turnVel,   turnT,   1.0 / 8.0);   // поворот: разгон ÷8
-    c.fwdVel    = ztEase(c.fwdVel,    fwdT,    1.0 / 16.0);  // вперёд:  разгон ÷16
-    c.strafeVel = ztEase(c.strafeVel, strafeT, 1.0 / 16.0);  // стрейф:  разгон ÷16
-    if (c.turnVel != 0.0) rcRotate(c, c.turnVel);
-    const double sx = c.dirY, sy = -c.dirX;                  // единичный вектор «ВЛЕВО» (исправлено: было -dirY/dirX = вправо)
-    double dx = c.dirX * c.fwdVel + sx * c.strafeVel;
-    double dy = c.dirY * c.fwdVel + sy * c.strafeVel;
-    if (dx != 0.0 || dy != 0.0) rcMove(c, lvl, dx, dy, noclip);
-}
+void rcMovePhysics(Camera& c, const Level& lvl, bool fwd, bool back, bool strafeL, bool strafeR, bool turnL, bool turnR, bool runMod, bool halveMove, bool noclip);   // тело в raycaster.cpp
 
 // Дальность видимости по режиму темноты env (0 Bright..4 Black) — клаустрофобный полумрак ZT.
 inline double rcMaxVis(int envMode) {
@@ -508,6 +408,28 @@ inline int bandForHeight(int h) {
     return 7;                       // h<10 (далеко) → самый тёмный
 }
 
+// ⭐band СПРАЙТА (eda0 @0xedd0, отдельно от стен; ВЕРИФИЦИРОВАНО побайтно capstone+ROM): band=ed50_table[base_idx+t].
+//   base_idx — по ОСВЕЩЕНИЮ этажа (указатель $FF1096, ладдер 0x1d66→блоки, все 5 записей сверены):
+//     env0 Bright→ed50(idx0, band0 ВСЕГДА), env1 Dim→ed64(idx5), env2 Haze→ed78(idx10),
+//     env3 NoCeil→ed64(idx5), env4 Black→ed64(idx5). ⚠ ed8c(band11) — НЕ per-floor, а блэкаут-режим ($FF105E).
+//   t = max(0, 5-(scale>>3)), scale=64/дист (C=64 верифиц.); scale<8 (>8 клеток) в ROM = CULL (тут клампим t=4).
+// ed50-таблица (idx→band, из ROM 0xed50): 0-4→0, 5→1, 6→2, 7→3, 8→4, 9→5, 10→6, 11→7, 12→8, 13→9, 14→10, 15+→11.
+inline int ed50Band(int idx) {
+    static const int B[20] = {0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,11,11,11,11};
+    if (idx < 0) idx = 0; if (idx > 19) idx = 19;
+    return B[idx];
+}
+inline int bandForSprite(double distCells, int envMode) {
+    static const int BASE[5] = {0, 5, 10, 5, 5};    // Bright,Dim,Haze,NoCeil,Black → idx базы (1/3/4 общий ed64)
+    int base = BASE[envMode < 0 ? 0 : (envMode > 4 ? 4 : envMode)];
+    if (base == 0) return 0;                          // Bright: band0 всегда (ROM beq $edf4 пропускает t)
+    double scale = faSpriteScaleC() / (distCells < 1e-3 ? 1e-3 : distCells);
+    if (scale > 300.0) scale = 300.0;                // кламп 0x12C (софт-скейлер не растит бесконечно)
+    int s3 = (int)scale >> 3;
+    int t = 5 - s3; if (t < 0) t = 0; if (t > 4) t = 4;   // ztpp не отбраковывает (drawDist свой) → клампим t
+    return ed50Band(base + t);
+}
+
 // ДАЛЬНОСТЬ ПРОРИСОВКИ (cull): сеттер 0x1d66 ставит -0x714c по env; рендер @0xba60 клампит X/Y-смещение
 // клетки от камеры к [−dist,+dist] (box/Чебышёв) → клетки-стены дальше dist НЕ рисуются (за ними фон/тёмный
 // градиент). env: Bright 16 (≈весь уровень), Dim/Haze/Black 5, No-ceiling 12.
@@ -521,7 +443,11 @@ inline int& faDrawDist() { static int v = -1; return v; }   // override даль
 // (L,R)=байт-смещения левого/правого края; дровер сдвигает выборку ТЕКСТУРЫ по вертикали поколоночно
 // (интерполяция L→R по ширине грани × 1/z) → «искажённая по диагонали» текстура на наклонных гранях,
 // обычная на плоских (L==R). Селектор asc/desc = знак -0x6e92 (под-позиция камеры в клетке).
-inline bool isStairProfileCT(uint8_t ct) { return ct >= 0x0c && ct <= 0x11; }
+// Клетки-СТЕНЫ лестницы с профиль-скосом: 0x0c-0x11 (низ этажа) + повороты 0x38-3b/40-43/48-4b (верх/12-19).
+inline bool isStairProfileCT(uint8_t ct) {
+    return (ct >= 0x0c && ct <= 0x11) || (ct >= 0x38 && ct <= 0x3b) ||
+           (ct >= 0x40 && ct <= 0x43) || (ct >= 0x48 && ct <= 0x4b);
+}
 // НАКЛОН ПИТЧА НА ЛЕСТНИЦЕ (главная механика спуска, дизасм BAEE: -0x71e6 -= -0x6e92). Стоя на клетке-лестницы
 // игра наклоняет камеру по под-позиции в клетке (B4E4 → таблица B51A). Возвращает добавку к питчу (= −V).
 // Формулы V (-0x6e92) per celltype (camXf/camYf = дробь*256, 0..255): спуск-клетки дают плавный переход.
@@ -617,28 +543,79 @@ inline void buildStairHeightMap(const Level& lvl, int floor, std::vector<int>& h
     }
     for (size_t i = 0; i < (size_t)W * H; ++i) ht[i] = (level[i] == UNSET) ? 0 : level[i];
 }
-// (L,R) байты профиля для МОЕЙ грани (0=N,1=W,2=E,3=S). Грань→d3→слово: N=d3:4=LW1hi, S=d3:5=LW1lo,
-// W=d3:2=LW2hi, E=d3:3=LW2lo (по геометрии рёбер растеризатора C6E0). Возвращает 0 если нет профиля.
-inline uint16_t stairProfileWord(uint8_t ct, int myface, bool desc) {
-    if (!isStairProfileCT(ct)) return 0;
-    static const uint32_t T[6][4] = {   // [asc-LW1, asc-LW2, desc-LW1, desc-LW2] по celltype 0x0c..0x11
-        {0x40407F7Fu, 0x7F40407Fu, 0xC0C00000u, 0x00C0C000u}, // 0c
-        {0x40404040u, 0x40404040u, 0xC0C0C0C0u, 0xC0C0C0C0u}, // 0d
-        {0x40404040u, 0x40404040u, 0xC0C0C0C0u, 0xC0C0C0C0u}, // 0e
-        {0x40404040u, 0x40404040u, 0xC0C0C0C0u, 0xC0C0C0C0u}, // 0f
-        {0x40400000u, 0x00404000u, 0xC0C08080u, 0x80C0C080u}, // 10
-        {0x40407F00u, 0x0040407Fu, 0xC0C00080u, 0x80C0C000u}, // 11
-    };
-    const uint32_t* p = T[ct - 0x0c];
-    uint32_t lw1 = desc ? p[2] : p[0];
-    uint32_t lw2 = desc ? p[3] : p[1];
-    switch (myface) {
-        case 0: return (uint16_t)(lw1 >> 16);     // N
-        case 3: return (uint16_t)(lw1 & 0xFFFF);  // S
-        case 1: return (uint16_t)(lw2 >> 16);     // W
-        case 2: return (uint16_t)(lw2 & 0xFFFF);  // E
+// ПРОФИЛЬ-СКОС граней лестницы ROM (хендлеры 945e-9818, §9.1 + агент 2026-07-10). По CELLTYPE и знаку
+// cabin: 4 слова граней [N,W,E,S] (порядок ГРАНЕЙ ПОРТА), слово=(L<<8|R) знаковые сдвиги вершин колонн.
+// STAIR_PROF[ctIdx][branch][face]; branch 0=cabin>0, 1=cabin<=0; face 0=N,1=W,2=E,3=S.
+static const uint16_t STAIR_PROF[18][2][4] = {
+    {{0x4040,0x7f7f,0x407f,0x7f40},{0xc0c0,0x0000,0xc000,0x00c0}},  // 0x0C
+    {{0x4040,0x4040,0x4040,0x4040},{0xc0c0,0xc0c0,0xc0c0,0xc0c0}},  // 0x0D
+    {{0x4040,0x4040,0x4040,0x4040},{0xc0c0,0xc0c0,0xc0c0,0xc0c0}},  // 0x0E
+    {{0x4040,0x4040,0x4040,0x4040},{0xc0c0,0xc0c0,0xc0c0,0xc0c0}},  // 0x0F
+    {{0x4040,0x0000,0x4000,0x0040},{0xc0c0,0x8080,0xc080,0x80c0}},  // 0x10
+    {{0x4040,0x7f00,0x407f,0x0040},{0xc0c0,0x0080,0xc000,0x80c0}},  // 0x11
+    {{0x7f7f,0x4040,0x7f40,0x407f},{0x0000,0xc0c0,0x00c0,0xc000}},  // 0x38
+    {{0x4040,0x4040,0x4040,0x4040},{0xc0c0,0xc0c0,0xc0c0,0xc0c0}},  // 0x39
+    {{0x0000,0x4040,0x0040,0x4000},{0x8080,0xc0c0,0x80c0,0xc080}},  // 0x3A
+    {{0x7f00,0x4040,0x0040,0x407f},{0x0080,0xc0c0,0x80c0,0xc000}},  // 0x3B
+    {{0x407f,0x7f40,0x7f7f,0x4040},{0xc000,0x00c0,0x0000,0xc0c0}},  // 0x40
+    {{0x4040,0x4040,0x4040,0x4040},{0xc0c0,0xc0c0,0xc0c0,0xc0c0}},  // 0x41
+    {{0x4000,0x0040,0x0000,0x4040},{0xc080,0x80c0,0x8080,0xc0c0}},  // 0x42
+    {{0x407f,0x0040,0x7f00,0x4040},{0xc000,0x80c0,0x0080,0xc0c0}},  // 0x43
+    {{0x7f40,0x407f,0x4040,0x7f7f},{0x00c0,0xc000,0xc0c0,0x0000}},  // 0x48
+    {{0x4040,0x4040,0x4040,0x4040},{0xc0c0,0xc0c0,0xc0c0,0xc0c0}},  // 0x49
+    {{0x0040,0x4000,0x4040,0x0000},{0x80c0,0xc080,0xc0c0,0x8080}},  // 0x4A
+    {{0x0040,0x407f,0x4040,0x7f00},{0x80c0,0xc000,0xc0c0,0x0080}},  // 0x4B
+};
+// ==0-СЛОВА cat4 (beq→ФИКСИРОВАННОЕ слово, когда -0x6e92==0 = кабина ровно на этаже, ДО спуска):
+// ct 0x11@9594 / 0x3b@967c / 0x43@9764 / 0x4b@984c. Порядок граней [N,W,E,S] (как STAIR_PROF).
+static const uint16_t STAIR_PROF_ZERO4[4][4] = {
+    {0x40c0,0x0000,0xc000,0x0040},  // 0x11 @9594: L1=$40c00000 L2=$0040c000
+    {0x0000,0x40c0,0x0040,0xc000},  // 0x3B @967c: L1=$000040c0 L2=$c0000040
+    {0xc000,0x0040,0x0000,0x40c0},  // 0x43 @9764: L1=$c0000040 L2=$40c00000
+    {0x0040,0xc000,0x40c0,0x0000},  // 0x4B @984c: L1=$0040c000 L2=$000040c0
+};
+// Профиль-байты (L,R) грани face (0=N,1=W,2=E,3=S) клетки ct. false = не профиль-клетка.
+// L,R — знаковые сдвиги вершин концов грани (0x40=+64, 0x7F=+127, 0xC0=-64, 0x80=-128).
+// cabinSign: знак -0x6e92 (кабина/питч): >0 → «подъём» (POS, branch0), <0 → «спуск» (NEG, branch1),
+//   ==0 → ==0-ВЕТКА ROM (кабина ровно на этаже, ДО спуска — «до спуска отображается неверно»).
+// dx,dy = смещение клетки от камеры (cx−camCX, cy−camCY); нужно ==0-веткам cat3 (0x0e/39/41/49 по знаку d0/d1).
+// ==0 расходится по типу условной инструкции хендлера (дизасм 945e-9818):
+//   ble (0x0c/0d/38/40/48): 0 попадает в ветку ≤0 = спуск/NEG (branch1) — как раньше;
+//   bmi (0x0f/10/3a/42/4a): 0 попадает в ветку ≥0 = подъём/POS (branch0) — БЫЛО НЕВЕРНО (порт брал NEG);
+//   beq→tst d0 (0x0e @94f6 bmi / 0x39 @9610 bpl): 0 выбирает POS/NEG по знаку смещения по X;
+//   beq→tst d1 (0x41 @96f8 bmi / 0x49 @97e0 bpl): по знаку смещения по Y;
+//   beq→фикс   (0x11/3b/43/4b): своё ==0-слово (STAIR_PROF_ZERO4).
+inline bool stairProfile(uint8_t ct, int face, int cabinSign, int dx, int dy, int& L, int& R) {
+    int idx;
+    if      (ct >= 0x0c && ct <= 0x11) idx = ct - 0x0c;
+    else if (ct >= 0x38 && ct <= 0x3b) idx = 6 + (ct - 0x38);
+    else if (ct >= 0x40 && ct <= 0x43) idx = 10 + (ct - 0x40);
+    else if (ct >= 0x48 && ct <= 0x4b) idx = 14 + (ct - 0x48);
+    else return false;
+    // РЕМАП ГРАНЬ→ИНДЕКС-СЛОВА: массив хранит слова в порядке записи handler'ом [N,S,W,E] (по адресам
+    // -6e8c/-6e8a/-6e86/-6e88, дизасм c71e/c758/c798/c7d4). Порт-грань [0=N,1=W,2=E,3=S]. face→array:
+    // N→0, W→2, E→3, S→1. Без ремапа W/E/S брали чужие слова (верна только N). См. faStairFaceMap.
+    static const int F2A[4] = {0, 2, 3, 1};
+    const int fa = faStairFaceMap() ? F2A[face & 3] : (face & 3);
+    uint16_t w;
+    if      (cabinSign > 0) w = STAIR_PROF[idx][0][fa];   // -0x6e92>0 → подъём (POS)
+    else if (cabinSign < 0) w = STAIR_PROF[idx][1][fa];   // -0x6e92<0 → спуск  (NEG)
+    else switch (ct) {                                    // -0x6e92==0 → ==0-ветка
+        case 0x11: w = STAIR_PROF_ZERO4[0][fa]; break;
+        case 0x3b: w = STAIR_PROF_ZERO4[1][fa]; break;
+        case 0x43: w = STAIR_PROF_ZERO4[2][fa]; break;
+        case 0x4b: w = STAIR_PROF_ZERO4[3][fa]; break;
+        case 0x0e: w = STAIR_PROF[idx][dx <  0 ? 0 : 1][fa]; break;  // @94f6 bmi d0: d0<0→POS
+        case 0x39: w = STAIR_PROF[idx][dx >= 0 ? 0 : 1][fa]; break;  // @9610 bpl d0: d0>=0→POS
+        case 0x41: w = STAIR_PROF[idx][dy <  0 ? 0 : 1][fa]; break;  // @96f8 bmi d1: d1<0→POS
+        case 0x49: w = STAIR_PROF[idx][dy >= 0 ? 0 : 1][fa]; break;  // @97e0 bpl d1: d1>=0→POS
+        case 0x0f: case 0x10: case 0x3a: case 0x42: case 0x4a:
+            w = STAIR_PROF[idx][0][fa]; break;            // bmi: 0→POS (branch0)
+        default:
+            w = STAIR_PROF[idx][1][fa]; break;            // ble: 0→NEG (branch1)
     }
-    return 0;
+    L = (int8_t)(w >> 8); R = (int8_t)(w & 0xFF);
+    return true;
 }
 
 // ОТЛОЖЕННЫЙ СЕГМЕНТ ПОЛ/ПОТОЛКА ЛИФТА/ЛЕСТНИЦЫ (по дизасму FUN_9226 хендлеры → FUN_9d42/9d4a → FUN_9d72).
@@ -674,22 +651,50 @@ inline int shaftSeg(uint8_t ct, int cx, int cy, int camCX, int camCY,
     return type;
 }
 
+// ДОСТИЖИМОСТЬ КЛЕТКИ ЛУЧОМ (ROM: транзит-сегмент клетки пакуется ⟺ DDA-луч дошёл до неё ДО первой
+// непрозрачной стены; bc90/9d72, разбор 2026-07-11). Заменяет жёсткий гейт «камера НА клетке»: сегменты
+// появляются плавно по мере приближения (клетка становится видимой) и НЕ торчат через карту (за стеной —
+// не достижима). Грид-DDA (Amanatides-Woo) от позиции камеры к центру клетки; блокирует любая рендер-стена
+// (0x01-05 оси/диаг, 0x0c-11/38-4b профиль, 0x30 шахта). Транзит-пол (0x12-17, area/кабина) — прозрачен.
+inline bool cellReachable(const Level& lvl, int floor, double px, double py, int tcx, int tcy) {
+    int cx = (int)px, cy = (int)py;
+    if (cx == tcx && cy == tcy) return true;                       // камера в самой клетке
+    double dx = (tcx + 0.5) - px, dy = (tcy + 0.5) - py;
+    int stepX = dx > 0 ? 1 : -1, stepY = dy > 0 ? 1 : -1;
+    double adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+    double tMaxX = (adx > 1e-9) ? ((stepX > 0 ? (cx + 1 - px) : (px - cx)) / adx) : 1e30;
+    double tMaxY = (ady > 1e-9) ? ((stepY > 0 ? (cy + 1 - py) : (py - cy)) / ady) : 1e30;
+    double tDeltaX = (adx > 1e-9) ? (1.0 / adx) : 1e30;
+    double tDeltaY = (ady > 1e-9) ? (1.0 / ady) : 1e30;
+    for (int guard = 0; guard < 256; ++guard) {
+        if (tMaxX < tMaxY) { cx += stepX; tMaxX += tDeltaX; } else { cy += stepY; tMaxY += tDeltaY; }
+        if (cx == tcx && cy == tcy) return true;                   // дошли до цели раньше стены
+        if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return false;
+        if (cellRenderWall(lvl.cellType(floor, cx, cy))) return false;  // непрозрачная стена на пути
+    }
+    return false;
+}
+
 // Рампы затенения ZT (CLUT): сеттер 0x1d66 ставит 8 таблиц-рамп по 256 б (ремап упакованного
 // байта-текселя). Дальние банды ремапят индексы → 15 (чёрный). hi/lo нибблы байта затеняются
 // по-разному → горизонтальный ДИЗЕРИНГ. Режим Haze (env 2) — свой набор 0x3b92.., прочие — 0x3392..
 struct ShadeRamps {
-    uint8_t lo[8][16], hi[8][16];   // [банд][индекс] -> затенённый индекс (lo/hi для дизеринга)
+    uint8_t lo[8][16], hi[8][16];   // [банд][индекс] -> затенённый индекс (lo/hi для дизеринга); диагональ CLUT (сплошной тексель)
+    uint8_t full[8][256];           // ПОЛНАЯ CLUT банда: [банд][байт=2 текселя] -> затенённый байт (hi=лев.px, lo=прав.px). ROM ccb6/скейлер move.b (a3,d0.w)
     int env = -1;
     // base = регион рамп (копия ROM с 0x3392): MAIN[b] = base + b*0x100; HAZE[b] = base + 0x800 + b*0x100.
     void build(const uint8_t* base, int envMode) {
         if (envMode == env || !base) return;
         env = envMode;
         size_t setBase = (envMode == 2) ? 0x800 : 0x0;     // Haze (env2) → HAZE-набор
-        for (int b = 0; b < 8; ++b)
+        for (int b = 0; b < 8; ++b) {
+            for (int by = 0; by < 256; ++by)               // полная CLUT (как a3=-$7176 в скейлере)
+                full[b][by] = base[setBase + (size_t)b * 0x100 + by];
             for (int p = 0; p < 16; ++p) {
-                uint8_t byte = base[setBase + (size_t)b * 0x100 + ((p << 4) | p)];
+                uint8_t byte = full[b][(p << 4) | p];       // диагональ = сплошной тексель p
                 hi[b][p] = byte >> 4; lo[b][p] = byte & 0x0F;
             }
+        }
     }
     // финальный индекс палитры для текселя idx на банде band, дизер по чётности тексель-X.
     // doShade=false (Bright) — без рампы (сырой индекс, полная яркость).
@@ -775,6 +780,38 @@ inline uint32_t floorCeilColor(const Palette& pal, const FloorCeil& fc,
     return pal.c[idx & 0x0F];
 }
 
+// ── D4A6-РЕСЕМПЛ ГРАДИЕНТ-ПОЛОС ПО ПИТЧУ (дизасм d494/d49a/d4a6, вскрыто 2026-07-02) ──
+// Игра при питче НЕ сдвигает градиент, а ПЕРЕСЭМПЛИРУЕТ его в буфер $FF6226: n=1.25·|pitch|;
+//   pitch>0 (камера ВЫШЕ: прыжок): строки 0..n = flat src[0]; потолок (src 0..39) сжат Брезенхэмом
+//     в строки n..40; пол (src 40..79) растянут ×(40+n)/40 вниз от горизонта (строка 40);
+//   pitch<0 (камера НИЖЕ: присед/спуск/поездка): зеркально — строки 80−n..80 = flat src[79];
+//     пол сжат в строки 40..80−n; потолок растянут вверх от горизонта ↔ его при-горизонтная
+//     часть (в env2 — сплошной idx2, «синий») расползается вниз по экрану.
+// Функция: экранная строка r (0..79) + питч → строка ИСХОДНОГО шаблона (0..79). Дробную
+// Брезенхэм-механику заменяем эквивалентной линейной перепроекцией (та же геометрия).
+inline int fcRowD4A6(int row, int pitch) {
+    if (pitch == 0) return row;
+    int n = std::abs(pitch) + (std::abs(pitch) >> 2);          // 1.25·|pitch| (asr #2 + add)
+    if (n > 80) n = 80;   // |pitch|≥64 → вся полоса = flat (ROM: цикл flat покрывает все 80 строк)
+    if (pitch > 0) {
+        if (row < n) return 0;                                  // flat: верх = src[0]
+        if (row < 40) {                                         // потолок сжат: n..40 ← src 0..40
+            int span = 40 - n; if (span < 1) return 39;
+            int s = (row - n) * 40 / span; return s > 39 ? 39 : s;
+        }
+        // пол растянут: 40..80 ← src 40..40+40·40/(40+n)
+        int s = 40 + (row - 40) * 40 / (40 + n); return s > 79 ? 79 : s;
+    } else {
+        if (row >= 80 - n) return 79;                           // flat: низ = src[79]
+        if (row >= 40) {                                        // пол сжат: 40..80−n ← src 40..80
+            int span = 40 - n; if (span < 1) return 40;
+            int s = 40 + (row - 40) * 40 / span; return s > 79 ? 79 : s;
+        }
+        // потолок растянут вверх от горизонта: строка 39-к ← src 39 − k·40/(40+n)
+        int s = 39 - (39 - row) * 40 / (40 + n); return s < 0 ? 0 : s;
+    }
+}
+
 // ТОЧНАЯ выборка шаблона (БИТ-В-БИТ ZT, БЕЗ Bayer-реконструкции) на НАТИВНОЙ сетке 256×80 — для FAITHFUL.
 // Дизасм d4a6/d202: буфер колонки индексируется ПРЯМО по сканлайну вида (ny = строка буфера, pitch=0),
 // горизонт = строка 40; гориз. — нативная 2px-колонка (байт) с выбором паттерна нечёт/чёт + 2 нибблы.
@@ -844,18 +881,33 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
     const double horizon = SH * 0.5;
     const int frame = decorFrame();
     uint8_t tile[32 * 32];
+    // КЛАМП МАСШТАБА (ограничение железа eda0 0x12C): при f<clampF держим РАЗМЕР (S/cw) как на f=clampF —
+    // MD не умеет hw-скейл спрайтов, софт-скейлер не растит их бесконечно у самого лица. Позиция — по реальному f.
+    const double clampF = faSpriteClampF();
+    const double fSizeMin = (clampF > 1e-6) ? clampF : 1e-6;
     for (const auto& it : items) {
         const double f = it.f, l = it.l;
-        const double S  = colH(f);                              // высота клетки (полной стены) на дистанции
-        double cw = sx(f, 0.5) - sx(f, -0.5);  if (cw < 0) cw = -cw;   // ширина клетки на таргете
-        const double cx = sx(f, l);                             // центр билборда по X
+        const double fS = (f < fSizeMin) ? fSizeMin : f;        // f для РАЗМЕРА (кламп), не для позиции
+        const double S  = colH(fS);                             // высота клетки (полной стены) на дистанции (клампнута)
+        double cw = sx(fS, 0.5) - sx(fS, -0.5);  if (cw < 0) cw = -cw;   // ширина клетки (клампнута)
+        // ⚠ Спрайты (враг/квадрат/пена) — от S (верт.масштаб), НЕ растягиваем ×cw/S: враги ZT = 1:2 (высокие,
+        // eda0 H=2·W), эффекты — КВАДРАТ. Клетка вида 2:1 (cw шир) — для СТЕН/декора-по-cw, не для спрайтов.
+        const double cx = sx(f, l);                             // центр билборда по X — по РЕАЛЬНОМУ f (позиция)
+        // ПИТЧ спрайта = ROM 1bcaa `screenY = scale·(pitch − eyeH − actorZ) >> 6 + horizon` = PER-SCALE `S·pitch/64`.
+        // Зеркалит ПОЛНЫЙ сдвиг стены (pshift + viewShiftPx), чтобы спрайт совпал с геометрией в ОБОИХ режимах:
+        //   ROM-точный (faTransitZT/лифт): `S·pitch/64` (полная сила, как d214/eda0). ← дефолт ON = ROM-питч.
+        //   legacy (faStairUni-ослабленный): `S·pitch·faStairUni/64` (per-column) + `pitch·faStairUni` (constant vShift).
+        const double pitchShift = (faTransitZT() || cam.elevState != 0)
+            ? S * cam.pitch / 64.0
+            : (S * cam.pitch * faStairUni() / 64.0 + cam.pitch * faStairUni());
+        const double hz = horizon + pitchShift;
         const int band = doShade ? bandForHeight((int)(64.0 / f)) : 0;  // тот же банд, что у стены на f
         // ПЕНА ОГНЕТУШИТЕЛЯ: ФОРМА декор-тайла 0 (как ZT draw 0x14272), но огненные индексы РЕМАПЛЮ в сине-белую пену
         // (ZT рисует тот же тайл палитра-линией 0x20d2 = голубой, а не 0x20f2 = огонь). Размер квадрат wFrac·S/16.
         if (it.foam) {
             double width = it.d.s[0].wFrac16 * 0.0625 * S, height = it.d.s[0].hFrac16 * 0.0625 * S;
             if (width < 0.5 || height < 0.5) continue;
-            double topY = horizon + it.d.s[0].topOff16 * 0.0625 * S, xa = cx - width * 0.5;
+            double topY = hz + it.d.s[0].topOff16 * 0.0625 * S, xa = cx - width * 0.5;
             int ix0 = (int)std::ceil(xa), ix1 = (int)std::floor(cx + width * 0.5);
             int iy0 = (int)std::ceil(topY), iy1 = (int)std::floor(topY + height) - 1;
             if (ix1 < 0 || ix0 > SW - 1 || iy1 < 0 || iy0 > SH - 1) continue;
@@ -890,7 +942,15 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
             if (it.animSt == 1 && !A.fire.empty())  lst = &A.fire;
             else if (it.animSt == 2 && !A.hit.empty())   lst = &A.hit;
             else if (it.animSt == 3 && !A.death.empty()) lst = &A.death;
-            else if (it.animSt == 4 && !A.climb.empty()) lst = &A.climb;   // Hydaca: вертикальный спрайт на стене
+            else if (it.animSt == 4) {                                     // Hydaca лазанье: DIRECTIONAL вертик. поза (6) по ракурсу, иначе одиночная
+                if (A.climbDirs > 0 && it.dir < (uint8_t)A.climbDirs && !A.climbDir[it.dir].empty()) lst = &A.climbDir[it.dir];
+                else if (!A.climb.empty()) lst = &A.climb;
+            }
+            else if (it.animSt == 5) {                                     // Hydaca ПАДЕНИЕ (ZT draw state2): dir 0=вверх a8 / 2=мёртв a10 / 1=вниз a1 (climb)
+                if (it.dir == 0 && !A.fallUp.empty())        lst = &A.fallUp;
+                else if (it.dir == 2 && !A.fallDead.empty()) lst = &A.fallDead;
+                else if (!A.climb.empty())                   lst = &A.climb;
+            }
             auto& frames = *lst;
             if (frames.empty()) continue;
             const EnemySprite& es = frames[it.efr < frames.size() ? it.efr : 0];
@@ -899,10 +959,24 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
             // экранные W/H пропорц. РЕАЛЬНЫМ пикселям, единый скейл K (0.375·S держит гуманоида 1×2 на ~0.75·S).
             // Пёс (1×1=32×32)=КВАДРАТ низкий, Hydaca (2×1=64×32)=ШИРОКАЯ низкая, боссы (2×2) крупнее. (Был баг:
             // drawW/drawH≈равны + формула 16/8 делала ВСЕХ вытянутыми 1:2 → пёс/Hydaca выглядели длинными.)
-            double K = 0.375 * S;
-            double height = (es.h / 32.0) * K, width = (es.w / 32.0) * K;
+            // РАЗМЕР: MD НЕ hw-скейлит — eda0 масштабирует ЦЕЛОЧИСЛЕННЫМ scale=64/F (клам 0x12c), H=drawH·scale>>4
+            // (>>4 = /16 огрубляет → КРУПНЫЕ дискретные ступени по дистанции, не плавно). Порт считал от float S/f.
+            double height, width;
+            if (faSpriteDiscScale()) {
+                int scaleI = (int)(faSpriteScaleC() / fS);                  // ZT invDepth = 64/F, ЦЕЛЫЙ
+                if (scaleI < 1) scaleI = 1; if (scaleI > 0x12c) scaleI = 0x12c;
+                int hstep = (6 * scaleI) >> 4;                             // ZT высота эталона (drawH=6): ЦЕЛОЕ, огрублено /16 → ступени
+                if (hstep < 1) hstep = 1;
+                // ZT-ДОЛЯ вида: враг = hstep/80 высоты 3D-вида (человек f=1: 24/80=0.3). Порт рисовал 0.75 (2.5× крупнее).
+                double base = hstep * (SH / 80.0) * faSpriteSizeK();       // 1.0 = ZT-точно; было SH/32 (=2.5× больше)
+                height = base * (es.h / 64.0);                             // аспект по tiles (одобрен): гуманоид 1:2, пёс квадрат, Hydaca широкая
+                width  = base * (es.w / 64.0);
+            } else {
+                double K = 0.375 * S;                                       // старый плавный float-скейл
+                height = (es.h / 32.0) * K; width = (es.w / 32.0) * K;
+            }
             if (it.corpse) { height *= 0.42; width *= 1.25; }            // труп: сплющен в кучу на полу
-            double bottomY = horizon + S * 0.5 - it.zlift * S * 0.9;     // ноги на полу; zlift>0 = поднят к потолку (Hydaca «на стене/потолке»)
+            double bottomY = hz + S * 0.5 - it.zlift * S * 0.9;     // ноги на полу; zlift>0 = поднят к потолку (Hydaca «на стене/потолке»)
             double topY = bottomY - height;
             double xa = cx - width * 0.5;
             int ix0 = (int)std::ceil(xa), ix1 = (int)std::floor(cx + width * 0.5);
@@ -910,23 +984,54 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
             if (ix1 < 0 || ix0 > SW - 1 || iy1 < 0 || iy0 > SH - 1 || width < 0.5 || height < 0.5) continue;
             if (ix0 < 0) ix0 = 0; if (ix1 > SW - 1) ix1 = SW - 1; if (iy0 < 0) iy0 = 0; if (iy1 > SH - 1) iy1 = SH - 1;
             double fdim = (band > 0) ? (1.0 - band * 0.07) : 1.0; if (fdim < 0.4) fdim = 0.4;
+            // CLUT-ШЕЙД спрайта (eda0/0x10d1be, как стены): сырой тексель → байт(2 текселя) → CLUT[band][byte] → пал.
+            const bool useClut = faSpriteClut() && g_spriteClut().ok && !es.idx.empty() && !it.burned;
+            // band спрайта: ROM-формула (ed50: освещение этажа + scale) ЛИБО как стена (bandForHeight).
+            int sband = faSpriteBandRom() ? bandForSprite(f, lvl.envT[cam.floor]) : band;
+            sband += faSpriteBandAdj(); if (sband < 0) sband = 0; if (sband > 11) sband = 11;
             for (int ix = ix0; ix <= ix1; ++ix) {
                 if (wallCloser(ix, f)) continue;
                 int su = (int)((ix + 0.5 - xa) / width * es.w); if (su < 0) su = 0; if (su >= es.w) su = es.w - 1;
                 for (int iy = iy0; iy <= iy1; ++iy) {
                     int sv = (int)((iy + 0.5 - topY) / height * es.h); if (sv < 0) sv = 0; if (sv >= es.h) sv = es.h - 1;
-                    uint32_t c = es.argb[(size_t)sv * es.w + su];
-                    if (c == 0) continue;
-                    if (it.burned) {                                     // ОБУГЛЕННЫЙ труп: тёмно-серый силуэт с лёгким угольным красным
-                        int g = ((((c>>16)&0xFF)+((c>>8)&0xFF)+(c&0xFF))/3) / 4 + 12;
-                        c = 0xFF000000u | ((g+8)<<16) | (g<<8) | g;
-                    } else if (fdim < 1.0) { int r=(c>>16)&0xFF,g=(c>>8)&0xFF,b=c&0xFF;
-                        c = 0xFF000000u | ((int)(r*fdim)<<16) | ((int)(g*fdim)<<8) | (int)(b*fdim); }
+                    uint32_t c;
+                    if (useClut) {                                       // ⭐CLUT-путь: тексель → байт → CLUT → пал
+                        uint8_t t = es.idx[(size_t)sv * es.w + su];
+                        if (t == 0) continue;                            // прозрачно (idx0)
+                        int suE = su & ~1, suO = suE + 1; if (suO >= es.w) suO = suE;   // байт-колонка (2 текселя)
+                        uint8_t byte = (uint8_t)((es.idx[(size_t)sv * es.w + suE] << 4) | es.idx[(size_t)sv * es.w + suO]);
+                        uint8_t sh = g_spriteClut().band[sband][byte];
+                        uint8_t nib = (su & 1) ? (sh & 0x0F) : (sh >> 4);
+                        c = wallPal.c[nib];
+                    } else {
+                        c = es.argb[(size_t)sv * es.w + su];
+                        if (c == 0) continue;
+                        if (it.burned) {                                 // ОБУГЛЕННЫЙ труп: тёмно-серый силуэт
+                            int g = ((((c>>16)&0xFF)+((c>>8)&0xFF)+(c&0xFF))/3) / 4 + 12;
+                            c = 0xFF000000u | ((g+8)<<16) | (g<<8) | g;
+                        } else if (fdim < 1.0) { int r=(c>>16)&0xFF,g=(c>>8)&0xFF,b=c&0xFF;
+                            c = 0xFF000000u | ((int)(r*fdim)<<16) | ((int)(g*fdim)<<8) | (int)(b*fdim); }
+                    }
                     put(ix, iy, c);
                 }
             }
             continue;                                                    // спрайт врага нарисован
         }
+        // MD-ДИСКРЕТНЫЙ масштаб объекта на полу (пикапы/декор идут через тот же eda0/1bcaa, что враги — размер
+        // ступенями по целому scale, не плавно). Квантуем S/cw тем же множителем, что у врагов.
+        double Sd = S, cwd = cw;
+        if (faSpriteDiscScale()) {
+            int scaleI = (int)(faSpriteScaleC() / fS); if (scaleI < 1) scaleI = 1; if (scaleI > 0x12c) scaleI = 0x12c;
+            int hstep = (6 * scaleI) >> 4; if (hstep < 1) hstep = 1;
+            double cont = 6.0 * faSpriteScaleC() / fS / 16.0;             // непрерывный эквивалент hstep (без огрубления)
+            double m = (cont > 0.01) ? (double)hstep / cont : 1.0;        // отношение дискр/непрер → квантует размер ступенями
+            Sd = S * m; cwd = cw * m;
+        }
+        // band для спрайтового CLUT-шейда декора (по освещению этажа + scale, как враги; ZT eda0 CLUT 0x10d1be)
+        const bool decClut = faDecorSpriteClut() && g_spriteClut().ok;
+        int sbandD = band;
+        if (decClut) { sbandD = faSpriteBandRom() ? bandForSprite(f, lvl.envT[cam.floor]) : band;
+                       sbandD += faSpriteBandAdj(); if (sbandD < 0) sbandD = 0; if (sbandD > 11) sbandD = 11; }
         for (int si = 0; si < it.d.count; ++si) {
             const DecorSprite& sp = it.d.s[si];
             uint8_t tnum = sp.tile; bool hflip = false;
@@ -937,10 +1042,10 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
             } else if (sp.anim == 2) {                                // мигание: alt = tile−4
                 if ((frame >> 4) & 1) tnum = (uint8_t)(sp.tile - 4);
             }
-            const double height = sp.hFrac16 * 0.0625 * S;           // высота (доля S, 1/16)
+            const double height = sp.hFrac16 * 0.0625 * Sd;          // высота (доля S, 1/16) — дискр. масштаб
             // ширина: декор — доля ширины КЛЕТКИ (cw, мир-аспект); эффекты/враги — КВАДРАТ от S (не растянуто).
-            const double width  = sp.wFrac16 * 0.0625 * (it.square ? S : cw);
-            const double topY   = horizon + sp.topOff16 * 0.0625 * S;     // верх (отн. горизонта)
+            const double width  = sp.wFrac16 * 0.0625 * (it.square ? Sd : cwd);
+            const double topY   = hz + sp.topOff16 * 0.0625 * Sd;    // верх (отн. горизонта)
             if (width < 0.5 || height < 0.5) continue;
             const double xa = cx - width * 0.5;
             int ix0 = (int)std::ceil(xa), ix1 = (int)std::floor(cx + width * 0.5);
@@ -958,7 +1063,14 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
                     int sv = (int)((iy + 0.5 - topY) / height * 32.0);  if (sv < 0) sv = 0; if (sv > 31) sv = 31;
                     uint8_t idx = tile[sv * 32 + su];
                     if (idx == 0) continue;                           // прозрачный (MD цвет 0)
-                    put(ix, iy, wallPal.c[ramps.map(idx, band, hiNib, doShade)]);
+                    uint32_t c;
+                    if (decClut) {                                    // ⭐СПРАЙТОВЫЙ CLUT (eda0/0x10d1be): байт-пара → CLUT[band][byte] → нибл
+                        int suE = su & ~1, suO = suE + 1; if (suO > 31) suO = suE;
+                        uint8_t byte = (uint8_t)((tile[sv * 32 + suE] << 4) | tile[sv * 32 + suO]);
+                        uint8_t sh = g_spriteClut().band[sbandD][byte];
+                        c = wallPal.c[(su & 1) ? (sh & 0x0F) : (sh >> 4)];
+                    } else c = wallPal.c[ramps.map(idx, band, hiNib, doShade)];  // старый стеновой CLUT (ramps)
+                    put(ix, iy, c);
                 }
             }
         }
@@ -968,7 +1080,10 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
 // Рендер кадра вида от первого лица. put(x,y,argb); zbuf[x] = глубина колонки.
 template <typename PutFn>
 void renderFPS(PutFn&& put, int W, int H, const Level& lvl, const Palette& wallPal,
-               MetaCache& meta, const Camera& cam, std::vector<double>& zbuf, int envMode) {
+               MetaCache& meta, const Camera& camIn, std::vector<double>& zbuf, int envMode) {
+    // ROM b9a6: глаз рендера = позиция игрока − dir/8 (камера «за плечом», см. tuning faCamBack)
+    Camera cam = camIn;
+    if (faCamBack()) { cam.px -= cam.dirX * 0.125; cam.py -= cam.dirY * 0.125; }
     zbuf.assign(W, 1e9);
     const bool   openTop = (envMode == 3);
     // PITCH = ВЫСОТА ГЛАЗА (не наклон! dead_ends #5/#8: наклона камеры в ZT НЕТ). Равномерный вертикальный
