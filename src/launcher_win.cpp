@@ -16,6 +16,15 @@
 #include "launcher_data.hpp"   // launcher::Entry / scanRoms / makeState / probeRom / buildLabel / saveLastRom
 #include "version.hpp"
 
+// ⭐UNICODE ОБЯЗАТЕЛЕН: весь файл использует W-строки/W-вызовы; без него TCHAR-макросы
+// (ListView_SetItemText, IDC_ARROW, …) разворачиваются в ANSI-варианты → ошибки LPWSTR→LPSTR
+// (первая живая Windows-сборка, MSYS2/MinGW64, 2026-07-23).
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
