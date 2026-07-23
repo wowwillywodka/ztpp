@@ -45,7 +45,6 @@ a **demo release (v0.8)** is being prepared.
 - Save/load (6 slots + quick), rebindable controls (4 presets), mouse, GZDoom-style console
 - ROM launcher (native on macOS, SDL fallback everywhere; Win32/GTK best-effort)
 - **Zero Tolerance Underground** — playable, partial support
-- macOS `.app` packaging (`tools/make_app.sh`)
 
 ## Not done yet
 - Gamepad support
@@ -85,8 +84,6 @@ a **demo release (v0.8)** is being prepared.
    cmake --build build --parallel
    ```
    On macOS you can instead just run `./build.sh` — it does both steps.
-   To package a distributable macOS app bundle (bundled SDL2, icon, ad-hoc signature):
-   `bash tools/make_app.sh` → `dist/ztpp.app` + a release zip.
 
 The project is built as **several translation units** (`src/`, `src/rom/`, `src/render/`) rather than one
 unity file, so incremental rebuilds are quick and `--parallel` speeds up a clean build. Sources are globbed
@@ -181,7 +178,6 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
 - Сейвы (6 слотов + quick), переназначаемое управление (4 пресета), мышь, консоль в стиле GZDoom
 - Лаунчер выбора ROM (нативный на macOS, SDL-фолбэк везде; Win32/GTK best-effort)
 - **Zero Tolerance Underground** — играбелен, частичная поддержка
-- Упаковка macOS `.app` (`tools/make_app.sh`)
 
 ## Что не сделано
 - Поддержка геймпада
@@ -222,8 +218,6 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
    cmake --build build --parallel
    ```
    На macOS можно вместо этого просто запустить `./build.sh` — он делает оба шага.
-   Для распространяемого macOS-бандла (вложенный SDL2, иконка, ad-hoc подпись):
-   `bash tools/make_app.sh` → `dist/ztpp.app` + релизный zip.
 
 Проект собирается из **нескольких единиц трансляции** (`src/`, `src/rom/`, `src/render/`), а не одним
 unity-файлом, — поэтому инкрементальная пересборка быстрая, а `--parallel` ускоряет чистую сборку.
