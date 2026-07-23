@@ -119,7 +119,6 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
 
 ## Related repositories
 - **ztextractor** — data inspection/extraction tool for the ROM: <https://github.com/wowwillywodka/ztextractor>
-- **Reverse-engineering notes** — addresses, formats, subsystem behaviour: <https://github.com/wowwillywodka/ztresearchdocs>
 
 ## Acknowledgements
 - **Smoke** — the **BZTEdit** editor; the map-cell icons used in the port come from it.
@@ -256,7 +255,6 @@ docker run --rm -v "$PWD/roms:/roms" -v "$PWD/out:/out" ztpp "/roms/your.gen" --
 
 ## Связанные репозитории
 - **ztextractor** — инструмент инспекции/извлечения данных из ROM: <https://github.com/wowwillywodka/ztextractor>
-- **Заметки по реверс-инжинирингу** — адреса, форматы, поведение подсистем: <https://github.com/wowwillywodka/ztresearchdocs>
 
 ## Благодарности
 - **Smoke** — редактор **BZTEdit**; иконки клеток карты в порте взяты из него.
