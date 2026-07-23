@@ -72,10 +72,11 @@ if(APPLE AND NOT ZTPP_NO_SDL)
   target_link_libraries(ztpp PRIVATE "-framework Cocoa")
 endif()
 
-# Windows: нативный Win32-диалог (launcher_win.cpp, по образцу eduke32 startwin.game.c).
-# ⚠ Написан best-effort и НЕ проверен сборкой (разработка идёт на macOS) — тестировать на Windows.
+# Windows: нативный Win32-диалог (launcher_win.cpp, по образцу eduke32 startwin.game.c)
+# + иконка exe (ztpp.rc → ztpp.ico из логотипа).
 if(WIN32 AND NOT ZTPP_NO_SDL)
-  target_sources(ztpp PRIVATE ${CMAKE_SOURCE_DIR}/src/launcher_win.cpp)
+  enable_language(RC)
+  target_sources(ztpp PRIVATE ${CMAKE_SOURCE_DIR}/src/launcher_win.cpp ${CMAKE_SOURCE_DIR}/ztpp.rc)
   target_link_libraries(ztpp PRIVATE comctl32 comdlg32 shell32)
 endif()
 
