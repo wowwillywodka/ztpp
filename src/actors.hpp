@@ -69,12 +69,21 @@ struct Actor {
 
 // ── ПУЛ (ZT: 64 слота). ФИКСИРОВАННЫЙ размер (без push_back!) — спавн во время think не должен
 // реаллоцировать вектор и инвалидировать итераторы (взрыв гранаты спавнит актёров прямо в цикле). ──
-static const int MAX_ACTORS = 256;
+// ⚠ Пул ГЛОБАЛЬНЫЙ и живёт весь уровень (персистентность этажей, ROM b8fc): трупы и вечные
+// карта-огни (0x18) копятся со ВСЕХ посещённых этажей. 256 слотов забивались к глубине эпизода
+// (ENGINEERING 2/3), и фолбэк «перезаписать слот 0» СТИРАЛ живого врага при каждом новом спавне.
+static const int MAX_ACTORS = 2048;
 inline std::vector<Actor>& actors() { static std::vector<Actor> v(MAX_ACTORS); return v; }
 inline void clearActors() { for (auto& a : actors()) a.active = false; worldFx().clear(); }
 inline Actor& allocActor() {
     for (auto& a : actors()) if (!a.active) { a = Actor{}; a.active = true; return a; }
-    return actors()[0];                      // пул полон — fallback (перезапишем слот 0)
+    // пул полон: жертвуем короткоживущим ЭФФЕКТОМ — НИКОГДА врагом/трупом/огнём-хазардом
+    for (auto& a : actors())
+        if (a.think == AT_SPARK || a.think == AT_BLOOD || a.think == AT_FOAM || a.think == AT_FLAME) {
+            a = Actor{}; a.active = true; return a;
+        }
+    static Actor scratch;                    // совсем некуда: одноразовый слот вне пула (актёр молча не появится)
+    scratch = Actor{}; scratch.active = true; return scratch;
 }
 // Число живых врагов на этаже (для сообщений «FLOOR SECURED» / «ZERO ENEMIES REMAINING»).
 inline int aliveEnemies(int floor) {
