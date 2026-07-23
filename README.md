@@ -39,15 +39,19 @@ a **demo release (v0.8)** is being prepared.
 - The background sniper on the rooftops (building overlay, ricochets, rocket tracer kill)
 - "Sky walls": station windows and roof parapets swallow shots, the laser sight aims through them
 - Character selection (perks, DECEASED cards), boot intro (SEGA / Accolade / Technopop / title),
-  cutscenes, ROM-compatible password system with entry screen, pause map (TAB)
+  cutscenes, pause map (TAB)
 - Sound through a **YM2612 / YM3438** chip emulator: GEMS music (FM/PSG/DAC), PCM voice samples,
   per-event SFX
-- Save/load (6 slots + quick), rebindable controls (4 presets), mouse, GZDoom-style console
+- Save/load (6 slots + quick), rebindable controls (4 presets), GZDoom-style console
+- Mouse control with adjustable sensitivity and smooth camera turning (frame-interpolated view
+  on top of the bit-exact 15 Hz simulation)
+- Optional unlimited inventory (the original 5-slot carousel stays the default)
 - ROM launcher (native on macOS, SDL fallback everywhere; Win32/GTK best-effort)
 - **Zero Tolerance Underground** — playable, partial support
 
 ## Not done yet
 - Gamepad support
+- The password system (ROM-compatible encode/decode and entry screen exist, but open questions remain)
 - A fully fixed-point render path (the math is float today, verified against MAME within 0.1%)
 - There are still some discrepancies with the original here and there — behaviour keeps being
   verified against the disassembly and MAME and fixed as they are found
@@ -172,15 +176,20 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
 - «Небесные стены»: окна станции и парапеты крыши глотают выстрелы, лазерный прицел
   смотрит сквозь них
 - Выбор бойца (перки, карточки DECEASED), boot-интро (SEGA / Accolade / Technopop / титул),
-  заставки, ROM-совместимая система паролей с экраном ввода, пауза-карта (TAB)
+  заставки, пауза-карта (TAB)
 - Звук через эмулятор чипа **YM2612 / YM3438**: музыка GEMS (FM/PSG/DAC), PCM-озвучка,
   событийные SFX
-- Сейвы (6 слотов + quick), переназначаемое управление (4 пресета), мышь, консоль в стиле GZDoom
+- Сейвы (6 слотов + quick), переназначаемое управление (4 пресета), консоль в стиле GZDoom
+- Управление мышью с настраиваемой чувствительностью и механизм плавного поворота камеры
+  (интерполяция кадров поверх бит-точной симуляции 15 Гц)
+- Возможность сделать инвентарь безграничным (по умолчанию — оригинальная карусель на 5 слотов)
 - Лаунчер выбора ROM (нативный на macOS, SDL-фолбэк везде; Win32/GTK best-effort)
 - **Zero Tolerance Underground** — играбелен, частичная поддержка
 
 ## Что не сделано
 - Поддержка геймпада
+- Система паролей (ROM-совместимые кодирование/декодирование и экран ввода есть, но остаются
+  открытые вопросы)
 - Полностью целочисленный (fixed-point) рендер-путь (математика пока float, сверена с MAME
   в пределах 0.1%)
 - Местами ещё встречаются расхождения с оригиналом — поведение продолжает сверяться
