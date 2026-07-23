@@ -10,8 +10,9 @@ C++/SDL2 — a first-person engine rebuilt from behaviour, not a decompilation. 
 > Created with heavy use of **Claude (Anthropic's AI)** — the reverse-engineering,
 > analysis, and most of the implementation were done together with it.
 
-> ⚠ Only the original **Zero Tolerance** ROM (US/EU release) is supported right now. The German build,
-> Zero Tolerance Underground and Beyond Zero Tolerance are planned — see [Planned](#planned).
+> ⚠ The original **Zero Tolerance** ROM (US/EU release, Rev A) is fully supported.
+> **Zero Tolerance Underground** is playable with **partial support**. The German build and
+> Beyond Zero Tolerance prototypes are planned — see [Planned](#planned).
 
 > Development is intentionally **very slow-paced** — this is a hobby project.
 
@@ -21,48 +22,40 @@ C++/SDL2 — a first-person engine rebuilt from behaviour, not a decompilation. 
 ## Goal
 Build a port that is as **accurate to the original as possible** — reference-faithful to the Mega Drive
 game — plus modern **quality-of-life** features that don't change the game itself (rebindable controls,
-gamepad, save games, resolution / full-screen options, …). Right now it looks more like a developer demo
-than a game — so there is **no release** yet.
+gamepad, save games, resolution / full-screen options, …). The game is playable start to finish —
+a **demo release (v0.8)** is being prepared.
 
 ## What works
-- Rendering as close to the original as possible, reconstructed from the reverse-engineered draw algorithm
-- Original physics (from reverse engineering)
-- Wall animations and destructible walls
-- Enemies — partially implemented
-- Enemy AI ~80% matching the reverse
-- Weapons, behaviour ~70% matching the reverse
-- Melee / fist-fight mechanic
-- All maps from all episodes
-- Weapon pickups from corpses
-- GZDoom-style console
-- Mouse control
-- 5-slot inventory, with an option to remove the limit
-- Blood physics and rendering as in the original
-- Proper HUD readouts — alive enemies on the level and health
-- The original radar (with minor discrepancies)
-- Audio playback through a **YM2612 / YM3438** chip emulator
+- Rendering as close to the original as possible, reconstructed from the reverse-engineered draw
+  algorithm (reference cockpit HUD, per-column CLUT shading, sprite scaling, panorama backgrounds)
+- Original player physics (ZT inertia, integer Mega-Drive movement path, knockback/stun, stances)
+- All 10 enemy types with byte-audited AI: attack cycles, telegraphs, walk-by-distance animation,
+  death sequences, stealth/darkness rolls, pack alerts — no artificial i-frames, ROM damage model
+- Bosses and the full episode-completion flow (briefings, MISSION CODE, gear carries over,
+  victory returns to the intro)
+- All weapons and items: cone auto-aim, distance damage curves, 5-slot inventory carousel,
+  consumable drain, vest, corpse looting
+- Stairs, elevators, doors, destructible & secret walls, explosions and chain detonations
+- The background sniper on the rooftops (building overlay, ricochets, rocket tracer kill)
+- "Sky walls": station windows and roof parapets swallow shots, the laser sight aims through them
+- Character selection (perks, DECEASED cards), boot intro (SEGA / Accolade / Technopop / title),
+  cutscenes, ROM-compatible password system with entry screen, pause map (TAB)
+- Sound through a **YM2612 / YM3438** chip emulator: GEMS music (FM/PSG/DAC), PCM voice samples,
+  per-event SFX
+- Save/load (6 slots + quick), rebindable controls (4 presets), mouse, GZDoom-style console
+- ROM launcher (native on macOS, SDL fallback everywhere; Win32/GTK best-effort)
+- **Zero Tolerance Underground** — playable, partial support
+- macOS `.app` packaging (`tools/make_app.sh`)
 
 ## Not done yet
-- Resolution settings
-- Character selection
-- Cutscenes / intros
-- The episode-completion mechanic
-- Stairs and elevator graphics
-- Item readouts and their limit
-- Boss behaviour
-- Fire-extinguisher graphics
-- Properly working enemy animations
-- Passwords
-- Pause map
-- Snipers
+- Gamepad support
+- German build and the Beyond Zero Tolerance prototypes
+- A fully fixed-point render path (the math is float today, verified against MAME within 0.1%)
+- Minor polish: elevator blue-void edge cases, exact flashlight ramp, small HUD discrepancies
 
 ## Planned
-- Support for **Zero Tolerance** (original & German builds), **Zero Tolerance Underground**, and
-  **Beyond Zero Tolerance** (June & July prototypes)
-- Both the original graphics mode and a configurable full-screen mode
-- Save games
-- Tuning of clock-dependent mechanics
-- Playback of audio files
+- Full support for the **German build** and **Beyond Zero Tolerance** (June & July prototypes);
+  finishing **Zero Tolerance Underground**
 - Gamepad support with rumble
 - A "what if the game had shipped on Sega CD / 32X" mode — a purely visual what-if on the more capable
   hardware; gameplay and mechanics stay identical to the original.
@@ -91,6 +84,8 @@ than a game — so there is **no release** yet.
    cmake --build build --parallel
    ```
    On macOS you can instead just run `./build.sh` — it does both steps.
+   To package a distributable macOS app bundle (bundled SDL2, icon, ad-hoc signature):
+   `bash tools/make_app.sh` → `dist/ztpp.app` + a release zip.
 
 The project is built as **several translation units** (`src/`, `src/rom/`, `src/render/`) rather than one
 unity file, so incremental rebuilds are quick and `--parallel` speeds up a clean build. Sources are globbed
@@ -150,8 +145,9 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
 > Сделано при активном участии **Claude (ИИ от Anthropic)** — реверс-инжиниринг,
 > анализ и бо́льшая часть реализации выполнены вместе с ним.
 
-> ⚠ Сейчас поддерживается только оригинальный ROM **Zero Tolerance** (релиз US/EU). Немецкий билд,
-> Zero Tolerance Underground и Beyond Zero Tolerance — в планах (см. [Планируется](#планируется)).
+> ⚠ Оригинальный ROM **Zero Tolerance** (релиз US/EU, Rev A) поддерживается полностью.
+> **Zero Tolerance Underground** играбелен с **частичной поддержкой**. Немецкий билд и прототипы
+> Beyond Zero Tolerance — в планах (см. [Планируется](#планируется)).
 
 > Разработка сознательно ведётся **очень неспешно** — это хобби-проект.
 
@@ -161,48 +157,42 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
 ## Цель
 Сделать максимально **точный порт оригинала** — референс-достоверность к игре на Mega Drive — плюс современные
 **quality-of-life** фичи, которые не меняют саму игру (переназначаемое управление, геймпад, сохранения, настройки
-разрешения / полноэкранного режима, …). Сейчас это выглядит скорее как демка для разработчиков, чем как игра, —
-поэтому **релиза нет**.
+разрешения / полноэкранного режима, …). Игра проходится от начала до конца — готовится **демо-релиз (v0.8)**.
 
 ## Что готово
-- Максимально близкий к оригиналу рендер, воссозданный на основе реверса оригинального алгоритма отрисовки
-- Оригинальная физика на основе реверса
-- Анимации стен, разрушаемость стен
-- Враги — частично реализованы
-- ИИ врагов, на ~80% совпадающий с реверсом
-- Оружие, поведение на ~70% совпадающее с реверсом
-- Механика кулачного боя
-- Все карты из всех эпизодов
-- Пикапы оружия с трупов
-- Консоль в стиле GZDoom
-- Управление мышью
-- 5-слотовый инвентарь с возможностью снять ограничение
-- Физика и отображение крови как в оригинале
-- Нормальное отображение показателей — живых врагов на уровне и здоровья
-- Оригинальный радар (с мелкими несоответствиями)
-- Воспроизведение звука через эмулятор чипа **YM2612 / YM3438**
+- Максимально близкий к оригиналу рендер по реверсу оригинального алгоритма отрисовки
+  (reference-кокпит HUD, поколоночный CLUT-шейдинг, масштабирование спрайтов, фоны-панорамы)
+- Оригинальная физика игрока (ZT-инерция, целочисленный MD-путь движения, нокбэк/стан, стойки)
+- Все 10 типов врагов с побайтно выверенным ИИ: боевые циклы, телеграфы атак, анимация ходьбы
+  по пройденному пути, последовательности смерти, стелс/тьма, пак-алерты — без искусственных
+  i-frames, модель урона как в ROM
+- Боссы и полный флоу завершения эпизодов (брифинги, MISSION CODE, перенос снаряжения,
+  после победы — возврат на заставку)
+- Всё оружие и предметы: конус-автонаведение, дистанционные кривые урона, карусель-инвентарь
+  на 5 слотов, расход пассивок, жилет, лут с трупов
+- Лестницы, лифты, двери, разрушаемые и секретные стены, взрывы и цепные детонации
+- Фоновый снайпер на крышах (здание на панораме, рикошеты, убийство ракетой-трассером)
+- «Небесные стены»: окна станции и парапеты крыши глотают выстрелы, лазерный прицел
+  смотрит сквозь них
+- Выбор бойца (перки, карточки DECEASED), boot-интро (SEGA / Accolade / Technopop / титул),
+  заставки, ROM-совместимая система паролей с экраном ввода, пауза-карта (TAB)
+- Звук через эмулятор чипа **YM2612 / YM3438**: музыка GEMS (FM/PSG/DAC), PCM-озвучка,
+  событийные SFX
+- Сейвы (6 слотов + quick), переназначаемое управление (4 пресета), мышь, консоль в стиле GZDoom
+- Лаунчер выбора ROM (нативный на macOS, SDL-фолбэк везде; Win32/GTK best-effort)
+- **Zero Tolerance Underground** — играбелен, частичная поддержка
+- Упаковка macOS `.app` (`tools/make_app.sh`)
 
 ## Что не сделано
-- Настройки разрешения
-- Выбор персонажа
-- Заставки
-- Механика завершения эпизодов
-- Графика лестниц и лифтов
-- Показатели предметов и их лимит
-- Поведение боссов
-- Графика огнетушителя
-- Нормально работающие анимации врагов
-- Пароли
-- Карта с паузы
-- Снайперы
+- Поддержка геймпада
+- Немецкий билд и прототипы Beyond Zero Tolerance
+- Полностью целочисленный (fixed-point) рендер-путь (математика пока float, сверена с MAME
+  в пределах 0.1%)
+- Мелкая полировка: краевые случаи синего фона лифта, точная рампа фонаря, мелкие расхождения HUD
 
 ## Планируется
-- Поддержка **Zero Tolerance** (оригинальный и немецкий билды), **Zero Tolerance Underground** и
-  **Beyond Zero Tolerance** (июньский и июльский прототипы)
-- Оригинальный режим отображения графики и полноэкранный настраиваемый
-- Сохранения
-- Настройка клок-зависимых механик
-- Воспроизведение аудиофайлов
+- Полная поддержка **немецкого билда** и **Beyond Zero Tolerance** (июньский и июльский прототипы);
+  доведение **Zero Tolerance Underground**
 - Поддержка геймпадов и вибрации
 - Режим «что, если бы игра вышла на Sega CD / 32X» — чисто визуальный what-if на более мощном железе;
   геймплей и механики — как в оригинале, без изменений.
@@ -231,6 +221,8 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
    cmake --build build --parallel
    ```
    На macOS можно вместо этого просто запустить `./build.sh` — он делает оба шага.
+   Для распространяемого macOS-бандла (вложенный SDL2, иконка, ad-hoc подпись):
+   `bash tools/make_app.sh` → `dist/ztpp.app` + релизный zip.
 
 Проект собирается из **нескольких единиц трансляции** (`src/`, `src/rom/`, `src/render/`), а не одним
 unity-файлом, — поэтому инкрементальная пересборка быстрая, а `--parallel` ускоряет чистую сборку.
