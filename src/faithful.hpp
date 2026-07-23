@@ -17,6 +17,7 @@
 #include "level.hpp"
 #include "cells.hpp"
 #include "raycaster.hpp"   // Camera, MetaCache, shade, rcMaxVis, cellIsDoor, DOOR_METATEX
+#include "sniper_overlay.hpp"   // фоновый снайпер эп2 (оверлей за стенами + рикошеты)
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -43,6 +44,19 @@ static const uint32_t FA_ELEV_BLUE = 0xFF002448u;
 inline double& faFocalH() { static double v = 64.0; return v; }   // гор. фокус (screenX)
 inline double& faFocalV() { static double v = 64.0; return v; }   // верт. фокус (высота D0)
 // faDrawDist() — в raycaster.hpp (нужен и renderFPS, который объявлен раньше).
+
+// ── FIXED-POINT ПРОЕКЦИЯ (fxProj, этап 1) — арифметика МД ca4c на ЦЕЛЫХ. Граница компромисса этапа 1:
+// perp/доля грани приходят из double-марша (веер целым станет на этапе 3, fxfan), но КВАНТУЮТСЯ здесь к
+// ROM-сеткам (усечение, не round — как divs/asr МД), дальше только int. Предполагает faFocalV=64 (ROM).
+inline int fxD0FromPerp(double perp) {            // D0 = divs.w(0x10000, forward>>6) ≈ 64/forward (ca4c)
+    int32_t f6 = (int32_t)(perp * 65536.0) >> 6;  // forward кл → 16.16 (=8.8 поз × 8.8 cos у МД) → >>6
+    if (f6 <= 0) return 0x7FFF;                   // в упор (forward<64 суб-ед) → кламп как bvs-пропуск
+    int32_t q = 0x10000 / f6;                     // divs.w: усечение к нулю
+    return q > 0x7FFF ? 0x7FFF : (int)q;
+}
+inline int fxTexel(double t) {                    // доля грани 0..1 → тексель 0..127: суб-поз 8.8, тексель=sub>>1
+    return (((int)(t * 256.0)) & 255) >> 1;       // (128 текселей на 256 суб-единиц клетки)
+}
 
 // faHStretch(), ShadeRamps, bandForHeight — общие, объявлены в raycaster.hpp.
 // Освещение faithful = ТОЧНАЯ таблица ZT height→band (bandForHeight) + рампы (ShadeRamps) с
@@ -327,6 +341,9 @@ template <typename PutFn>
 void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& wallPal,
                     MetaCache& meta, const Camera& camIn, std::vector<double>& zbuf, int envMode,
                     int natW = FA_NW, int natH = -1) {
+    // ⭐НОЧНИК (ROM 11286): градиент пола/потолка = ИСТОЧНИК BRIGHT 0x14EE66 (тьма этажа отменяется — «видно
+    // в темноте»), env3 (no-ceiling) сохраняет панораму. Палитра уже зелёная (scenePal 0x2072, ROM 29ee).
+    if (nvActive() && envMode != 3) envMode = 0;
     // ВЫСОТА ГЛАЗА НА ЛЕСТНИЦЕ (дизасм BAEE: -71e6 -= subpos для класса≥6; D202: сдвиг колонны =(D0·pitch+
     // profile_acc)>>6, обрезка по экрану). АВТО ВЫКЛ: без реального профиль-аккумулятора (-6e84, компенсирует
     // питч и даёт V-скос) один питч уводит близкие стены блока за экран = всё синее. Питч+профиль связаны,
@@ -357,6 +374,11 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
     ramps.build(meta.shadeRampData, envMode);
     static FloorCeil fc;                // слой пол/потолок ZT (ROM-шаблон по env)
     fc.build(meta.fcTemplateData, wallPal, envMode);
+    // ⭐ФОНАРЬ: конус света в ПОЛ/ПОТОЛОК (ROM d3xx: рампа 0x4436 в 16 колоннах вокруг центра) —
+    // аппроксимация: в конусных колоннах пол/потолок берётся из env-0 (Bright) шаблона (как стены band=0).
+    static FloorCeil fcLit;
+    const bool flCone = flActive() && envMode != 0;
+    if (flCone) fcLit.build(meta.fcTemplateData, wallPal, 0);
     // КАРТА ВЫСОТ ПОЛА ЛЕСТНИЦЫ (кэш по этажу): пол клеток-спуска опущен → наклонный/смещённый вниз пол.
     static std::vector<int> stairHt; static int stairHtFloor = -1; static const Level* stairHtLvl = nullptr;
     if (stairHtFloor != cam.floor || stairHtLvl != &lvl) {
@@ -518,7 +540,7 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
     //     по хендлерам c8a8/c910/c97c/c842; вид со СПЛОШНОЙ стороны = плоская грань ребра);
     //   • ШАГ4 сдвижные двери (перекрытие створок по doorOpen) + профиль-скос лестницы (stairProfile→pshift).
     // Транзит-сегменты пол/потолок (shaftSeg/deferFC) рисуют отдельные проходы ниже (гейт reachedTransit) —
-    // общие для бокс-обхода и DDA. ДЕФОЛТ OFF (в разработке; сверяется живьём) — рабочий рендер = бокс-обход.
+    // общие для бокс-обхода и DDA. ⭐ДЕФОЛТ ON (tuning.hpp faRayDDA; бокс-обход = легаси-фолбэк faRayDDA OFF).
     if (faRayDDA() && !faNoWalls()) {
         const double yc2 = NH / 2.0;
         const int maxSteps = drawDist * 2 + 2;
@@ -535,16 +557,37 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
         auto emitCol = [&](int ix, double perp, const uint8_t* mt, int tmx, int pshift, bool blueBk, bool elevRide) {
             if (perp < FA_NEAR) perp = FA_NEAR;
             double iv = 1.0 / perp;
+            // fxProj (этап 1): D0 целочисленно как МД ca4c. fxZQuant (этап 2): глубина колонны (z-тест и
+            // запись в zc) на СЕТКЕ целого D0 (=D0/64) — ROM держит per-column СКЕЙЛ стены ($FF6126..6226).
+            int D0 = fxProj() ? fxD0FromPerp(perp) : (int)(faFocalV() * iv);
+            if (fxZQuant() && D0 >= 1) iv = D0 / faFocalV();
             if (iv <= zc[ix]) return;
-            int D0 = (int)(faFocalV() * iv);
             if (D0 < 1) { zc[ix] = iv; return; }
             int band = doShade ? (faWallBand0() ? 0 : bandForHeight(D0)) : 0;
+            // ⭐ФОНАРЬ (ROM 13182: конус $FF6196+прицел·4 шириной 0x20 = 16 колонн; CLUT-рампа 0x4436 в
+            // конусе = яркая): при активном фонаре (без ночника) колонны вокруг центра НЕ затемняются.
+            if (flActive() && ix >= NW / 2 - 8 && ix < NW / 2 + 8) band = 0;
             bool clutD = faWallDither() && (D0 <= faWallDitherD0());
             int top = (int)yc2 - D0 / 2 + pshift;
             if (blueBk) {                                             // синий пол/потолок-задник (§9.2): над/под колонной
+                // ⭐ROM d28e (сдвинутая/высокая колонна): синий НЕ с обеих сторон всегда.
+                //   d278: сруб ПОЛНОСТЬЮ за экраном (D0/2±pshift ≤ −0x28) → ВСЯ колонка = полоса (синий), текстуры нет;
+                //   d35c: pshift ≥ +0x28 → синий ТОЛЬКО сверху (текстура тянется до низа вида, низ НЕ льётся);
+                //   d3b6: pshift ≤ −0x28 → синий ТОЛЬКО снизу;
+                //   иначе (умеренный сдвиг) → оба зазора из полосы, как было.
+                // До фикса порт лил синий с обеих сторон всегда → «синяя полоса вверх и вниз» на профиль-стенах
+                // (центральная ячейка лестницы) и просвет уровня в поездке лифта. Тумблер faBlueD28E (дефолт ON).
+                const int HALF = NH / 2;                              // 0x28 в ROM-единицах (вид 0x50 строк)
+                bool fullOff = faBlueD28E() && (D0 / 2 - pshift <= -HALF || D0 / 2 + pshift <= -HALF);
+                if (fullOff) {
+                    for (int y = 0; y < NH; ++y) nat[(size_t)y * NW + ix] = FA_ELEV_BLUE;
+                    zc[ix] = iv; return;                              // сруб не рисуем (он за экраном)
+                }
+                bool topBlue = !faBlueD28E() || (pshift > -HALF);     // d3b6: сильный сдвиг ВВЕРХ → верх не льём
+                bool botBlue = !faBlueD28E() || (pshift <  HALF);     // d35c: сильный сдвиг ВНИЗ → низ не льём
                 int botStart = top + D0;
-                for (int y = 0;        y < top && y < NH; ++y) if (y >= 0) nat[(size_t)y * NW + ix] = FA_ELEV_BLUE;
-                for (int y = botStart; y < NH;            ++y) if (y >= 0) nat[(size_t)y * NW + ix] = FA_ELEV_BLUE;
+                if (topBlue) for (int y = 0;        y < top && y < NH; ++y) if (y >= 0) nat[(size_t)y * NW + ix] = FA_ELEV_BLUE;
+                if (botBlue) for (int y = botStart; y < NH;            ++y) if (y >= 0) nat[(size_t)y * NW + ix] = FA_ELEV_BLUE;
             }
             // СВЕРХВЫСОКАЯ КОЛОННА (ROM cfb2/ce74, D0>0x50): NH строк из центра с Bresenham-шагом текселя (как
             // бокс-обход). Только без питча/бэкдропа (иначе центр смещён → падаем в общий цикл).
@@ -575,26 +618,45 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
             int face; double tf;
             if (side == 0) { if (stX > 0) { face = 1; tf = frac; }     else { face = 2; tf = 1.0 - frac; } }   // W / E
             else           { if (stY > 0) { face = 0; tf = 1.0 - frac; } else { face = 3; tf = frac; } }        // N / S
-            int tmx = (int)(tf * 128.0) & 127;
+            int tmx = fxProj() ? fxTexel(tf) : ((int)(tf * 128.0) & 127);   // fx: тексель со снапом к суб-поз 8.8
             uint8_t cell = lvl.cellId(cam.floor, mX, mY);
             uint16_t m = lvl.texorder(cell, face); if (m == 0 && cellIsDoor(ct)) m = DOOR_METATEX;
             const uint8_t* mt = meta.get(m);
             double perp = tCross < FA_NEAR ? FA_NEAR : tCross;
-            int D0 = (int)(faFocalV() / perp);
+            int D0 = fxProj() ? fxD0FromPerp(perp) : (int)(faFocalV() / perp);
             int pshift; bool blueBk = false, elevRide = false;
             // ГЕЙТ по клетке камеры (camInElevZT/camOnStair) даёт «блочность» (dead_ends Тупик 11). При
             // faTransitNoCamGate профиль/шахта рисуются по ГЕОМЕТРИИ КЛЕТКИ (по дистанции, z-тест) — как ROM.
             const bool romShaft  = (faTransitNoCamGate() ? faElevZT() : camInElevZT) && (ct == 0x30);
             const bool stairCell = faElevZT() && (faTransitNoCamGate() || camOnStair) && isStairProfileCT(ct) && !faStairOff();
-            if (romShaft) { pshift = 0; blueBk = true; elevRide = true; }        // шахта лифта: неподвижна + синий над/под
+            if (romShaft) {
+                // ⭐ROM 9862: профиль ВСЕХ 4 граней шахты = cabin|1 → pshift=(D0·pitch + D0·(cabin|1))/64.
+                // Поездка (pitch=−cabin) → шахта неподвижна (остаток D0/64 = ROM, бит0-маркер); прыжок/присед
+                // (cabin=0) → шахта едет ВМЕСТЕ с миром (жёсткий pshift=0 морозил её → относительный сдвиг).
+                if (faShaftProf()) {
+                    int cb = ((int)std::lround(cam.cabin)) | 1;
+                    pshift = (int)((D0 * cam.pitch + (double)cb * D0) / 64.0);
+                } else pshift = 0;                                               // legacy: жёстко неподвижна
+                blueBk = true; elevRide = true;
+            }
             else if (stairCell) {                                                // профиль-скос лестницы (ROM d214)
                 int L = 0, R = 0;
                 stairProfile(ct, face, cabinSign, mX - camCX, mY - camCY, L, R);
-                const bool flipUface = (face == 0 || face == 2);                 // N/E: L/R на конце texU=0 меняются (faStairFaceLR)
-                double pb = flipUface ? (R + (L - R) * frac) : (L + (R - L) * frac);   // профиль-байт по доле грани
-                double sign = faStairFlip() ? -1.0 : 1.0;
-                pshift = (int)((D0 * cam.pitch * sign + pb * D0) / 64.0);
-                blueBk = true;
+                // ⭐ROM ce0a: `tst -0x6e8e; bne d0c4` — грань с НУЛЕВЫМ словом профиля = ОБЫЧНАЯ стена
+                // (градиент-заливка d186/d202, БЕЗ синего). Синий задник — только у граней с ненулевым
+                // словом (путь d0c4, a5=$d074). До фикса порт лил синий на ВСЕ грани профиль-клеток →
+                // лишний синий на гранях с word=0 (напр. S-грань 0x11 при cabin=0). Гейт под faBlueD28E.
+                if (faBlueD28E() && L == 0 && R == 0) { pshift = normPitchShift(D0); }
+                else {
+                    const bool flipUface = (face == 0 || face == 2);             // N/E: L/R на конце texU=0 меняются (faStairFaceLR)
+                    double pb = flipUface ? (R + (L - R) * frac) : (L + (R - L) * frac);   // профиль-байт по доле грани
+                    double sign = faStairFlip() ? -1.0 : 1.0;
+                    pshift = (int)((D0 * cam.pitch * sign + pb * D0) / 64.0);
+                    blueBk = true;
+                }
+                if (std::getenv("ZTDBG_COL"))
+                    std::fprintf(stderr, "col ix=%d cell=(%d,%d) ct=%02X face=%d L=%d R=%d frac=%.2f D0=%d pshift=%d blue=%d\n",
+                                 ix, mX, mY, ct, face, L, R, frac, D0, pshift, blueBk ? 1 : 0);
             } else pshift = normPitchShift(D0);
             emitCol(ix, perp, mt, tmx, pshift, blueBk, elevRide);
         };
@@ -624,11 +686,11 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
                           case 4: tf = 1.0 - sx; dface = 0; break;
                           case 3: tf = sy;       dface = 0; break;
                           default:tf = sx;       dface = 3; break; }   // 0x05
-            int tmx = (int)(tf * 128.0) & 127;
+            int tmx = fxProj() ? fxTexel(tf) : ((int)(tf * 128.0) & 127);
             uint8_t cell = lvl.cellId(cam.floor, mX, mY);
             const uint8_t* mt = meta.get(lvl.texorder(cell, dface));
             double perp = t < FA_NEAR ? FA_NEAR : t;
-            emitCol(ix, perp, mt, tmx, normPitchShift((int)(faFocalV() / perp)), false, false);
+            emitCol(ix, perp, mt, tmx, normPitchShift(fxProj() ? fxD0FromPerp(perp) : (int)(faFocalV() / perp)), false, false);
             return true;
         };
         // СДВИЖНАЯ ДВЕРЬ 6(гориз.)/7(верт.): панель в центре клетки, две створки уезжают к краям (текстура едет
@@ -638,32 +700,22 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
             double h = doorOpen(cam.floor, mX, mY) * 0.5;                 // 0=закрыта .. 0.5=открыта
             if (h >= 0.499) return false;                                 // полностью открыта — проём
             double t, cf;                                                 // t=перпенд.дист, cf=доля вдоль панели (0..1)
-            if (ct == 6) { if (rdy < 1e-9 && rdy > -1e-9) return false;    // гориз. панель на y=mY+0.5
+            if (doorIsHoriz(ct)) { if (rdy < 1e-9 && rdy > -1e-9) return false;    // гориз. панель на y=mY+0.5 (обычн.0x06 / фейк 0x83)
                            t = (mY + 0.5 - cam.py) / rdy; if (t <= 0) return false; cf = cam.px + t * rdx - mX; }
-            else         { if (rdx < 1e-9 && rdx > -1e-9) return false;    // верт. панель на x=mX+0.5
+            else         { if (rdx < 1e-9 && rdx > -1e-9) return false;    // верт. панель на x=mX+0.5 (0x07 / фейк 0x84)
                            t = (mX + 0.5 - cam.px) / rdx; if (t <= 0) return false; cf = cam.py + t * rdy - mY; }
             if (cf < 0.0 || cf > 1.0) return false;
             double texU;                                                  // створки показывают уехавшую часть текстуры
             if      (cf < 0.5 - h) texU = (h * 128.0) + (64.0 - h * 128.0) * (cf / (0.5 - h));            // левая/верхняя
             else if (cf > 0.5 + h) texU = 64.0 + ((128.0 - h * 128.0) - 64.0) * ((cf - (0.5 + h)) / (0.5 - h)); // правая/нижняя
             else return false;                                            // проём между створками — прошёл
-            int tmx = (int)texU & 127;
+            int tmx = fxProj() ? fxTexel(texU / 128.0) : ((int)texU & 127);   // fx: суб-поз 8.8 вдоль панели
             uint8_t cell = lvl.cellId(cam.floor, mX, mY);
             uint16_t m = lvl.texorder(cell, 0); if (m == 0) m = DOOR_METATEX;
             const uint8_t* mt = meta.get(m);
             double perp = t < FA_NEAR ? FA_NEAR : t;
-            emitCol(ix, perp, mt, tmx, normPitchShift((int)(faFocalV() / perp)), false, false);
+            emitCol(ix, perp, mt, tmx, normPitchShift(fxProj() ? fxD0FromPerp(perp) : (int)(faFocalV() / perp)), false, false);
             return true;
-        };
-        // ТРАНЗИТ-СЕГМЕНТ клетки (пол/потолок шахты лифта / ступень лестницы): 0=нет, 1=СИНИЙ idx1 (area/landing),
-        // 2=ГРАДИЕНТ (slope-риза/кабина/шахта). Набор клеток — как отдельные проходы (rcElevCell/ctElevArea + shaftSeg).
-        auto transitSegType = [&](uint8_t ct) -> int {
-            if (rcElevCell(ct)) return (ct == 0x30) ? 0 : (ctElevArea(ct) ? 1 : 2);   // лифт (0x30 = стена, не сегмент)
-            switch (ct) {                                                             // лестница (без edge-проверки — марш = достижимость)
-                case 0x12: case 0x14: case 0x3c: case 0x3e: case 0x44: case 0x46: case 0x4c: case 0x4e: return 2;  // риза-градиент (slope)
-                case 0x13: case 0x3d: case 0x45: case 0x4d:                                             return 1;  // синий landing/area
-                default: return 0;
-            }
         };
         // ПЕР-КОЛОНОЧНЫЙ ТРАНЗИТ-СЕГМЕНТ (ROM d5ce: сегмент рисуется В ТОМ ЖЕ марше на РЕАЛЬНОЙ дистанции луча до
         // клетки, НЕ по бинарному reachedTransit). Собираем ВСЕ достигнутые транзит-клетки колонны (как ROM-очередь
@@ -676,18 +728,46 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
             if (mX < 0 || mY < 0 || mX >= Level::W || mY >= Level::H) return true;
             uint8_t ct = lvl.cellType(cam.floor, mX, mY);
             if (ct >= 2 && ct <= 5)  return emitDiag(ix, mX, mY, side, tCross, rdx, rdy);
-            if (cellIsDoor(ct))      return emitDoor(ix, mX, mY, rdx, rdy);
+            if (cellRendersDoor(ct)) return emitDoor(ix, mX, mY, rdx, rdy);   // обычн.двери + ФЕЙК-двери 0x83/0x84 (дверной рендер створок)
             if (cellBlocks(ct))     { emitAxial(ix, mX, mY, side, tCross, rdx, rdy); return true; }
             if (faElevZT() && segN < SEG_MAX) {                          // прозрачная транзит-клетка → в очередь сегментов
-                int st = transitSegType(ct);
-                if (st && (rcElevCell(ct) || (faStairSteps() && !faStairOff()))) { segTd[segN] = tCross; segTy[segN] = st; ++segN; }
+                // ⭐КАНОНИЧЕСКОЕ РЕБРО + НАПРАВЛЕННЫЙ ГЕЙТ (хендлеры 988a-9a4a, faSegGate): celltype пакует ровно
+                // ОДНО фикс. ребро и только с одной стороны (строгий tst d0/d1). d5ce красит колонки [X1..X2] этого
+                // ребра ⟺ луч ПЕРЕСЕКАЕТ его = вход в клетку именно через это ребро (side+знак шага; вход через
+                // боковое ребро → колонка вне спана → ROM её не красит). Подход с тыла → сегмента НЕТ вовсе
+                // (чинит «полосы с противоположной стороны» и «синий виден до прохода через дверь»).
+                int edge = -1, st = segEdgeType(ct, edge);
+                if (st && (rcElevCell(ct) || (faStairSteps() && !faStairOff()))) {
+                    int entry = (side == 0) ? (rdx > 0 ? 2 : 3) : (rdy > 0 ? 0 : 1);   // ребро входа: W/E/N/S
+                    if (!faSegGate() || entry == edge) { segTd[segN] = tCross; segTy[segN] = st; ++segN; }
+                }
             }
             return false;                                                 // прозрачная → идём дальше
         };
+        // ⭐fxFan (этап 3): веер ROM bb00 — rayAng = ($9124[col] + угол камеры) & 0x1ff, направление из zAngLUT.
+        // Для per-column рендера направление нормируется к forward-компоненте 1 (деление на fdot=cos(оффсета)
+        // — только bookkeeping, чтобы tCross=perp как прежде); КВАНТОВАНИЕ направления = ROM-сетка 512+LUT.
+        // NW=128 колонн, таблица 0..0x80=129 лучей-ГРАНИЦ → колонка ix берёт левую границу fan[ix] (ROM красит
+        // спан [screenX..): луч границы i попадает в screenX=i по построению веера — обратная пара к ca4c).
+        const bool fanOn = fxFan() && zAngLUTok() && zFanLUTok() && NW == 128;
+        int fanCamAng = 0; double fanCcs = 0, fanCsn = 0;
+        if (fanOn) { fanCamAng = ((int)std::lround(camDirToAng512(cam)) + 128) & 511;
+                     fanCcs = zAngLUT()[fanCamAng * 2]; fanCsn = zAngLUT()[fanCamAng * 2 + 1]; }
         for (int ix = 0; ix < NW; ++ix) {
             segN = 0;                                                   // сброс очереди транзит-сегментов на колонку
-            double pcol = (ix + 0.5 - NW * 0.5) / (NW * 0.5);            // lateral/forward колонки (FOV порта)
-            double rdx = cam.dirX - cam.dirY * pcol, rdy = cam.dirY + cam.dirX * pcol;   // forward-компонента = 1 → tCross=perp
+            double rdx, rdy;
+            if (fanOn) {
+                // центр колонки = среднее соседних лучей-границ (fan[ix]..fan[ix+1]), окр. вверх: граница
+                // fan[ix] давала систематический полуколоночный сдвиг против сверенного float-центра.
+                int ra = (fanCamAng + ((zFanLUT()[ix] + zFanLUT()[ix + 1] + 1) >> 1)) & 511;
+                double cs = zAngLUT()[ra * 2], sn = zAngLUT()[ra * 2 + 1];
+                double fdot = (cs * fanCcs + sn * fanCsn) / 65536.0;     // cos углового оффсета (≥ ~0.7 при ±45°)
+                if (fdot < 0.05) fdot = 0.05;
+                rdx = cs / 256.0 / fdot; rdy = sn / 256.0 / fdot;        // forward-компонента = 1 → tCross=perp
+            } else {
+                double pcol = (ix + 0.5 - NW * 0.5) / (NW * 0.5);        // lateral/forward колонки (FOV порта)
+                rdx = cam.dirX - cam.dirY * pcol; rdy = cam.dirY + cam.dirX * pcol;   // forward-компонента = 1 → tCross=perp
+            }
             int mapX = camCX, mapY = camCY;
             double adx = rdx < 0 ? -rdx : rdx, ady = rdy < 0 ? -rdy : rdy;
             double dDX = adx > 1e-9 ? 1.0 / adx : 1e30, dDY = ady > 1e-9 ? 1.0 / ady : 1e30;
@@ -730,8 +810,9 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
             for (int si = segN - 1; si >= 0; --si) {
                 double perp = segTd[si] < FA_NEAR ? FA_NEAR : segTd[si];
                 double iv = 1.0 / perp;
+                int D0 = fxProj() ? fxD0FromPerp(perp) : (int)(faFocalV() / perp);
+                if (fxZQuant() && D0 >= 1) iv = D0 / faFocalV();         // этап 2: сегмент на той же D0-сетке
                 if (iv < zc[ix]) continue;                               // за стеной → пропуск
-                int D0 = (int)(faFocalV() / perp);
                 if (D0 < 1) continue;
                 int top = (int)(NH / 2.0) - D0 / 2 + normPitchShift(D0);
                 uint32_t src = (segTy[si] == 1) ? FA_ELEV_BLUE : 0x00000001u;   // синий idx1 / FA_GRAD (пол-потолок в блите)
@@ -819,16 +900,15 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
                 uint8_t ct = lvl.cellType(cam.floor, cx, cy);
                 if (!rcElevCell(ct) || ct == 0x30) continue;          // 0x30 (шахта) уже нарисована в обходе стен
                 if (!isReached(cx, cy)) continue;                     // достижимость лучом (не за стеной)
-                const int sIdx = ctElevArea(ct) ? 1 : -1;             // area → синий (solidIdx>=0); кабина → градиент (FA_GRAD)
-                auto seg = [&](double ax, double ay, double bx, double by) {
-                    faDrawSeg(nat.data(), NW, NH, zc.data(), lvl, wallPal, meta, cam,
-                              ax, ay, bx, by, 0, false, doShade, ramps, 0.0, 128.0,
-                              false, sIdx, false, /*overdraw*/true, /*deferFC*/true, 0, 0x40, false, 0.0, 0.0);
-                };
-                if (cam.py < cy)          seg(cx, cy, cx + 1, cy);         // N ребро (камера севернее клетки)
-                else if (cam.py > cy + 1) seg(cx, cy + 1, cx + 1, cy + 1); // S ребро
-                if (cam.px < cx)          seg(cx, cy, cx, cy + 1);         // W ребро
-                else if (cam.px > cx + 1) seg(cx + 1, cy, cx + 1, cy + 1); // E ребро
+                // Каноническое ребро + направленный гейт хендлеров 997a-9a4a (как слой ступеней ниже) —
+                // прежний выбор «ближних» рёбер по позиции камеры рисовал с любой стороны и по 2 ребра сразу.
+                int ex0, ey0, ex1, ey1;
+                int type = shaftSeg(ct, cx, cy, camCX, camCY, ex0, ey0, ex1, ey1);
+                if (type == 0) continue;
+                const int sIdx = (type == 1) ? 1 : -1;                // area → синий (solidIdx>=0); кабина → градиент (FA_GRAD)
+                faDrawSeg(nat.data(), NW, NH, zc.data(), lvl, wallPal, meta, cam,
+                          ex0, ey0, ex1, ey1, 0, false, doShade, ramps, 0.0, 128.0,
+                          false, sIdx, false, /*overdraw*/true, /*deferFC*/true, 0, 0x40, false, 0.0, 0.0);
             }
         }
     }
@@ -887,7 +967,10 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
                    else                { blueLo = 0; blueHi = (int)(H * (-cam.cabin / 64.0)); } }
     // ФОН (Plane A): универсальный backdrop-слой за всем. Панорама 1:1 (background.hpp bgSample),
     // позиционируется углом (hscroll) и этажом/кабиной (vscroll). Чёрный, если панорамы нет.
+    // ⭐СНАЙПЕР-ОВЕРЛЕЙ (ROM 2404): здание/снайпер/трассер = VDP-спрайты pri=0 → НАД панорамой,
+    // ПОД 3D-видом — сэмплим тут же, только там, где виден фон (sniper_overlay.hpp).
     auto bgAt = [&](int x_, int sy) -> uint32_t {
+        if (uint32_t sp = snip::sampleLow(x_, W, sy, H)) return sp;
         return hasBg ? bgSample(*bg, cam.dirX, cam.dirY, cam.floor, cam.cabin, x_, W, sy, fbHorizon) : 0xFF000000u;
     };
     // ПОЛ/ПОТОЛОК-градиент (Plane B): точный дизер-паттерн ZT в ПОЛНОМ 256-широком ZT-виде.
@@ -903,6 +986,8 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
         int r  = ny * 80 / NH;                         if (r > 79) r = 79;
         // ROM-точный путь: градиент НЕ статичен — пересэмплирован по питчу (D4A6, $FF6226).
         if (faTransitZT()) r = fcRowD4A6(r, (int)cam.pitch);
+        if (flCone && gx >= 112 && gx < 144)                       // ⭐конус фонаря в пол/потолок (те же 16 колонн, что стены)
+            return floorCeilColorExact(wallPal, fcLit, gx, r);
         return floorCeilColorExact(wallPal, fc, gx, r);
     };
     // FLOOR-CASTING: пиксель пола (ny>hor) → forward-дистанция → мировая клетка. Клетки лестницы (пол ОПУЩЕН
@@ -1009,10 +1094,24 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
     if (faDecorFullRes() && faDecor() && !faWallsOnly() && meta.obj && meta.obj->count > 0)
         drawDecorBillboards(W, H, lvl, cam, *meta.obj, wallPal, ramps, doShade, drawDist,
             [&](int x, int y, uint32_t c) { put(x, y, c); },
-            // z-тест с ДЕПТ-БИАСОМ (как DDA-рендер): спрайт занимает ~0.4кл, перекрываем колонку ТОЛЬКО если стена ЗАМЕТНО
-            // ближе (>BIAS). Иначе соседняя боковая стена «вровень» (чуть ближе по краю спрайта) срезала пол-спрайта врага у стены
-            // (юзер: «половина спрайта у стены»). Стена явно впереди (враг за углом, разница >BIAS) — всё ещё перекрывает. ZT ef20: спрайт выигрывает равенство.
-            [&](int x, double f) { const double BIAS = 0.40; return x >= 0 && x < W && zbuf[x] < f - BIAS; },  // ≈полу-ширина спрайта (кл)
+            // z-тест: fxZQuant (этап 2) = ЦЕЛЫЕ СКЕЙЛЫ как ROM ef20/167b0 — стена режет колонку спрайта только
+            // если её скейл СТРОГО крупнее (ближе); равные скейлы (один D0-бакет) → СПРАЙТ выигрывает. Это
+            // ROM-замена float-BIAS 0.40: тот компенсировал непрерывную глубину (боковая стена «вровень» срезала
+            // пол-спрайта). ⚠D0-бакет растёт с дистанцией (~f²/64: 0.25кл на f=4, ~1кл на f=8) — вдали спрайт
+            // «выигрывает» щедрее BIAS, это ОРИГИНАЛ. Легаси (fxzquant off) = прежний BIAS.
+            [&](int x, double f) {
+                if (x < 0 || x >= W) return false;
+                if (fxZQuant()) {                                     // стена СТРОГО ближе по целому скейлу → режет
+                    bool q = (int)std::lround(faFocalV() / zbuf[x]) > fxD0FromPerp(f);
+                    static const bool dbg = std::getenv("ZTDBG_ZQ") != nullptr;   // диагностика A/B (как ZTDBG_COL)
+                    if (dbg) { static bool once = false; if (!once) { once = true; std::fprintf(stderr, "zq-active\n"); } }
+                    if (dbg && q != (zbuf[x] < f - 0.40))
+                        std::fprintf(stderr, "zq-diff x=%d f=%.3f zbuf=%.3f wallD0=%d sprD0=%d quant=%d\n",
+                                     x, f, zbuf[x], (int)std::lround(faFocalV() / zbuf[x]), fxD0FromPerp(f), q ? 1 : 0);
+                    return q;
+                }
+                const double BIAS = 0.40; return zbuf[x] < f - BIAS;  // ≈полу-ширина спрайта (кл)
+            },
             [&](double f, double l) { return W * 0.5 * (1.0 + l / f); },
             [&](double f) { return faFocalV() / f; });
 }

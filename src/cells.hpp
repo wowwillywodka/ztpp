@@ -4,6 +4,7 @@
 // ⚠ КЛЮЧЕВОЕ: celltype 0 = Empty (ПОЛ, проходим); celltype 1 = Wall (стена).
 // Цепочка: celltype --CELL_DEFS_ZT--> maptype --MAP_TYPE_TO_ICON--> иконка(0..15).
 #pragma once
+#include "tuning.hpp"   // simDt (fps-инвариантные фазы дверей)
 #include <cstdint>
 
 // Иконки (MAP_ICONS): 0 empty,1 wall,2..5 углы,6 hor_door,7 ver_door,8 pl_start,
@@ -40,7 +41,9 @@ struct CellClassTable {
             {101,10},{102,10},{103,10},{104,10},{105,10},{106,10},{107,10},
             {108,16},{117,16},{118,16},{119,9},{120,16},
             {121,15},{122,11},{123,15},{124,11},{125,11},{126,11},{127,15},
-            {129,8},{130,12},{131,15},{132,15},  // 0x83/0x84 = разрушаемые СТЕНЫ (icon14 sht_wall), НЕ декор (game-true; ломает только тревога-камера)
+            {129,8},{130,12},{131,15},{132,15},  // 0x83(гориз)/0x84(верт) = ФЕЙК-ДВЕРИ (CELL_DEFS «Fake horiz/vert door»): рисуются (icon14 sht_wall, тайл 33)
+            //   + БЛОКИРУЮТ (collision) + камера-тревога 0x26 УБИРАЕТ (b130 гориз/b168 верт, requestDestruct→пусто). Пуля/граната НЕ ломают.
+            //   ⚠ztextractor CELL_DEFS даёт maptype16→icon15(decor)=НЕВЕРНО (не блокировали); порт → icon14 (game-true). Пример: cellId 0xA7→0x84 (e2f5), 0xA8→0x83 (e2f6).
         };
         for (const auto& p : ov) maptype[p.ct] = p.mt;
     }
@@ -66,6 +69,12 @@ inline bool cellRenderWall(uint8_t ct) { int ic = cellIcon(ct); return iconWall(
 // Блокирует ДВИЖЕНИЕ (стены, но НЕ двери — сквозь двери ходим, как в игре они открываются).
 inline bool cellBlocks(uint8_t ct)     { return iconWall(cellIcon(ct)); }
 inline bool cellIsDoor(uint8_t ct)     { return iconDoor(cellIcon(ct)); }
+// ⭐ФЕЙК-ДВЕРИ 0x83(гориз)/0x84(верт): ROM рисует их ДВЕРНЫМ рендером (render-fn @0x923a = как двери 0x06/0x07), но они БЛОКИРУЮТ
+// (не открываются step-on) и убираются лишь камерой-тревогой. cellRendersDoor = рисовать дверным рендером (створки); cellIsDoor
+// (открытие/проход) их НЕ включает → doorOpen=0 всегда → рисуются ЗАКРЫТОЙ дверью + блокируют (cellBlocks icon14 = true).
+inline bool isFakeDoor(uint8_t ct)     { return ct == 0x83 || ct == 0x84; }
+inline bool cellRendersDoor(uint8_t ct){ return cellIsDoor(ct) || isFakeDoor(ct); }
+inline bool doorIsHoriz(uint8_t ct)    { return cellIcon(ct) == 6 || ct == 0x83; }   // гориз-панель (обычн.0x06 icon6 / фейк 0x83)
 
 // ── СОСТОЯНИЕ ДВЕРЕЙ (0=закрыта..1=открыта) — здесь, чтобы видели и actors (LOS/спавн), и raycaster (рендер). ──
 #include <unordered_map>
@@ -163,7 +172,7 @@ inline bool enemyBlockedAt(uint8_t ct, int f, int cx, int cy, double fx, double 
     if (cellIsDoor(ct)) {
         auto& m = doorMap(); int k = doorKey(f, cx, cy);
         double o = m.count(k) ? m[k] : 0.0;
-        if (canOpen && o < 1.0) { double no = o + 0.20; m[k] = no > 1.0 ? 1.0 : no; }  // ТОЛЬКО опенер толкает створку (ZT b1c4/b202)
+        if (canOpen && o < 1.0) { double no = o + 0.20 * simDt(); m[k] = no > 1.0 ? 1.0 : no; }  // опенер толкает створку (ZT b1c4/b202; simDt: fps-инвариант)
         return o < 0.4;                          // закрытая (<0.4) блокирует всех; открытую проходят все
     }
     return enemyBlocksCell(ct);                  // enemy-LUT (НЕ полуплоскость игрока)

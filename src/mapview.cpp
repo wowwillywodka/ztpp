@@ -80,10 +80,10 @@ void renderMap(FB& fb, const Level& lvl, const Palette& wallPal, const WallBank&
             if (mapShowIds()) drawCellId(fb, dx, dy, cellpx, cell);   // cell ID поверх (тумблер в настройках)
         }
     }
+    (void)celltypeColor;
 }
 
-// ПАУЗА-КАРТА (по TAB, как меню паузы ZT — НЕ радар): полная карта уровня (значки celltype) + позиция/направление
-// игрока + «MAP» сверху. Верхушку ZT (уровень/NOT SECURED/пароль) пока не делаем — просто заголовок MAP.
+// ПАУЗА-КАРТА (по TAB, как меню паузы ZT — НЕ радар): полная карта уровня + позиция/направление игрока.
 // ── ПЛОСКАЯ ПОЛНАЯ КАРТА (меню настроек «full map»): только автокарта этажа + позиция, без хедера ──
 void drawFullMap(FB& fb, const GameData& gd, int ep, int floor, const Camera& cam) {
     renderMap(fb, gd.levels[ep], gd.wallPal, gd.wall, floor, 0, true);
@@ -94,22 +94,19 @@ void drawFullMap(FB& fb, const GameData& gd, int ep, int floor, const Camera& ca
     for (int i = 0; i < 12; ++i) fb.put(px + (int)(cam.dirX*i), py + (int)(cam.dirY*i), 0xFFFFFF00u);
 }
 
-// ── МЕНЮ ПАУЗЫ (Tab) — как в оригинале: автокарта этажа + ХЕДЕР (здание/этаж · SECURED/NOT SECURED · пароль).
-// Карта = renderMap (значки/двери/предметы). Позиция игрока = мигающая зелёная точка + жёлтая стрелка.
-// SECURED = на этаже не осталось врагов (aliveEnemies==0). ⚠ Точный 8-симв. ПАРОЛЬ (ZT gen 0x58720:
-// упаковка прогресса + checksum + feedback-XOR 0x586b4 + таблица 0x585ea) — отдельный проход.
-void drawPauseMap(FB& fb, const GameData& gd, int ep, int floor, const Camera& cam) {
+// ── МЕНЮ ПАУЗЫ (Tab) — как в оригинале: автокарта этажа на бумаге-PDA + СПИСОК ЭТАЖЕЙ с паролями.
+void drawPauseMap(FB& fb, const GameData& gd, int ep, int floor, const Camera& cam, const std::vector<std::string>* lines) {
     // МЕНЮ ПАУЗЫ как в ОРИГИНАЛЕ: фон = руки держат карту-PDA (ROM @0x12DD06, gd.pauseBg 320×224),
-    // на поверхность карты рисуется blueprint этажа (комнаты светлые, стены-контур тёмные, двери оранж.) +
-    // позиция игрока + сверху «<имя уровня> : *SECURED*». Без пароля.
+    // на поверхность карты рисуется blueprint этажа + позиция игрока + список этажей/паролей сверху.
     const Level& lvl = gd.levels[ep];
     int us = uiScale();
     fb.clear(0xFF000000u);
-    if (gd.pauseBg.empty()) {                                  // фон не загрузился → тёмный фон
-        fb.clear(0xFF04040Au);
-    } else {
+    {
         double sc = (double)FBW/320.0; { double sy=(double)FBH/224.0; if (sy<sc) sc=sy; }   // вписать 320×224
         int vpW=(int)(320*sc), vpH=(int)(224*sc), vpX=(FBW-vpW)/2, vpY=(FBH-vpH)/2;
+        if (gd.pauseBg.empty()) {                              // фон не вскрыт (ZTU) → тёмная бумага-подложка,
+            fb.rect(vpX, vpY, vpW, vpH, 0xFF04040Au);          //   карта/строки рисуются как обычно ниже
+        } else
         for (int y=0;y<vpH;++y){ int ny=(int)(y/sc); if(ny>223)ny=223;
             const uint32_t* src=&gd.pauseBg[(size_t)ny*320];
             for(int x=0;x<vpW;++x){ int nx=(int)(x/sc); if(nx>319)nx=319; fb.put(vpX+x, vpY+y, src[nx]); } }
@@ -138,21 +135,36 @@ void drawPauseMap(FB& fb, const GameData& gd, int ep, int floor, const Camera& c
             int ox=(int)(mpx+c*px), oy=(int)(mpy+r*px);
             for(int yy=0;yy<(int)px+1;++yy)for(int xx=0;xx<(int)px+1;++xx) fb.put(ox+xx,oy+yy,col);
         }
-        // ВЕРХНИЙ ЗАГОЛОВОК (ZT таблица 0x576a8, БЕЛЫЙ Font_grph @натив-строка 3): длинная форма
-        // «<AREA> LEVEL <N> : *<status>*». Строим из короткого имени, вставляя «LEVEL » перед хвост.номером
-        // («DOCKING BAY 1» → «DOCKING BAY LEVEL 1»). Статусы фикс-строки как в ROM (0x57690).
+        // (ID-карта бойца — НЕ здесь: ROM 2acc рисует её на игровом КОКПИТЕ при загрузке уровня → renderReference)
+        // ⭐ВЕРХ (ROM 5755e/5761e/57d2e): СПИСОК ЭТАЖЕЙ, до 3 видимых строк (nametable rows 1/3/5 → y=8/24/40),
+        // центрирование; пройденный этаж = «<label 576aa> ПАРОЛЬ», текущий = «<label> *SECURED*/*NOT SECURED*».
+        // Строки собирает main (пароли требуют инвентарь). ⚠РЕГИСТРО-КОРРЕКТНО (selFont): пароль CASE-SENSITIVE —
+        //   Font_grph заглавил строчные («LFpb*TnUg»→«LFPB*TNUG») → ввод не совпадал → «неверный пароль».
+        if (lines) {
+            int psc = (int)(sc + 0.5); if (psc < 1) psc = 1;
+            for (int li = 0; li < (int)lines->size() && li < 3; ++li) {
+                const std::string& s = (*lines)[li];
+                if (gd.selFont.have) {
+                    int x = vpX + (int)(160*sc) - (int)s.size()*8*psc/2, y = vpY + (int)((8 + li*16)*sc);
+                    for (char ch : s) {
+                        unsigned uc = (unsigned char)ch;
+                        if (uc >= 0x20 && uc <= 0x7f) { int e = (int)uc - 0x20;
+                            for (int ry = 0; ry < 16; ++ry) for (int rx = 0; rx < 8; ++rx) {
+                                uint8_t idx = gd.selFont.idx[e][ry*8+rx]; if (!idx) continue;
+                                uint32_t col = gd.pauseTextPal.c[idx];
+                                for (int sy = 0; sy < psc; ++sy) for (int sx = 0; sx < psc; ++sx) fb.put(x+rx*psc+sx, y+ry*psc+sy, col);
+                            } }
+                        x += 8*psc;
+                    }
+                } else drawTextBigC(fb, vpX + (int)(160*sc), vpY + (int)((8 + li*16)*sc), s.c_str(), 0, psc, false, gd.pauseTextPal.c.data());
+            }
+        }
+        // НИЗ: короткое имя уровня шрифтом Font2 — цвет = idx1 CRAM line3 паузы (0x0444 → #575757,
+        // VERIFIED MAME pause_cram; был порт-выдуманный 0x303038)
         (void)us;
         int gi=ep*16+floor; if(gi<0)gi=0; if(!gd.levelNames.empty()&&gi>=(int)gd.levelNames.size())gi=(int)gd.levelNames.size()-1;
         std::string nm = (!gd.levelNames.empty()&&gi>=0)?gd.levelNames[gi]:"";
-        std::string longName = nm;
-        { size_t sp = nm.find_last_of(' ');
-          if (sp != std::string::npos && sp+1 < nm.size() && isdigit((unsigned char)nm[sp+1]))
-              longName = nm.substr(0, sp) + " LEVEL " + nm.substr(sp+1); }
-        bool secured=(aliveEnemies(floor)==0);
-        char buf[96]; std::snprintf(buf,sizeof buf,"%s : %s", longName.c_str(), secured?"*SECURED*":"*NOT SECURED*");
-        drawTextBigC(fb, FBW/2, vpY+(int)(24*sc), buf, 0xFFFFFFFFu, (int)(sc+0.5), true);  // ВЕРХ: Font_grph БЕЛЫМ (mono)
-        // НИЗ: короткое имя уровня шрифтом Font2 (gd.fontAlt) под картой — как в оригинале
-        if (!nm.empty()) drawTextFontC(fb, FBW/2, vpY+(int)(206*sc), nm.c_str(), 0xFF303038u,
+        if (!nm.empty()) drawTextFontC(fb, FBW/2, vpY+(int)(212*sc), nm.c_str(), 0xFF575757u,   // ⭐212: карта до 208 — не наезжает
                                        sc > 1.5 ? 2 : 1, gd.fontAlt.have ? &gd.fontAlt : nullptr);
     }
 }
@@ -288,7 +300,7 @@ void drawGameMap(uint32_t* buf, int bw, int bh, int rx, int ry, int rw, int rh,
     int  pf    = radarres::PING[(radarTick / 4) & 7];                // кадр пульса (≈15Гц)
     bool blink = ((radarTick / 6) & 1) != 0;                         // мигание трейла (≈5Гц)
     // Блит тайла-маркера (8×8), центр «+» = тайл-коорд (2,2) → на экранной точке (scx,scy). idx0 прозрачно.
-    auto blitTile = [&](const uint8_t* tile, int scx, int scy) {
+    auto blitTileM = [&](const uint8_t* tile, int scx, int scy) {
         int mx0 = scx - 2 * bp, my0 = scy - 2 * bp;
         for (int tr = 0; tr < 8; ++tr) for (int tc = 0; tc < 8; ++tc) {
             uint8_t idx = tile[tr * 8 + tc]; if (idx == 0) continue;
@@ -303,18 +315,18 @@ void drawGameMap(uint32_t* buf, int bw, int bh, int rx, int ry, int rw, int rh,
     auto blip = [&](double wx, double wy) {
         double gxp = (wx - ox), gyp = (wy - oy);
         if (gxp < 0 || gyp < 0 || gxp >= N || gyp >= N) return;
-        blitTile(radarres::ENEMY[pf], rx + (int)(gxp * s), ry + (int)(gyp * s));
+        blitTileM(radarres::ENEMY[pf], rx + (int)(gxp * s), ry + (int)(gyp * s));
     };
     for (const Actor& a : actors()) {
         if (!a.active || a.think != AT_ENEMY || a.floor != cam.floor || a.hp <= 0) continue;
         blip(a.x, a.y);                                              // все заспавненные/патрулирующие враги (без aggro-гейта)
     }
-    if (hasScanner) for (const auto& m : pendingSpawns()) blip(m.x + 0.5, m.y + 0.5);  // сканер: + дормантные маркеры этажа
+    if (hasScanner) for (const auto& m : pendingSpawns()) if (m.floor == cam.floor) blip(m.x + 0.5, m.y + 0.5);  // сканер: + дормантные маркеры ЭТОГО этажа
     // ИГРОК: пульсирующий «+» (0x34f-0x353) + МИГАЮЩИЙ ТРЕЙЛ направления — 3 крестика (тайл 0x34f) впереди по взгляду
     // на 0.5/1.0/1.5 клетки (ZT e9a8: dir·k/64, dir=cos/sin амплитуда 256 → 0.5кл·k). БЕЗ стрелки.
     double cxpF = (cam.px - ox) * s, cypF = (cam.py - oy) * s;
     if (blink) for (int k = 1; k <= 3; ++k)
-        blitTile(radarres::PULSE[0], rx + (int)(cxpF + cam.dirX * 0.5 * k * s),
-                                     ry + (int)(cypF + cam.dirY * 0.5 * k * s));
-    blitTile(radarres::PULSE[pf], rx + (int)cxpF, ry + (int)cypF);    // сам маркер игрока (пульс)
+        blitTileM(radarres::PULSE[0], rx + (int)(cxpF + cam.dirX * 0.5 * k * s),
+                                      ry + (int)(cypF + cam.dirY * 0.5 * k * s));
+    blitTileM(radarres::PULSE[pf], rx + (int)cxpF, ry + (int)cypF);    // сам маркер игрока (пульс)
 }

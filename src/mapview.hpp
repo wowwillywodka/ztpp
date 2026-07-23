@@ -20,7 +20,7 @@ inline bool& gameMapMode() { static bool v = true; return v; }
 // ── Публичные top-down рендеры (реализация в mapview.cpp) ──
 void renderMap(FB& fb, const Level& lvl, const Palette& wallPal, const WallBank& wall, int floor, int mode, bool grid);
 void drawFullMap(FB& fb, const GameData& gd, int ep, int floor, const Camera& cam);
-void drawPauseMap(FB& fb, const GameData& gd, int ep, int floor, const Camera& cam);
+void drawPauseMap(FB& fb, const GameData& gd, int ep, int floor, const Camera& cam, const std::vector<std::string>* lines = nullptr);
 void renderAtlas(FB& fb, const WallBank& wall, const Palette& wallPal);
 void drawMinimap(FB& fb, const Level& lvl, const Camera& cam);
 void drawMinimapRect(uint32_t* buf, int bw, int bh, int rx, int ry, int rw, int rh, const Level& lvl, const Camera& cam);

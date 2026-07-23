@@ -20,6 +20,11 @@ static const int ENEMY_ANIM_IDX[10][4] = {   // {walk, fire, hit, death(=corpse)
     {0, 2,  5,  9}, // Boss3: fire=a2 (контакт-УДАР «руки вверх», ZT state2/3 draw 1a786; a1=дальний state1) hit=a5 corpse=a9
     {0, 5,  1,  4}  // Boss2: fire=a5 hit=a1 corpse=a4(64×32; corpse-draw 18f50 — было a2=death-стаггер)
 };
+// ⭐2-я БОЕВАЯ поза по слоту (−1 = нет; 2026-07-15). ROM даёт врагу ДВЕ боевые анимации (fire=основная в ENEMY_ANIM_IDX):
+//   Sgt a4=бросок гранаты (1b600 state5), Boss1 a2=выстрел-вспышка (19402 $35∈4/5/6), Dog a2=прыжок-укус (198c4 $35<6||dist<1кл),
+//   FH-SF a11=замах гранаты (19f5c state5), Boss3 a4=дальняя атака (01a7d0 state1; fire=a2 ближний), Boss2 a6=удар (018f44; fire=a5 aim).
+//   ⭐Imp a1 = ЗАМАХ (ROM draw 18aa0: окно атаки $35 10..7 и 3..0 → кадр 1 «руки подняты», 4..6 → кадр 2 удар).
+static const int ENEMY_ANIM_IDX2[10] = { 4, -1, 1, -1, -1, 2, 2, 11, 4, 6 };
 // 2-я ВАРИАЦИЯ ходьбы по слоту (−1 = нет). FH (slot1) имеет 2-й полный 6-напр walk-набор (anim9) в том же банке.
 // Hydaca(3): anim5 = ПОТОЛОК-краул (variant драйвится z: на потолке→1; пол=anim0).
 static const int ENEMY_VARIANT_WALK[10] = { -1, -1, -1, 5, -1, -1, -1, -1, -1, -1 };
@@ -29,10 +34,10 @@ static const int ENEMY_CLIMB_ANIM[10] = { -1, -1, -1, 1, -1, -1, -1, -1, -1, -1 
 // (ztextractor ZT_CELLTYPE_ENEMY[0x2A]=(...,0x16EC58,0x1C258A)). «Две вариации FH при одном cell id» = разные банки.
 static const unsigned ENEMY_ALT_GFX[10] = { 0, 0x1C258A, 0, 0, 0, 0, 0, 0, 0, 0 };
 
-void SpriteClut::load(const Rom& rom) {
-    if (0x10d1be + 12 * 0x100 > rom.size()) return;
+void SpriteClut::load(const Rom& rom, size_t base) {
+    if (base + 12 * 0x100 > rom.size()) return;
     for (int b = 0; b < 12; ++b)
-        for (int i = 0; i < 256; ++i) band[b][i] = rom.u8(0x10d1be + (size_t)b * 0x100 + i);
+        for (int i = 0; i < 256; ++i) band[b][i] = rom.u8(base + (size_t)b * 0x100 + i);
     ok = true;
 }
 
@@ -78,10 +83,11 @@ static EnemySprite decodeEnemySprite(const Rom& rom, size_t a1, const Palette& p
     s.ok = true; return s;
 }
 
-void decodeEnemySprites(const Rom& rom, const Palette& pal) {
-    g_spriteClut().load(rom);                       // CLUT спрайтов (шейд при рендере)
-    static const size_t GFX[10] = { 0x1B7B38, 0x16EC58, 0x1A7828, 0x1ACC72, 0x18D078,
-                                    0x183B94, 0x1784F2, 0x17BA80, 0x193F00, 0x19D50C };
+void decodeEnemySprites(const Rom& rom, const Palette& pal, const size_t* gfxOverride, size_t altFH, size_t clutBase) {
+    g_spriteClut().load(rom, clutBase);             // CLUT спрайтов (шейд при рендере)
+    static const size_t GFX_ZT[10] = { 0x1B7B38, 0x16EC58, 0x1A7828, 0x1ACC72, 0x18D078,
+                                       0x183B94, 0x1784F2, 0x17BA80, 0x193F00, 0x19D50C };
+    const size_t* GFX = gfxOverride ? gfxOverride : GFX_ZT;
     auto decAnim = [&](size_t a1, int anim, int dir, std::vector<EnemySprite>& out) {
         if (anim < 0) return;
         int animCount = rom.u16(a1); if (anim >= animCount) return;
@@ -105,7 +111,18 @@ void decodeEnemySprites(const Rom& rom, const Palette& pal) {
         if (A.walk[0].empty()) decAnim(a1, 0, 0, A.walk[0]);           // фолбэк
         decAnim(a1, fA, 0, A.fire);                                    // стрельба/удар
         decAnim(a1, hA, 0, A.hit);                                     // стаггер
+        // ⭐DIRECTIONAL огонь/стаггер (ROM 1ba04 разруливает виды ГЕОМЕТРИЧЕСКИ у любого кадра — не только ходьбы)
+        auto decDirs = [&](int anim, std::vector<EnemySprite>* out, int& cnt) {
+            if (anim < 0 || anim >= rom.u16(a1)) return;
+            size_t blk = (a1 + 2) + rom.u16(a1 + 4 + (size_t)anim * 2);
+            int dn = rom.u16(blk); if (dn < 1) dn = 1; if (dn > 6) dn = 6;
+            for (int d = 0; d < dn; ++d) decAnim(a1, anim, d, out[d]);
+            if (!out[0].empty()) cnt = dn;
+        };
+        decDirs(fA, A.fireD, A.fireDirs);
+        decDirs(hA, A.hitD, A.hitDirs);
         decAnim(a1, dA, 0, A.death);                                   // смерть
+        if (ENEMY_ANIM_IDX2[i] >= 0) decAnim(a1, ENEMY_ANIM_IDX2[i], 0, A.fire2);   // 2-я боевая поза (прыжок/выстрел/дальний/удар/бросок)
         // 2-я вариация ходьбы (FH anim9): per-actor выбор по variant.
         int vA = ENEMY_VARIANT_WALK[i];
         if (vA >= 0 && vA < rom.u16(a1)) {
@@ -123,13 +140,26 @@ void decodeEnemySprites(const Rom& rom, const Palette& pal) {
             decAnim(a1, 8,  0, A.fallUp);                               // a8  = падение вверх/срыв (ZT draw state2 $2e>0)
             decAnim(a1, 10, 0, A.fallDead);                             // a10 = падение мёртвой (ZT draw state2 HP<0)
         }
+        if (i == 0) decAnim(a1, 6, 0, A.morph);                         // Sgt: a6 = МОРФ (ZT 1b628, 5 ступеней по $35)
+        if (i == 4) {                                                   // Revenant: СМЕРТЕЛЬНЫЙ стаггер = падение (ZT draw 1adfe, HP<0)
+            decAnim(a1, 8, 0, A.revFall[0]);                            //   $35 10..9 → a8 (подбит)
+            decAnim(a1, 4, 0, A.revFall[1]);                            //   $35 8..7  → a4
+            decAnim(a1, 6, 0, A.revFall[2]);                            //   $35 6..5  → a6
+            decAnim(a1, 5, 0, A.revFall[3]);                            //   $35 4..0  → a5 (лёг; после — звук 0x27 + кадр 7)
+        }
+        if (i == 8) {                                                   // Boss3: притворство мёртвым (ZT 1a752/1a7dc)
+            decAnim(a1, 10, 0, A.pretendLie);                           // a10 = лежит смирно ($35<5)
+            decAnim(a1, 7,  0, A.pretendJerkA);                         // a7  = дёрг (15/16)
+            decAnim(a1, 8,  0, A.pretendJerkB);                         // a8  = дёрг-альт (1/16)
+        }
         A.ok = !A.walk[0].empty();
         g_enemyWalk[i] = A.walk[0];                                    // совместимость
     }
     // АЛЬТ-БАНКИ: полный второй набор спрайтов (другая модель). Сейчас FH(1)=0x1C258A (коммандо).
     for (int i = 0; i < 10; ++i) {
         EnemyAnimSet& A = g_enemyAnimVar2[i]; A = EnemyAnimSet{};
-        size_t a1 = ENEMY_ALT_GFX[i]; if (!a1) continue;
+        size_t a1 = (i == 1) ? altFH : ENEMY_ALT_GFX[i] && !gfxOverride ? ENEMY_ALT_GFX[i] : 0;  // альт-банк: FH per-build, прочие ZT-only
+        if (!a1) continue;
         int wA = ENEMY_ANIM_IDX[i][0], fA = ENEMY_ANIM_IDX[i][1], hA = ENEMY_ANIM_IDX[i][2], dA = ENEMY_ANIM_IDX[i][3];
         size_t animBlock = (a1 + 2) + rom.u16(a1 + 4 + (size_t)wA * 2);
         int dirs = rom.u16(animBlock); if (dirs < 1) dirs = 1; if (dirs > 6) dirs = 6;
@@ -139,6 +169,11 @@ void decodeEnemySprites(const Rom& rom, const Palette& pal) {
         decAnim(a1, fA, 0, A.fire); decAnim(a1, hA, 0, A.hit); decAnim(a1, dA, 0, A.death);
         A.ok = !A.walk[0].empty();
     }
+    // ⭐BURNT REMAINS (ZT 0x1b8d8 спрайт-банк 0x1cb96a, draw 1b952): 1 anim / 1 dir / 4 кадра. Труп спалённого огнём врага.
+    // Только ZT-раскладка (адрес ZTU-банка не вскрыт — при override пропускаем, потребители держат пустой список).
+    g_burntRemains.clear();
+    if (!gfxOverride)
+        for (int f = 0; f < 4; ++f) { EnemySprite s = decodeEnemySprite(rom, 0x1cb96a, pal, 0, 0, f); if (s.ok) g_burntRemains.push_back(std::move(s)); }
     // КАМЕРА-ТРЕВОГА (0x26): draw 15d84 грузит a1=0x110FBE/0x1111BE в eda0, НО эти адреса = нулевые провалы между
     // блоками графики (тайлы на 0x110F00/0x111000). eda0 читает a1 не как обычный actor-дескриптор → реальный спрайт
     // требует разбора блиттера eda0/формата (TODO, отд. RE). Пока камера рисуется плейсхолдер-декором (pushCameraBillboards).

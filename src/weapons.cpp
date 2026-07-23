@@ -1,6 +1,22 @@
 // ztpp — src/weapons.cpp: холодные не-шаблонные функции оружия/инвентаря (стрельба/подбор/HUD).
 // Шаблоны отрисовки в руках (template<class Put>) и мелкие хелперы — в weapons.hpp.
 #include "weapons.hpp"
+#include "sniper_overlay.hpp"   // фоновый снайпер: хвост конуса 167b0 (убийство по X-центру)
+
+// ⭐УБИЙСТВО ФОНОВОГО СНАЙПЕРА (хвост 167b0 @16862): исполняется при КАЖДОМ вызове конус-наведения
+// (кулак/граната/огнемёт/hitscan — ROM: хвост внутри 167b0). Условия: этаж 0 (-$6fd8==0), игрок в
+// ct 0x28 (любой pitch) или 0x27 с pitch≥−5 (из глубокого приседа НЕ пострелять — укрытие в обе
+// стороны), снайпер активен, |X_прицела(центр 0x120) − X_снайпера| ≤ 3 → фаза 0x20 → 0x24 → жизнь−1.
+// Звука убийства в ROM НЕТ (только link-пакет 29ba).
+static void snipTryAimKill(const Level& lvl, const Camera& cam) {
+    if (!faSnipers() || cam.floor != 0) return;                      // 1685a
+    int cx = (int)cam.px, cy = (int)cam.py;
+    if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return;
+    uint8_t ct = lvl.cellType(cam.floor, cx, cy);
+    double camH = player().crouchY + player().knockPitch;            // -71e6 (полный питч)
+    if (!(ct == 0x28 || (ct == 0x27 && camH >= -5.0))) return;       // 16878/1687e
+    snip::aimKill();
+}
 
 int rcTryPickup(Inventory& inv, const Level& lvl, int floor, double px, double py) {
     int x = (int)px, y = (int)py;
@@ -14,15 +30,9 @@ int rcTryPickup(Inventory& inv, const Level& lvl, int floor, double px, double p
     }
     int idx = pickupItemIdx(ct);
     if (idx < 1 || idx >= 15) return -1;
-    bool firstTime = !inv.has(idx);
-    if (firstTime && !inv.addItem(idx)) return -1;   // инвентарь полон → не берём (остаётся в мире)
-    pickedSet().insert(k);                           // занять слот удалось (или добор) → гасим клетку
-    inv.ammo[idx] += ITEMS[idx].ammoPickup;          // добор боезапаса с КАПОМ (таблица @0x11240)
-    if (inv.ammo[idx] > ITEMS[idx].ammoCap) inv.ammo[idx] = ITEMS[idx].ammoCap;
-    if (firstTime && ITEMS[idx].weapon) {            // авто-выбор нового ствола (встать на его слот)
-        for (size_t i = 0; i < inv.carried.size(); ++i) if (inv.carried[i] == idx) { inv.sel = (int)i; break; }
-        inv.syncCurrent(); inv.slide = 1.0;
-    } else inv.syncCurrent();
+    // ⭐ЕДИНАЯ логика (applyPickup): кап-блок (полный → НЕ брать), руки-vs-слот, мигание. false → клетку НЕ гасим (остаётся на полу).
+    if (!applyPickup(inv, idx)) return -1;           // инвентарь полон / кап-блок (ammo>=cap) → предмет остаётся в мире
+    pickedSet().insert(k);                           // взято → гасим клетку
     return idx;
 }
 
@@ -37,6 +47,7 @@ void fireSpawn(const Inventory& inv, const Level& lvl, const Camera& cam) {
         snd::playSfx(0x1b);                                     // ЗАМАХ на КАЖДЫЙ удар (ZT 12bac move #$1b,d0→d760); лёгкий «вжух»
         int reachScale = (fg == 3) ? 100 : 160;                 // порог ближней дальности (0x64 / 0xa0)
         int ti = coneTargetEnemy(lvl, cam.floor, cam.px, cam.py, cam.dirX, cam.dirY, 0, reachScale);
+        snipTryAimKill(lvl, cam);        // хвост 167b0 — исполняется и на кулачном конусе (ROM)
         if (ti >= 0) {
             int X = (fg == 3) ? 0xc8 : (fg == 4) ? 0x1f4 : 0x300;   // X по бойцу (12118/12124/12130)
             int raw = 0x400 - X;                                     // урон = 0x400 − X (187c8)
@@ -61,24 +72,48 @@ void fireSpawn(const Inventory& inv, const Level& lvl, const Camera& cam) {
         }
         spawnMine(mx, my, cam.floor); return;
     }
-    if (id == 13) { spawnFlameP(x, y, cam.floor, cam.dirX, cam.dirY);                                 // ОГНЕМЁТ: поток частиц
-                    spawnFlameP(x, y, cam.floor, cam.dirX, cam.dirY); return; }                       // 2/кадр (свой разброс) = плотная струя
+    if (id == 13) {                                            // ⭐ОГНЕМЁТ: конус-наведение (ZT 167b0 в 12946, d1=8) → короткий
+        int ti = coneTargetEnemy(lvl, cam.floor, cam.px, cam.py, cam.dirX, cam.dirY, 8);  //   lifetime к врагу → AoE-импакт достаёт.
+        snipTryAimKill(lvl, cam);                                                         // хвост 167b0 (конус 12946)
+        double td = (ti >= 0) ? gameDist(actors()[ti].x - cam.px, actors()[ti].y - cam.py) : -1.0;
+        spawnFlameP(x, y, cam.floor, cam.dirX, cam.dirY, td); return;                     // ~1 частица/кадр (ZT ~0.75; было 2 = слишком плотно)
+    }
     if (id == 4)  {                                            // ОГНЕТУШИТЕЛЬ (ZT 0x12cfe): ОДИН спрайт пены (БЕЗ разброса), падает вниз, тушит огонь
         double mx = cam.px + cam.dirX * 0.35, my = cam.py + cam.dirY * 0.35;
         spawnFoam(mx, my, cam.floor, cam.dirX, cam.dirY);
         return;
     }
-    if (id == 7)  { spawnGrenade(cam.px + cam.dirX * 0.3, cam.py + cam.dirY * 0.3, cam.floor, cam.dirX, cam.dirY, 0,
-                                 playerFighter() == 1 ? 2.0 : 1.0); return; } // граната (БОЕЦ1: дальность ×2, ZT 12e7c)
+    if (id == 7)  {                                            // ГРАНАТА (ZT 12e7c→11e64): автонаведение 167b0 →
+        // фитиль = dist/64+8 (11e3c), vel к упреждённой цели (цель+vel×4) — ложится на цель; без цели фитиль 0x32=50.
+        double gx = cam.px + cam.dirX * 0.3, gy = cam.py + cam.dirY * 0.3;
+        int gt = coneTargetEnemy(lvl, cam.floor, cam.px, cam.py, cam.dirX, cam.dirY, 8);
+        snipTryAimKill(lvl, cam);        // хвост 167b0 (конус 11e64)
+        if (gt >= 0 && actors()[gt].think == AT_ENEMY) {
+            Actor& t = actors()[gt];
+            double lx = t.x + t.vx * 4.0, ly = t.y + t.vy * 4.0;   // упреждение цель+vel×4 (11e2c)
+            double dd = gameDist(lx - cam.px, ly - cam.py);
+            int fuse = (int)(dd * 4.0) + 8;                         // dist/64 units = dd·4 тиков
+            if (playerFighter() == 1) { fuse /= 2; if (fuse < 1) fuse = 1; }   // боец1: vel×2 / фитиль÷2 (11ea4)
+            spawnGrenadeAimed(gx, gy, cam.floor, (lx - gx) / fuse, (ly - gy) / fuse, fuse);
+        } else spawnGrenade(gx, gy, cam.floor, cam.dirX, cam.dirY, 0,
+                            playerFighter() == 1 ? 2.0 : 1.0);      // без цели (БОЕЦ1: дальность ×2, ZT 12e7c)
+        return; }
     if (id == 11) { spawnBullet(x, y, cam.floor, cam.dirX, cam.dirY, 0.5, A_EXPL_TILE, 200); return; }  // РАКЕТА vel=0.5кл/кадр (ZT dir/2)
     // ⭐HIT-SCAN (handgun/laser/shotgun/pulse): КОНУС-АВТОНАВЕДЕНИЕ (ZT 167b0) — ближайший враг в конусе оружия;
     // урон = дист-кривая (playerWeaponRawDamage, с перками бойца). Промах/вне дальности → искра у стены / прострел трупа.
-    int ti = coneTargetEnemy(lvl, cam.floor, cam.px, cam.py, cam.dirX, cam.dirY, coneWidth(id));
+    // minScale = depth-порог стены в прицеле (ZT d0=-$1e5a): нельзя навестись на врага ДАЛЬШЕ стены перед прицелом.
+    int wallScale = aimWallScale(lvl, cam.floor, cam.px, cam.py, cam.dirX, cam.dirY);
+    int ti = coneTargetEnemy(lvl, cam.floor, cam.px, cam.py, cam.dirX, cam.dirY, coneWidth(id), wallScale);
+    snipTryAimKill(lvl, cam);            // хвост 167b0 — и при попадании в актёра тоже (ROM: хвост безусловен)
     if (ti >= 0) {
         Actor& a = actors()[ti];
         double dd = gameDist(a.x - cam.px, a.y - cam.py);
         int raw = playerWeaponRawDamage(id, dd);
-        if (raw > 0) {
+        // ⭐ВЫСТРЕЛ ВО ВЗРЫВЧАТКУ (ROM receive 13ad2: d0<0x200 → детонация 13dcc). raw = 0x400−d0 → условие raw>0x200.
+        // Мина отфильтрована стойкой ещё в конусе (flags 0x8 → только присед); граната/ракета — из любой стойки.
+        if (a.think == AT_MINE || a.think == AT_BULLET || a.think == AT_GRENADE) {
+            if (raw > 0x200) { detonateActor(lvl, a, cam); return; }
+        } else if (raw > 0) {
             if (a.think == AT_CORPSE) { corpseHit(a, cam.px, cam.py, raw); return; }   // ТРУП (в конусе из приседа) → отлёт ПО ОРУЖИЮ
             int dmg = raw / 100 < 1 ? 1 : raw / 100; hitEnemy(a, dmg, cam.px, cam.py, raw); return;
         }
@@ -102,6 +137,7 @@ void drawInventoryHud(uint32_t* frame, int FW, int FH, const GameData& gd, const
         else if (j < 0 || j >= n) continue;              // <5 слотов: пустые края
         int id = r[j];
         if (id < 0) continue;                            // пустой слот / кулаки — иконки нет
+        if (!inv.iconVisible(id)) continue;              // ⭐МИГАНИЕ после подбора (ZT 0108d6): иконка скрыта на blink T=3/1
         int icon = gd.iconForId(id);
         if (icon < 0) continue;
         gd.decodeIcon(icon, ip);
@@ -114,7 +150,10 @@ void drawInventoryHud(uint32_t* frame, int FW, int FH, const GameData& gd, const
             bool pct = ITEMS[id].ammoCap <= 10;                       // расходник → % / оружие → count
             int cap = ITEMS[id].ammoCap > 0 ? ITEMS[id].ammoCap : 1;
             int a = pct ? (inv.ammo[id] * 100 / cap) : inv.ammo[id];
-            int amax = pct ? 100 : 99; if (a > amax) a = amax; if (a < 0) a = 0;
+            // расходник: ПОЛНЫЙ заряд = 100% (юзер: у процентных айтемов есть 100%). len=3 → плашка/знак % ниже
+            // берут ширину из len, поэтому «100%» размещается корректно. Оружие-счётчик держим в 2 цифрах (кап 99).
+            if (pct) { if (a > 100) a = 100; } else if (a > 99) a = 99;
+            if (a < 0) a = 0;
             char b[8]; int len = std::snprintf(b, sizeof b, "%d", a);
             int glyphs = len + (pct ? 1 : 0);                          // +1 клетка под знак '%'
             int dx = bx + 1, dy = SLOT_Y + 25;                         // низ-лев. угол иконки

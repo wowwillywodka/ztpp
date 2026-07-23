@@ -40,6 +40,10 @@ struct Level {
 
     bool valid() const { return ok; }
 
+    // ⭐ОБЛАСТЬ уровня (ROM -$58e4 = (levelByte>>4)&3 = номер эпизода): выбирает набор «небесных»
+    // cellID для пуль (13c36/13cbc — окна станции / парапеты крыши). Ставит loadGameDataFromRom.
+    int area = 0;
+
     // ШАГ 1: cell-ID из грида карты.
     uint8_t cellId(int floor, int x, int y) const {
         return mapT[static_cast<size_t>(floor) * 1024 + static_cast<size_t>(y) * 32 + x];

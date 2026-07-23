@@ -24,7 +24,7 @@ namespace snd {
 // ── НАСТРОЙКИ ЧИПА ──
 static const double YM_CLOCK   = 7670454.0;            // NTSC мастер-такт YM2612
 static const double NATIVE_RATE = YM_CLOCK / 144.0;    // 53267 Гц — один сэмпл = сумма 24 тактов чипа
-static const int    FM_SFX_CH  = 5;                    // FM-голоса 0..4 под SFX (5-й/ch6 отдан DAC)
+static const int    FM_SFX_CH  = 6;                    // все 6 FM-голосов в общем пуле (ROM: DAC отбирает phys6 только НА ВРЕМЯ PCM)
 
 inline ym3438_t& chip()        { static ym3438_t c; return c; }
 inline SDL_AudioDeviceID& dev(){ static SDL_AudioDeviceID d = 0; return d; }
@@ -101,12 +101,34 @@ struct GemsChan {
     int  pos = 0; int wait = 0, delayv = 0, duration = 0;
     bool wasdelay = false, wasduration = false, done = true;
     int  patch = -1, patchType = -1, voice = -1, note = -1; long noteOff = -1;
-    int  loopRet[8]; int loopRem[8]; int loopDepth = 0; int volume = 0;
+    int  loopRet[8]; int loopRem[8]; int loopDepth = 0; int volume = 0;   // ⭐GEMS: АТТЕНЮАЦИЯ канала 0..0x7F (0=полная громкость; данные 0x72/05=0..40)
+    int  psgV = -1;                                              // PSG-тон голос (музыка), −1 = нет
 };
+// ── PSG ТОН для МУЗЫКИ (SN76489 ch0-2 + GEMS ADSR из Z80-драйвера psg_service $0066) ──
+// Патч: b[2]=atkRate b[3]=susLevel b[4]=atkTgt b[5]=decRate b[6]=relRate (8-бит атт: 0=громко, 255=тишина).
+// Меандр: период = NATIVE_RATE/(2·freq); ADSR тикает на noiseEnvHz (60 Гц), вывод = psgAmp(att>>4).
+struct PsgTone {
+    bool active = false; int phase = 0; int owner = -1;         // owner = GEMS-канал
+    double att = 255, atk = 16, dec = 8, sus = 0, tgt = 0, rel = 16;
+    double halfPeriod = 100, acc = 0, envAcc = 0; int cur = 1; int volAtt = 0;
+};
+inline PsgTone* psgTones() { static PsgTone v[3]; return v; }
 struct GemsVoice { int owner = -1; int patch = -1; long last = -1, off = 0; int vol = -1; };
+// ⭐ЕДИНЫЙ ПУЛ 6 FM-КАНАЛОВ (GEMS Z80 $17e2, трассировка 2026-07-16): канал = {busy, prio, sfx?}.
+// Алгоритм note-on: (1) СВОЙ канал переиспользуется; (2) свободный (LRU); (3) свободных нет → КРАЖА у
+// занятого с МИНИМАЛЬНЫМ приоритетом, ТОЛЬКО если prio запроса ≥ его; (4) иначе ОТКАЗ — звук НЕ играет
+// (музыку не рвёт). Приоритеты: музыка=1, SFX=2 (SFX крадёт у музыки один худший голос; музыка у SFX — нет).
+inline int* chanPrio() { static int p[6] = {0,0,0,0,0,0}; return p; }   // приоритет ЗАНЯТОГО канала (0=свободен)
+// ROM $17e2: свободный голос, чей ПОСЛЕДНИЙ владелец (запись +3) == запросивший канал, берётся сразу
+// (музыкальный канал липнет к «своему» голосу). Владельцы: 0..15 = каналы музыки, 16+ = SFX (по патчу).
+inline int* voiceLastOwner() { static int p[6] = {-1,-1,-1,-1,-1,-1}; return p; }
+// ROM бит5 записи $17b1: пока DAC играет PCM, FM-голос 5 (phys6) исключён из аллокации (DAC глушит FM ch6).
+inline bool& dacLocked() { static bool b = false; return b; }
+inline bool& dacOn()     { static bool b = false; return b; }   // текущее состояние рег. $2B (DAC enable)
 struct GemsMusic {
-    bool active = false; int song = -1; int tempo = 120; double acc = 0;
+    bool active = false; bool paused = false; int song = -1; int tempo = 120; double acc = 0;
     long tick = 0; int nch = 0;
+    bool ptr3 = false;         // ⭐указатели каналов песни: false=2 байта (ZT), true=3 (GEMS-флаг «3», ZTU)
     GemsChan ch[GEMS_MAX_CH]; GemsVoice voice[6];
     std::vector<uint8_t> seq;                                    // копия банка секвенций (окно 64К)
 };
@@ -118,7 +140,7 @@ inline double& musicVolume() { static double v = 1.0; return v; }
 void gemsLoadPatchVoice(int v, int patchIdx);
 void gemsKeyOffVoice(int v);
 void gemsNoteOffCh(GemsMusic& m, GemsChan& c);
-int  gemsAllocVoice(GemsMusic& m, int chIdx);
+int  gemsAllocFm(int reqPrio, int ownerId);
 void gemsNoteOn(GemsMusic& m, int chIdx, int note);
 void gemsDelayAdd(GemsChan& c);
 void gemsAdvance(GemsMusic& m, int chIdx);
@@ -142,7 +164,9 @@ inline int musicSongCount() {
     return (d[0] | (d[1] << 8)) / 2;
 }
 void musicStop();                                              // → sound.cpp
-bool musicPlay(int song);                                      // → sound.cpp
+void musicSetPaused(bool p);                                   // ⭐пауза GEMS (ROM cmd 0x0D/0x0C: ESC-меню/Tab-карта)
+bool renderMusicWav(int song, double seconds, const char* path);   // отладка: трек → WAV (headless)
+bool musicPlay(int song, int tempo = -1);                      // → sound.cpp (tempo из SFX-таблицы p2, cmd5/0e1d)
 inline int musicCurrent() { return music().active ? music().song : -1; }
 
 // ── SFX-ДЕСКРИПТОРЫ ZT (таблица @0xc5eb4, 3 байта/запись: type,p1,p2) ──
@@ -165,7 +189,10 @@ void playSfxNote(int id, int note);                            // → sound.cpp 
 void stopAllSfx();                                             // → sound.cpp
 
 // ── ЗАГРУЗКА: таблица DAC-сэмплов + банк FM-патчей + секвенции + SFX-таблица + чип/аудио ──
-void load(const Rom& rom, size_t sampBase = 0x5E51C, size_t patchBase = 0x5A804);   // → sound.cpp
+// GEMS-банки per-build: ZT samp 0x5E51C / patch 0x5A804 / seq 0x5B0CC / SFX 0xC5EB4;
+// ZTU 0x2EE77 / 0x2981E / 0x2A288 / 0x96848 (GEMS-init пуши @0x96492, sfx = lea (pc) @0x96a7a — verified).
+void load(const Rom& rom, size_t sampBase = 0x5E51C, size_t patchBase = 0x5A804,
+          size_t seqBase = 0x5B0CC, size_t sfxBase = 0xC5EB4);   // → sound.cpp
 
 // ── СОБЫТИЯ → ИГРОВОЙ SFX-ID (выверено по дизасм-вызовам jsr 0xd740/0xd760 с d0=id) ──
 enum Ev { SFX_HANDGUN, SFX_SHOTGUN, SFX_LASER, SFX_PULSE, SFX_ROCKET, SFX_GRENADE, SFX_EXPLOSION,

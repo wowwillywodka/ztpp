@@ -81,22 +81,22 @@ bool rcUpdateTransitZT(Camera& c, const Level& lvl, bool enteredNewCell) {
     // (B) PER-FRAME автомат (b4e4 при ct>=0x12): рампа кабины ±4/кадр + своп этажа на пробое ±0x40.
     if (c.elevState == +1) {                                    // UP по зданию: floor--
         if (ctElevDown(ct)) {                                   // b798: доезд к 0 на встречной down-кабине
-            c.cabin -= 4.0; if (c.cabin < 0.0) { c.cabin = 0.0; c.elevState = +2; }
+            c.cabin -= 4.0 * simDt(); if (c.cabin < 0.0) { c.cabin = 0.0; c.elevState = +2; }
         } else {                                                // b768→b7ec: пробой -0x40 → floor--, cabin→+0x40
-            c.cabin -= 4.0;
+            c.cabin -= 4.0 * simDt();
             if (c.cabin < -64.0) { c.cabin = 64.0; if (c.floor > 0) c.floor--; }
         }
     } else if (c.elevState == -1) {                             // DOWN по зданию: floor++
         if (ctElevUp(ct)) {                                     // b7da: доезд к 0 на встречной up-кабине
-            c.cabin += 4.0; if (c.cabin >= 0.0) { c.cabin = 0.0; c.elevState = -2; }
+            c.cabin += 4.0 * simDt(); if (c.cabin >= 0.0) { c.cabin = 0.0; c.elevState = -2; }
         } else {                                                // b7aa→b862: пробой +0x40 → floor++, cabin→-0x40
-            c.cabin += 4.0;
+            c.cabin += 4.0 * simDt();
             if (c.cabin > 64.0) { c.cabin = -64.0; if (c.floor < 15) c.floor++; }
         }
     } else {                                                    // не в поездке (0 или ±2)
         if (!rcStairCabin(c, ct, subX, subY)) {
-            if      (c.cabin > 0.0) { c.cabin -= 4.0; if (c.cabin < 0.0) c.cabin = 0.0; }
-            else if (c.cabin < 0.0) { c.cabin += 4.0; if (c.cabin > 0.0) c.cabin = 0.0; }
+            if      (c.cabin > 0.0) { c.cabin -= 4.0 * simDt(); if (c.cabin < 0.0) c.cabin = 0.0; }
+            else if (c.cabin < 0.0) { c.cabin += 4.0 * simDt(); if (c.cabin > 0.0) c.cabin = 0.0; }
         }
     }
 
@@ -136,11 +136,11 @@ bool rcUpdateTransit(Camera& c, const Level& lvl, bool enteredNewCell) {
                 if (fy < 0.125) c.py = cy + 0.125; else if (fy > 0.871) c.py = cy + 0.871;
             }
             if (dir > 0) {                              // вниз по зданию (floor++)
-                c.cabin += 4.0;
+                c.cabin += 4.0 * simDt();
                 if (rcElevArrival(ct, dir)) { if (c.cabin >= 0.0) { c.cabin = 0.0; c.elevState = 0; } }
                 else if (c.cabin > 64.0)    { c.cabin = -64.0; if (c.floor < 15) c.floor++; }
             } else {                                    // вверх по зданию (floor--)
-                c.cabin -= 4.0;
+                c.cabin -= 4.0 * simDt();
                 if (rcElevArrival(ct, dir)) { if (c.cabin <= 0.0) { c.cabin = 0.0; c.elevState = 0; } }
                 else if (c.cabin < -64.0)   { c.cabin = 64.0;  if (c.floor > 0)  c.floor--; }
             }
@@ -181,8 +181,8 @@ bool rcUpdateTransit(Camera& c, const Level& lvl, bool enteredNewCell) {
         default:   onStair = false; break;
     }
     if (!onStair) {                                          // не на лестнице → питч плавно к 0
-        if (c.cabin > 0.0) { c.cabin -= 4.0; if (c.cabin < 0.0) c.cabin = 0.0; }
-        else if (c.cabin < 0.0) { c.cabin += 4.0; if (c.cabin > 0.0) c.cabin = 0.0; }
+        if (c.cabin > 0.0) { c.cabin -= 4.0 * simDt(); if (c.cabin < 0.0) c.cabin = 0.0; }
+        else if (c.cabin < 0.0) { c.cabin += 4.0 * simDt(); if (c.cabin > 0.0) c.cabin = 0.0; }
     }
     c.pitch = -c.cabin;
     return false;

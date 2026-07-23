@@ -56,12 +56,15 @@ inline bool itemIsWeapon(int idx) { return idx >= 0 && idx < 15 && ITEMS[idx].we
 struct Inventory {
     bool   owned[15] = {false};
     int    ammo[15]  = {0};
+    int    blink[15] = {0};             // ⭐таймер МИГАНИЯ иконки слота после подбора (ZT $FF1052, старт=3): дисплей 0108d6
+                                        //   T=3→скрыта, 2→показана, 1→скрыта, 0→постоянно. Декремент 1/тик (updateInvBlink).
     std::vector<int> carried;           // упорядоченные слоты-предметы (idx 1..14), длина ≤ capacity (или ∞)
     int    sel       = 0;               // индекс выбранного слота в carried (центр карусели)
     int    capacity  = 5;               // макс. слотов (ZT = 5); см. unlimited
     bool   unlimited = false;           // снять лимит ёмкости (неогранич. инвентарь)
     int    current   = -1;              // РАЗРЕШЁННЫЙ id выбранного (carried[sel], или −1 = кулаки)
     double slide     = 0.0;             // выезд ствола при смене: 0 на месте … 1 убран вниз (ZT $FF1058 0x20↔0)
+    int    flameAlt  = 0;               // огнемёт: чередование расхода (1.0 за 2 порт-цикла = ROM-темп 13024)
     int    switching = 0;               // фаза смены: 0 нет · 1 уходит ВНИЗ (старый) · 2 выезжает ВВЕРХ (новый)
     int    pendingDir= 0;               // направление карусели, применяется в низшей точке слайда (ZT down→swap→up)
     int    fire      = 0;               // счётчик анимации выстрела ($FF105A): 0 покой, 1..4 кадры
@@ -86,6 +89,8 @@ struct Inventory {
         current = r[sel];
     }
     bool has(int idx) const { for (int c : carried) if (c == idx) return true; return false; }
+    void tickBlink() { for (int i = 1; i < 15; ++i) if (blink[i] > 0) --blink[i]; }               // ⭐мигание: 1/тик (ZT 0108d6)
+    bool iconVisible(int idx) const { int t = (idx >= 1 && idx < 15) ? blink[idx] : 0; return t != 3 && t != 1; }  // ZT паттерн: скрыта при T=3/1
     // Убрать предмет из инвентаря (боезапас кончился — как ZT FUN_10b00: слот очищается, переключение).
     // Освобождает слот; выбор сдвигается на оставшееся (или кулаки). Re-pickup вернёт его (has()→false).
     void dropItem(int idx) {
@@ -136,36 +141,47 @@ inline void heldOffset(int id, int& yoff, int& xoff) {
 // Выстрел (как FUN_12bac/12eac): нельзя в выезде ствола (slide) или пока идёт анимация (fire); оружие тратит
 // патрон. Возвращает true, если выстрел начался. Урон/рейкаст/спавн пули — позже (нужны актёры).
 inline bool fireWeapon(Inventory& inv) {
-    if (inv.fire != 0 || inv.slide > 0) return false;
+    if (inv.fire != 0 || inv.slide > 0 || inv.switching != 0) return false;   // смена оружия запрещает выстрел (ZT 12a78 pending≠FF)
     int id = inv.current;
-    if (id >= 0 && ITEMS[id].weapon) { if (inv.ammo[id] <= 0) return false; --inv.ammo[id]; }
+    if (id >= 0 && ITEMS[id].weapon) {
+        if (inv.ammo[id] <= 0) return false;
+        bool consume = true;
+        // ⭐ОГНЕМЁТ (ROM 13024: расход 1.0 гейтится циклом анимации -$6fa6 ~6 тиков; порт авто-рефайрит
+        // каждые ~3) → тратим через раз = ROM-темп (кап 10 ≈ 10 струй, юзер: «слишком быстро расходует»).
+        if (id == 13) { inv.flameAlt ^= 1; consume = (inv.flameAlt == 0); }
+        if (consume) --inv.ammo[id];
+    }
     if (id < 0) inv.punchSide ^= 1;          // кулаки: чередуем бьющую руку (правая/левая)
     inv.fire = 1;
     return true;
 }
 
 // Переключить выбранный слот (dir −1 пред. / +1 след.) по кольцу carried — карусель (центр = текущий).
-// ZT-смена ДВУХФАЗНАЯ ($FF1058 0x20↔0): текущий ствол УХОДИТ ВНИЗ → в нижней точке swap → новый ВЫЕЗЖАЕТ ВВЕРХ.
+// ⭐ZT-смена ДВУХФАЗНАЯ (VERIFIED 11c2c): pending=$FF1051 заказ; слайд $FF1058 += 8/кадр до 0x20 (УБИРАНИЕ старого,
+// 4 кадра) → в нижней точке ФАКТИЧЕСКАЯ смена слота → слайд −= 8/кадр до 0 (ДОСТАВАНИЕ нового, 4 кадра).
+// Карусель HUD (1125e) ротируется сразу; заказ того же оружия (11c58) = отмена БЕЗ анимации.
 inline void cycleWeapon(Inventory& inv, int dir) {
     int n = (int)inv.ring().size();                          // кольцо: unlim=несомые+кулаки · 5-слот=5 позиций (с пустыми)
     if (n <= 0) { inv.sel = 0; inv.current = -1; return; }
-    // ZT (1125e): слот меняется МГНОВЕННО на каждое нажатие (быстрый проклик); перебираются и ПУСТЫЕ слоты (=кулаки).
-    inv.sel = ((inv.sel + dir) % n + n) % n;
-    inv.syncCurrent();
-    inv.slide = 1.0; inv.switching = 2;                      // новый ствол выезжает вверх (не блокирует следующий проклик)
+    inv.sel = ((inv.sel + dir) % n + n) % n;                 // HUD-карусель — мгновенно (ZT 1125e ротация массива)
+    int tgt = inv.ring()[inv.sel];
+    if (tgt == inv.current) { inv.switching = 0; return; }   // тот же слот → отмена заказа (ZT 11c58 beq)
+    inv.switching = 1;                                       // фаза УБИРАНИЯ (current остаётся старым до нижней точки)
 }
 // Анимация выезда/боба/выстрела: вызывать раз в игр.кадр. speed = фактическая скорость игрока (кл/кадр) — боб
 // масштабируется по ней (быстрее идёшь → чаще/сильнее качается; стоишь → гаснет). 0 = покой.
 inline void updateHeld(Inventory& inv, double speed = 0.0) {
-    if (inv.switching == 1) {                                // СТАРЫЙ уходит вниз (ZT 0x11c2c: -$6fa8 += 8 до 0x20 = 4 кадра)
-        inv.slide += 0.25; if (inv.slide >= 1.0) {           // достиг низа → СМЕНА слота
-            inv.slide = 1.0;
-            int n = (int)inv.ring().size(); if (n < 1) n = 1;
-            inv.sel = ((inv.sel + inv.pendingDir) % n + n) % n; inv.syncCurrent();
-            inv.switching = 2;                               // фаза 2: новый выезжает вверх
+    // ⭐СЛАЙД-СМЕНА (ZT 11c2c): fire-анимация ПАУЗИТ слайд (11c46 tst -$6fa6 → bne skip)
+    if (inv.fire == 0) {
+        if (inv.switching == 1) {                            // СТАРЫЙ уходит вниз (+8/кадр до 0x20 = 4 кадра)
+            inv.slide += 0.25; if (inv.slide >= 1.0) {       // нижняя точка → ФАКТИЧЕСКАЯ смена слота (ZT 11c6a-92)
+                inv.slide = 1.0;
+                inv.syncCurrent();                           // current = ring()[sel] (последний заказ при прокликах)
+                inv.switching = 2;                           // фаза 2: новый выезжает вверх
+            }
+        } else if (inv.switching == 2 || inv.slide > 0) {    // НОВЫЙ выезжает вверх (−8/кадр до 0 = 4 кадра, ZT 11cdc)
+            inv.slide -= 0.25; if (inv.slide <= 0) { inv.slide = 0; inv.switching = 0; }
         }
-    } else if (inv.switching == 2 || inv.slide > 0) {        // НОВЫЙ выезжает вверх (ZT: -$6fa8 -= 8 до 0 = 4 кадра)
-        inv.slide -= 0.25; if (inv.slide <= 0) { inv.slide = 0; inv.switching = 0; }
     }
     if (inv.fire > 0)  { ++inv.fire; if (inv.fire >= 5) inv.fire = 0; }
     // ПОКАЧИВАНИЕ ствола: скорость фазы И амплитуда ∝ фактической скорости игрока (не статично). reff: 0.156 кл/кадр = бег.
@@ -207,23 +223,37 @@ static const int PICK_MEDKIT = -2;
 //  • новый + инвентарь ПОЛОН (5, не unlimited) → НЕ подбирать (оставить в мире, return −1).
 int rcTryPickup(Inventory& inv, const Level& lvl, int floor, double px, double py);   // weapons.cpp
 
-// Выдать оружие/предмет в инвентарь (как rcTryPickup, но без celltype/pickedSet) — для дропа с трупов. true = взято.
-inline bool grantPickup(Inventory& inv, int idx) {
+// ⭐ЕДИНАЯ логика подбора в инвентарь (ZT addItem 0x11084). Возвращает true=ВЗЯТО (гасить клетку), false=НЕ брать
+// (оставить на полу): инвентарь полон ИЛИ кап-блок (count==cap). Правки 2026-07-15 по дизасму (агент):
+//   • КАП-БЛОК (ZT 110e6 `count==cap→d7=-1`): полностью заполнен (ammo>=cap) → НЕ подбирать (тактич.момент, ждёт пока станет меньше).
+//   • РУКИ-vs-СЛОТ (ZT 11c02 читает $FF104A[0]): новое оружие → в РУКИ только если руки ПУСТЫ (кулаки, current==-1); иначе в слот.
+//   • МИГАНИЕ (ZT $FF1052=3): blink[idx]=3 при подборе.
+// amount: 0 = штатное кол-во из таблицы пикапа (ROM @0x11222); >0 = ОВЕРРАЙД (ROM -$6fcc @110cc:
+// трофей с трупа солдата приходит с 2-3 ед., а не полным пикапом — corpse-give 1872e RNG-бит).
+inline bool applyPickup(Inventory& inv, int idx, int amount = 0) {
     if (idx < 1 || idx >= 15) return false;
     bool firstTime = !inv.has(idx);
-    if (firstTime && !inv.addItem(idx)) return false;            // инвентарь полон → не берём
-    inv.ammo[idx] += ITEMS[idx].ammoPickup;
+    bool handsEmpty = (inv.current == -1);                       // руки пусты (кулаки) ДО подбора
+    if (firstTime) { if (!inv.addItem(idx)) return false; }      // новый + инвентарь полон (5) → на полу
+    else if (inv.ammo[idx] >= ITEMS[idx].ammoCap) return false;  // ⭐КАП-БЛОК: полный → НЕ подбирать (остаётся на полу)
+    inv.ammo[idx] += (amount > 0 ? amount : ITEMS[idx].ammoPickup);
     if (inv.ammo[idx] > ITEMS[idx].ammoCap) inv.ammo[idx] = ITEMS[idx].ammoCap;
-    if (firstTime && ITEMS[idx].weapon) {                        // авто-выбор нового ствола
+    inv.blink[idx] = 3;                                          // ⭐мигание иконки (ZT $FF1052)
+    if (firstTime && ITEMS[idx].weapon && handsEmpty) {          // ⭐новое оружие В РУКИ только при пустых руках
         for (size_t i = 0; i < inv.carried.size(); ++i) if (inv.carried[i] == idx) { inv.sel = (int)i; break; }
         inv.syncCurrent(); inv.slide = 1.0;
-    } else inv.syncCurrent();
+    } else inv.syncCurrent();                                    // руки заняты → новое падает в слот, sel не меняется
     return true;
 }
-// Подбор оброненного оружия при шаге на труп (ZT: солдаты бросают ствол у трупа). Возвращает id или −1.
+// Выдать оружие/предмет в инвентарь (дроп с трупов). true = взято.
+inline bool grantPickup(Inventory& inv, int idx, int amount = 0) { return applyPickup(inv, idx, amount); }
+// Подбор оружия при шаге на труп. ⭐ROM 1872e/11084: трофей = 2-3 ед. боезапаса (RNG-бит → -$6fcc=0x200|0x300),
+// НЕ полный пикап (пистолет 6/лазер 10 давали «слишком дофига»). Возвращает id или −1.
 inline int rcTryCorpsePickup(Inventory& inv, const Camera& cam) {
     int got = -1;
-    corpsePickup(cam, [&](int wid) -> bool { if (grantPickup(inv, wid)) { got = wid; return true; } return false; });
+    corpsePickup(cam, [&](int wid) -> bool {
+        int amt = 2 + (int)((enemyRng() >> 8) & 1);              // ROM: jsr a5c; asr#8; andi#1; addq#2 → 2|3
+        if (grantPickup(inv, wid, amt)) { got = wid; return true; } return false; });
     return got;
 }
 
@@ -259,22 +289,61 @@ inline int coneWidth(int id) {
         default: return 8;
     }
 }
-// Промах hit-scan (ZT 12ad4): луч ОТ ГЛАЗ до 1-й СОЛИДНОЙ клетки (макс 31 клетка) → спрайт импакта У ГРАНИ стены.
+// Промах hit-scan — общий хвост fire-функций ROM (12f4e-паттерн): `jsr a8b6; bne → без импакта;
+// bsr 12ad4 (импакт); jsr a5d4 (слом секретки) ВСЕГДА`.
 // ⚠ ROM 12ad4 актёров НЕ проверяет — луч ПРОХОДИТ СКВОЗЬ ТРУПЫ (и живых) прямо к стене; трупы выстрел НЕ
 // задевают/не стопают (фидбэк юзера: «выстрелы задевают трупы — неверно» + «нет импакта по стене за трупом»).
-// Нет солида в 31 клетке → импакта НЕТ (ROM rts). Диагональ учитывается полуплоскостью (cellBlockedAt).
+// ⭐«НЕБЕСНЫЕ» СТЕНЫ (12b18→13c36, 2026-07-22): окна станции / парапеты крыши (bulletSkyCellId по СЫРОМУ
+// cellID) — выстрел уходит «в небо», импакт-СПРАЙТ не спавнится. Из приседа парапеты 03/A2/06..08 твёрдые.
+// Дальность ИСКРЫ = 4 клетки (12af0: 32 шага × d5/8 = ⅛ кл; прежний коммент «31 кл» читал d7=0x1F как клетки).
+// ⭐СЛОМ СЕКРЕТ-СТЕНЫ = ОТДЕЛЬНЫЙ луч a5d4 (VERIFIED 2026-07-22): 9 шагов × ¼ кл = 2.25 клетки,
+// БЕЗ sky-фильтра (A2=ct7B на крыше ломается стоя, хотя импакта нет!), ломает ТОЛЬКО 0x79/0x7B/0x7F —
+// 0x7D пулей НЕ ломается (только взрыв a6bc: ракета 14114/граната 13c16).
+// ⭐Гейт a8b6/@a8cc: игрок СТОИТ на клетке лестницы/лифта → импакт-спрайт не рисуется (слом работает).
+inline bool transitNoImpactCell(uint8_t ct) {                     // ненулевые записи таблицы @a8cc
+    return (ct >= 0x12 && ct <= 0x17) || (ct >= 0x32 && ct <= 0x34) || (ct >= 0x3C && ct <= 0x3F) ||
+           (ct >= 0x44 && ct <= 0x47) || (ct >= 0x4C && ct <= 0x4F) || (ct >= 0x51 && ct <= 0x53) ||
+           (ct >= 0x55 && ct <= 0x57) || (ct >= 0x59 && ct <= 0x5B);
+}
 inline void traceMiss(const Level& lvl, int floor, double px, double py, double dx, double dy) {
+    const bool high = playerAimHigh();
+    int pcx = (int)px, pcy = (int)py;
+    const bool noImpact = (pcx >= 0 && pcy >= 0 && pcx < Level::W && pcy < Level::H) &&
+                          transitNoImpactCell(lvl.cellType(floor, pcx, pcy));
     double x = px, y = py;
-    for (int i = 0; i < 600; ++i) {                               // 31 кл / 0.06 ≈ 517 шагов (+запас)
+    for (int i = 0; i < 600; ++i) {
         double nx = x + dx * 0.06, ny = y + dy * 0.06; int cx = (int)nx, cy = (int)ny;
         if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return;
-        if (cellBlockedAt(lvl.cellType(floor, cx, cy), nx - cx, ny - cy)) {   // 1-я солидная клетка = СТЕНА
-            if (wallIsSecret(lvl.cellType(floor, cx, cy))) requestDestruct(floor, cx, cy);  // ТОЛЬКО секрет-стены 0x79/7B/7D/7F (a6bc: смена текстуры). 0x83/84 пуля НЕ ломает — разрушает тревога-камера
-            spawnSparkA(nx, ny, floor); return;                   // ИМПАКТ у грани стены (ZT актёр 15ad6, банк 0x1167be, 3 кадра)
+        uint8_t ct = lvl.cellType(floor, cx, cy);
+        if (cellBlockedAt(ct, nx - cx, ny - cy)) {                // 1-я солидная клетка (13d48, диагональ-полуплоскость)
+            double d2 = (nx - px) * (nx - px) + (ny - py) * (ny - py);
+            if ((ct == 0x79 || ct == 0x7B || ct == 0x7F) && d2 <= 2.25 * 2.25)
+                requestDestruct(floor, cx, cy);                   // a5d4: слом БЕЗ sky-гейта, ≤2.25 кл
+            if (!noImpact && d2 <= 16.0 &&
+                !bulletSkyCellId(lvl, lvl.cellId(floor, cx, cy), high))
+                spawnSparkA(nx, ny, floor);                       // ИМПАКТ ≤4 кл (12ad4 → актёр 15ad6, банк 0x1167be)
+            return;
         }
-        if ((nx - px) * (nx - px) + (ny - py) * (ny - py) > 31.0 * 31.0) return;  // ROM: дальность 31 клетка (0x1f)
+        if ((nx - px) * (nx - px) + (ny - py) * (ny - py) > 31.0 * 31.0) return;
         x = nx; y = ny;
     }
+}
+
+// ⭐ГЛУБИНА ЛАЗЕР-ПРИЦЕЛА (ROM 12622: размер точки по прицел-буферу -$1eda, который пишут ТОЛЬКО грани,
+// накрывающие ЦЕНТР экрана — ce2c..ce46): луч по взгляду СКВОЗЬ «небесные» стены (парапеты/окна) до
+// первой полной стены. На крыше/у окон точка «уходит вдаль» (минимальный размер), как в оригинале.
+inline double laserAimDepth(const Level& lvl, int floor, double px, double py, double dx, double dy) {
+    const bool high = playerAimHigh();
+    double x = px, y = py;
+    for (int i = 0; i < 600; ++i) {
+        double nx = x + dx * 0.06, ny = y + dy * 0.06; int cx = (int)nx, cy = (int)ny;
+        if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return 1e9;
+        if (cellBlockedAt(lvl.cellType(floor, cx, cy), nx - cx, ny - cy) &&
+            !bulletSkyCellId(lvl, lvl.cellId(floor, cx, cy), high))
+            return std::hypot(nx - px, ny - py);
+        x = nx; y = ny;
+    }
+    return 1e9;
 }
 
 // ── ВЫСТРЕЛ (спавн актёров) ─────────────────────────────────────────────────────
@@ -341,6 +410,7 @@ inline void drawHeldRegion(Put put, int rx, int ry, int rw, int rh,
     if (gd.heldGfx.empty() || gd.heldBlocks <= 0) return;
     const size_t HELD_BLOCK = 672;
     int id = inv.current;                               // −1 → кулаки
+    if (id >= 0 && heldDisplayKind(id) == 0) id = -1;   // пассивный предмет → те же КУЛАКИ (ROM display 0x11f3c)
     int block = (id < 0) ? gd.heldBlockForId[0] : gd.heldBlockForId[id];
     if (block < 0 || block >= gd.heldBlocks) block = 0;
     const uint8_t* base = gd.heldGfx.data() + (size_t)block * HELD_BLOCK;
@@ -405,21 +475,42 @@ inline void drawHeldWeapon(FB& fb, int vw, int vh, const GameData& gd, const Inv
                    heldScaleFor(vw));
 }
 
-// ── ЛАЗЕРНЫЙ ПРИЦЕЛ laser aimed gun (id 10), дизасм-дисплей 0x1247a ───────────────────────────────
-// Красная лазерная ТОЧКА над стволом: размер ∝ 1/дистанция (ближе препятствие → крупнее), покачивается
-// при ходьбе вместе со стволом. ВСЕГДА включён, пока несём лазерную пушку. fwdDist = глубина центр.колонны (zbuf).
+// ── ЛАЗЕРНЫЙ ПРИЦЕЛ laser aimed gun (id 10) — ⭐VERIFIED дизасм 12632-1268e ────────────────────────
+// Точка НЕ трассируется лучом: это 8×8 спрайт у ЦЕНТРА окна. X = центр + 4·sway (покачивание ходьбы;
+// sway подмешан и в угол камеры — точка честно следит за прицелом), Y = центр − 2·recoil (подброс при
+// выстреле, таблица 12828). РАЗМЕР = 5 ступеней (тайлы 0x354..0x358) от scale = 0x10000/dist центральной
+// колонны z-буфера: sz = scale>>4, кламп 4. Цвета held-палитры 0x20D2: ядро CRAM 0x022E, кайма 0x0026.
 template<class Put>
 inline void drawLaserSight(Put put, int vx, int vy, int vw, int vh, const Inventory& inv, double fwdDist) {
-    if (inv.current != 10) return;                       // только laser aimed gun
-    double d = fwdDist; if (d < 0.3) d = 0.3;
-    int r = (int)(2.4 / d + 0.5); if (r < 1) r = 1; if (r > 7) r = 7;   // радиус по дистанции
-    int bx = (int)(std::sin(inv.bobPhase) * inv.bobAmt * 3.0);          // покачивание как у ствола
-    int by = (int)(std::fabs(std::sin(inv.bobPhase)) * inv.bobAmt * 2.0);
-    int cx = vx + vw / 2 + bx, cy = vy + vh / 2 + by;     // центр вида (куда смотрит ствол) + боб
-    for (int dy = -r; dy <= r; ++dy) for (int dx = -r; dx <= r; ++dx) {
-        if (dx * dx + dy * dy > r * r) continue;
-        bool core = (dx * dx + dy * dy) <= (r > 2 ? (r - 1) * (r - 1) : 0);
-        put(cx + dx, cy + dy, core ? 0xFFFF3030u : 0xFFFF9090u);        // ядро ярко-красное, кайма светлее
+    if (inv.current != 10) return;                       // только laser aimed gun (рисуется всегда, пока несём)
+    double d = fwdDist; if (d < 0.05) d = 0.05;
+    int scale = (int)(256.0 / d);                        // = 0x10000 / dist_units (dist_units = кл·256)
+    int sz = scale >> 4; if (sz > 4) sz = 4;             // ступень размера 0..4 (ZT 1266a-12682)
+    int us = vw / 320; if (us < 1) us = 1;               // масштаб региона (нативный px тайла)
+    int bx = (int)(std::sin(inv.bobPhase * 0.5) * inv.bobAmt * 4.0);   // ≈ 4·sway (12634 lsl+lsl)
+    int cx = vx + vw / 2 + bx * us, cy = vy + vh / 2 - 2 * fireRecoil(inv.fire) * us;   // 1249c: −2·recoil
+    const uint32_t CORE = 0xFFFF2424u, RIM = 0xFF6D2400u;   // CRAM 0x022E ярко-красный / 0x0026 тёмный
+    auto plot = [&](int gx, int gy, uint32_t c) {           // «пиксель тайла» = квадрат us×us
+        for (int yy = 0; yy < us; ++yy) for (int xx = 0; xx < us; ++xx)
+            put(cx + gx * us + xx, cy + gy * us + yy, c);
+    };
+    switch (sz) {
+        case 0:                                             // далеко: 1px ядро + крестик-кайма (тайл 0x354)
+            plot(0, 0, CORE); plot(-1, 0, RIM); plot(1, 0, RIM); plot(0, -1, RIM); plot(0, 1, RIM); break;
+        case 1: case 2:                                     // 3×3 квадрат (0x355 тусклее / 0x356 ярче)
+            for (int gy = -1; gy <= 1; ++gy) for (int gx = -1; gx <= 1; ++gx)
+                plot(gx, gy, ((gx == 0 && gy == 0) || sz == 2) ? CORE : RIM);
+            break;
+        case 3:                                             // 5×5 ромб (0x357)
+            for (int gy = -2; gy <= 2; ++gy) for (int gx = -2; gx <= 2; ++gx) {
+                int m = std::abs(gx) + std::abs(gy); if (m > 2) continue;
+                plot(gx, gy, m <= 1 ? CORE : RIM);
+            }
+            break;
+        default:                                            // в упор: 5×5 плотный (0x358)
+            for (int gy = -2; gy <= 2; ++gy) for (int gx = -2; gx <= 2; ++gx)
+                plot(gx, gy, (std::abs(gx) == 2 && std::abs(gy) == 2) ? RIM : CORE);
+            break;
     }
 }
 
@@ -575,25 +666,10 @@ inline void drawEnemyCountHud(uint32_t* frame, int FW, int FH, const GameData& g
     drawHudDigits(frame, FW, FH, gd.fontNum, 8, 72, 1, n, 2, yellow, yellow, black, black);
 }
 
-// ВСПЫШКА УРОНА (палитра d800/d98e): тинт кадра — КРАСНЕЕТ + БЕЛЕЕТ с интенсивностью ~ УРОНУ (не только
-// длительность). Большой урон → ярко-белая вспышка, малый → красноватая; затухает (p.flash убывает в updateActors).
-// ⭐ FAITHFUL (d98e крутит CRAM, не пиксели): вспышка в оригинале — модификация ПАЛИТРЫ (3-битные уровни),
-// значит цвета ВСЕГДА на нелинейной DAC-лестнице. Тинтим RGB, но СНАПИМ каждый канал к ближайшему MD DAC-уровню
-// {0,52,87,116,144,172,206,255} — вспышка «ступенчатая», как CRAM оригинала (а не гладкий off-ladder градиент).
-inline void applyDamageFlash(uint32_t* buf, int n) {
-    const PlayerState& p = player();
-    if (p.flash <= 0) return;
-    static const int DAC[8] = { 0, 52, 87, 116, 144, 172, 206, 255 };   // нелинейный DAC МД (как cramToArgb)
-    auto snap = [](int v) { int best = 0, bd = 1 << 30;                 // ближайший DAC-уровень (CRAM всегда на них)
-        for (int k = 0; k < 8; ++k) { int d = v - DAC[k]; if (d < 0) d = -d; if (d < bd) { bd = d; best = DAC[k]; } }
-        return best; };
-    double a = p.flash / 15.0; if (a > 1.0) a = 1.0;                     // интенсивность ~ урон (затухает с flash)
-    double amt = a * 0.6;                                                // сила тинта
-    int wht = (int)(a * 210);                                           // белизна по интенсивности (больш.урон → белее)
-    int tr = 255, tg = 30 + wht, tb = 30 + wht;                         // база красная + подмешать белый
-    for (int i = 0; i < n; ++i) {
-        uint32_t c = buf[i]; int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
-        r = snap(r + (int)((tr - r) * amt)); g = snap(g + (int)((tg - g) * amt)); b = snap(b + (int)((tb - b) * amt));
-        buf[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
-    }
-}
+// ⭐ВСПЫШКА УРОНА/СМЕРТИ — ИСТИНА (VBlank 0xB12, перечитан 2026-07-18): $FF1072 = СЫРОЕ CRAM-слово, каждый
+// кадр пишется в CRAM-слот 63 (@0x7E = линия 3, цвет 15) = ЧЁРНЫЙ ФОН КОКПИТА. 3D-сцена НЕ перекрашивается!
+// Урон (d87c): 15−(X>>7) ∈ 8..15 (красная рампа R=4..7), max-update. Смерть (1756): 0xFFF (белый) →
+// −0x110/кадр (B и G гаснут, 15 кадров до 0x00F = чистый красный) → −1/кадр до чёрного (ровно 30 кадров =
+// death-цикл 0x1e). Реализация: player().flashCram + перекраска чёрного фона кокпита в renderReference (main).
+// (Прежние applyDamageFlash*/ztFlashRecolor удалены — были основаны на неверном чтении d98e: 0x16e618 на
+//  самом деле ШРИФТ ЦИФР, d98e = отрисовка HP-цифр font|mask, НЕ вспышка.)

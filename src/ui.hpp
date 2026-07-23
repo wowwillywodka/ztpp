@@ -75,10 +75,18 @@ inline void drawTextFontC(FB& fb, int cx, int y, const char* s, uint32_t col, in
 
 // ---- Большой шрифт ZT (Font_grph 8×16, ЦВЕТНОЙ со своей палитрой): меню/настройки/сюжет/пауза ----
 inline const ZtFontBig* g_uiFontBig = nullptr;   // ставится из main после загрузки GameData
+// ⭐ПАЛИТРА ТЕКСТА ЭКРАНА ОПЦИЙ (ROM CRAM line3 0x1CDAE = gd.pauseTextPal): ESC-меню рисуется ею через palOv.
+inline const uint32_t* g_uiOptPal   = nullptr;   // 16 ARGB или nullptr (тогда родная жёлтая палитра Font_grph)
+// ⭐СТРЕЛКА-КУРСОР МЕНЮ ОПЦИЙ (ROM sub_10B4C8, спрайт 8×16 ARGB @gd.optArrow) или nullptr → векторный треугольник.
+inline const uint32_t* g_uiOptArrow = nullptr;
+// ⭐КУРСОР-СКОБКА ЭКРАНА ПАРОЛЯ (ROM тайл 0x243, 8×8 ARGB @gd.pwCursor) или nullptr → векторные уголки.
+inline const uint32_t* g_pwCursor = nullptr;
+inline int& menuSel() { static int s = 0; return s; }   // индекс пункта корневого ESC-меню (клавиатура + стрелка-курсор)
+inline bool& menuPreGame() { static bool p = false; return p; }   // ⭐OPTIONS открыты ДО геймплея (с титула) → показывать PASSWORD
 
-// mono=true → все непрозрачные пиксели глифа красятся в col (напр. БЕЛЫЙ заголовок паузы, ZT грузит Font_grph
-// с белой палитрой на экране карты); mono=false → родная палитра шрифта (жёлтая, для меню/сюжета).
-inline void drawCharBig(FB& fb, int x, int y, char ch, uint32_t col, int sc, bool mono = false) {
+// mono=true → все непрозрачные пиксели глифа красятся в col; palOv → рендер родными ИНДЕКСАМИ глифа через
+// ДРУГУЮ CRAM-линию (напр. пауза: глифы 57bc2 несут pal2 → 0x2132, gd.pauseTextPal); иначе родная жёлтая.
+inline void drawCharBig(FB& fb, int x, int y, char ch, uint32_t col, int sc, bool mono = false, const uint32_t* palOv = nullptr) {
     unsigned char uc = (unsigned char)ch;
     unsigned char up = (uc >= 'a' && uc <= 'z') ? (unsigned char)(uc - 32) : uc;  // Font_grph = заглавные
     if (!(g_uiFontBig && g_uiFontBig->have) || up >= 128 || !g_uiFontBig->supported[up]) {
@@ -89,18 +97,42 @@ inline void drawCharBig(FB& fb, int x, int y, char ch, uint32_t col, int sc, boo
         for (int rx = 0; rx < 8; ++rx) {
             uint8_t idx = g_uiFontBig->pix[up][ry][rx];
             if (idx == 0) continue;
-            uint32_t c = mono ? col : g_uiFontBig->pal[idx];   // mono: форс-цвет; иначе родная палитра
+            uint32_t c = palOv ? palOv[idx] : (mono ? col : g_uiFontBig->pal[idx]);
             for (int sy = 0; sy < sc; ++sy)
                 for (int sx = 0; sx < sc; ++sx)
                     fb.put(x + rx * sc + sx, y + ry * sc + sy, c);
         }
 }
 inline int  textWBig(const char* s, int sc) { int n = 0; while (s[n]) ++n; return n * 8 * sc; }
-inline void drawTextBig(FB& fb, int x, int y, const char* s, uint32_t col, int sc, bool mono = false) {
-    for (; *s; ++s) { drawCharBig(fb, x, y, *s, col, sc, mono); x += 8 * sc; }
+inline void drawTextBig(FB& fb, int x, int y, const char* s, uint32_t col, int sc, bool mono = false, const uint32_t* palOv = nullptr) {
+    for (; *s; ++s) { drawCharBig(fb, x, y, *s, col, sc, mono, palOv); x += 8 * sc; }
 }
-inline void drawTextBigC(FB& fb, int cx, int y, const char* s, uint32_t col, int sc, bool mono = false) {
-    drawTextBig(fb, cx - textWBig(s, sc) / 2, y, s, col, sc, mono);
+inline void drawTextBigC(FB& fb, int cx, int y, const char* s, uint32_t col, int sc, bool mono = false, const uint32_t* palOv = nullptr) {
+    drawTextBig(fb, cx - textWBig(s, sc) / 2, y, s, col, sc, mono, palOv);
+}
+// ⭐СТРЕЛКА-КУРСОР меню: аутентичный спрайт ОПЦИЙ 16×8 «────►» если декодирован, иначе жёлтая стрелка вправо.
+inline void drawMenuArrow(FB& fb, int x, int y, int sc) {
+    if (g_uiOptArrow) {
+        for (int ry = 0; ry < 8; ++ry)
+            for (int rx = 0; rx < 16; ++rx) {
+                uint32_t c = g_uiOptArrow[ry * 16 + rx];
+                if (!(c >> 24)) continue;                                 // прозрачный пиксель глифа
+                for (int sy = 0; sy < sc; ++sy)
+                    for (int sx = 0; sx < sc; ++sx)
+                        fb.put(x + rx * sc + sx, y + ry * sc + sy, c);
+            }
+    } else {                                                             // фолбэк (ZTU/др.): «──►» вправо
+        for (int ry = 3; ry <= 4; ++ry)                                  // древко
+            for (int rx = 0; rx < 11; ++rx)
+                for (int sy = 0; sy < sc; ++sy) for (int sx = 0; sx < sc; ++sx)
+                    fb.put(x + rx * sc + sx, y + ry * sc + sy, 0xFFF0D040u);
+        for (int ry = 0; ry < 8; ++ry) {                                 // остриё
+            int hw = (ry < 4 ? ry : 7 - ry);
+            for (int rx = 11 - hw; rx <= 11 + hw && rx < 16; ++rx)
+                for (int sy = 0; sy < sc; ++sy) for (int sx = 0; sx < sc; ++sx)
+                    fb.put(x + rx * sc + sx, y + ry * sc + sy, 0xFFF0D040u);
+        }
+    }
 }
 
 // ---- Примитивы ----
@@ -115,6 +147,25 @@ inline void fbDim(FB& fb, int pct) {                 // затемнить ве�
         p = 0xFF000000u | (r << 16) | (g << 8) | b;
     }
 }
+// ⭐ROM-ФЕЙДЫ (ZT 1f870 in / 1f93a out): каждый канал CRAM ползёт СТУПЕНЯМИ по 1 из 8 уровней за шаг.
+// t = 0..7: in → канал' = min(c3, t) (из чёрного к цели); out → канал' = max(0, c3 − t) (тёмные гаснут первыми).
+inline const int MD_DAC[8] = { 0, 52, 87, 116, 144, 172, 206, 255 };
+inline void fbFadeInMD(FB& fb, int t) {
+    if (t >= 7) return; if (t < 0) t = 0;
+    for (auto& p : fb.px) {
+        int r = ((p>>16)&0xFF)*7/255, g = ((p>>8)&0xFF)*7/255, b = (p&0xFF)*7/255;
+        if (r > t) r = t; if (g > t) g = t; if (b > t) b = t;
+        p = 0xFF000000u | ((uint32_t)MD_DAC[r]<<16) | ((uint32_t)MD_DAC[g]<<8) | (uint32_t)MD_DAC[b];
+    }
+}
+inline void fbFadeOutMD(FB& fb, int t) {
+    if (t <= 0) return; if (t > 7) t = 7;
+    for (auto& p : fb.px) {
+        int r = ((p>>16)&0xFF)*7/255 - t, g = ((p>>8)&0xFF)*7/255 - t, b = (p&0xFF)*7/255 - t;
+        if (r < 0) r = 0; if (g < 0) g = 0; if (b < 0) b = 0;
+        p = 0xFF000000u | ((uint32_t)MD_DAC[r]<<16) | ((uint32_t)MD_DAC[g]<<8) | (uint32_t)MD_DAC[b];
+    }
+}
 inline void fbBox(FB& fb, const Rect& r, uint32_t fill, uint32_t border) {
     fb.rect(r.x, r.y, r.w, r.h, fill);
     for (int i = 0; i < r.w; ++i) { fb.put(r.x + i, r.y, border); fb.put(r.x + i, r.y + r.h - 1, border); }
@@ -122,26 +173,40 @@ inline void fbBox(FB& fb, const Rect& r, uint32_t fill, uint32_t border) {
 }
 
 // ---- Геометрия меню (база 640x640, всё ×uiScale() для render-scale) ----
+// ⭐СТРУКТУРА МЕНЮ (2026-07-17): ESC → КОРЕНЬ (малый чёрный бокс, Font_grph как в ZT OPTIONS):
+// CONTINUE / NEW GAME / OPTIONS / EXIT / *DEBUG*. OPTIONS и DEBUG — ПОЛНОЭКРАННЫЕ чёрные (как ориг. OPTIONS).
+inline int& menuMode() { static int m = 0; return m; }       // 0=корень, 1=OPTIONS, 2=DEBUG, 3=SAVE, 4=LOAD, 5=ABOUT
 namespace menu {
-    const int NPAGE = 5;                                     // страниц настроек (движение/гейм/видео/точность/CONTROLS)
-    const int CTRL_PAGE = 4;                                 // страница переназначения клавиш
+    const int NPAGE_OPT = 4;                                 // OPTIONS: VIDEO / AUDIO / GAME / CONTROLS
+    const int NPAGE_DBG = 2;                                 // DEBUG: 2 страницы тумблеров/ползунков
+    const int CTRL_PAGE = 3;                                 // страница переназначения клавиш (в OPTIONS)
+    const int NROOT = 8;                                     // пунктов в корне (+ABOUT 2026-07-22)
     inline int K()  { return uiScale(); }                   // масштаб всего меню = render scale
+    // ⭐ЕДИНЫЙ РЕГИОН ПРЕЗЕНТАЦИИ: все экраны (игра/пауза/меню) живут в 640×448 (=320×224×2) по центру fb —
+    // «скукоженность» (меню-квадрат 640×640 против игры 640×448 при 4:3-блите) устранена.
+    inline int OY() { return (FBH - 448 * K()) / 2; }        // верх региона (96·K)
+    inline int RY(int y) { return OY() + y * K(); }          // y в 448-пространстве → fb
     inline int PX() { return 140 * K(); }
-    inline int PY() { return 40  * K(); }
+    inline int PY() { return RY(4); }
     inline int PW() { return 360 * K(); }
-    inline int PH() { return 560 * K(); }
-    inline int sliderY(int i) { static const int y[4] = {84, 144, 204, 264}; return y[i] * K(); }
-    inline Rect minusBtn(int i) { int k = K(); return {PX() + 20*k,  sliderY(i) + 18*k, 30*k, 26*k}; }
-    inline Rect bar(int i)      { int k = K(); return {PX() + 58*k,  sliderY(i) + 18*k, 240*k, 26*k}; }
-    inline Rect plusBtn(int i)  { int k = K(); return {PX() + 306*k, sliderY(i) + 18*k, 30*k, 26*k}; }
-    inline Rect tog(int j)      { int k = K(); return {PX() + 20*k, (320 + j*38)*k, PW() - 40*k, 30*k}; }
-    inline Rect pageBtn()       { int k = K(); return {PX() + 20*k, 458*k, PW() - 40*k, 30*k}; }
-    inline Rect saveBtn()       { int k = K(); return {PX() + 20*k, 496*k, PW() - 40*k, 30*k}; }
-    inline Rect quitBtn()       { int k = K(); return {PX() + 20*k, 526*k, PW() - 40*k, 22*k}; }
-    inline Rect resumeBtn()     { int k = K(); return {PX() + 20*k, 550*k, PW() - 40*k, 22*k}; }
-    inline Rect rscaleBtn()     { int k = K(); return {PX() + 20*k, sliderY(0), PW() - 40*k, 30*k}; }  // стр.3: render scale
-    inline Rect ctrlPresetBtn(int p){ int k = K(); return {PX() + (22 + p*84)*k, 62*k, 78*k, 26*k}; }   // CONTROLS: выбор пресета 0..3 (4 кнопки в ряд)
-    inline Rect ctrlKeyBtn(int i){ int k = K(); return {PX() + 196*k, (100 + i*28)*k, 148*k, 26*k}; }   // CONTROLS: кнопка-клавиша ряда i (12 действий)
+    inline int PH() { return 440 * K(); }
+    inline Rect rootBox()      { int k = K(); return {FBW/2 - 130*k, RY(50), 260*k, 356*k}; }   // 8 пунктов (ABOUT)
+    inline Rect rootBtn(int i) { int k = K(); return {FBW/2 - 110*k, RY(50 + 44 + i*38), 220*k, 34*k}; }
+    inline int sliderY(int i) { static const int y[4] = {44, 92, 140, 188}; return RY(y[i]); }
+    inline Rect minusBtn(int i) { int k = K(); return {PX() + 20*k,  sliderY(i) + 18*k, 30*k, 24*k}; }
+    inline Rect bar(int i)      { int k = K(); return {PX() + 58*k,  sliderY(i) + 18*k, 240*k, 24*k}; }
+    inline Rect plusBtn(int i)  { int k = K(); return {PX() + 306*k, sliderY(i) + 18*k, 30*k, 24*k}; }
+    inline Rect tog(int j)      { int k = K(); return {PX() + 20*k, RY(238 + j*32), PW() - 40*k, 26*k}; }
+    inline Rect pwBtn()         { int k = K(); return {PX() + 20*k, RY(344), PW() - 40*k, 22*k}; }   // ⭐OPTIONS (пред-геймплей): ENTER PASSWORD
+    inline Rect pageBtn()       { int k = K(); return {PX() + 20*k, RY(368), PW() - 40*k, 22*k}; }
+    inline Rect saveBtn()       { int k = K(); return {PX() + 20*k, RY(392), PW() - 40*k, 22*k}; }
+    inline Rect quitBtn()       { int k = K(); return {PX() + 20*k, RY(416), PW() - 40*k, 15*k}; }
+    inline Rect resumeBtn()     { int k = K(); return {PX() + 20*k, RY(432), PW() - 40*k, 15*k}; }
+    inline Rect rscaleBtn()     { int k = K(); return {PX() + 20*k, sliderY(0), PW() - 40*k, 24*k}; }  // VIDEO: render scale
+    inline Rect ctrlPresetBtn(int p){ int k = K(); return {PX() + (22 + p*84)*k, RY(42), 78*k, 24*k}; }   // CONTROLS: пресеты
+    // CONTROLS: 12 клавиш — шаг 22 / высота 18 (было 24/22: последние строки налезали на PASSWORD/PAGE; юзер: «не влезают»)
+    inline Rect ctrlKeyBtn(int i){ int k = K(); return {PX() + 196*k, RY(60 + i*22), 148*k, 18*k}; }
+    inline Rect slotBtn(int i)  { int k = K(); return {PX() + 20*k, RY(50 + i*50), PW() - 40*k, 42*k}; }  // SAVE/LOAD: слоты
 }
 
 enum MenuAction {
@@ -152,17 +217,33 @@ enum MenuAction {
     MA_FL_DEC, MA_FL_INC, MA_FL_BAR,     // 10..12 лимит кадров
     MA_ES_DEC, MA_ES_INC, MA_ES_BAR,     // 13..15 СКОРОСТЬ ВРАГОВ
     MA_WA_DEC, MA_WA_INC, MA_WA_BAR,     // замедление анимации стен
-    MA_SK_DEC, MA_SK_INC, MA_SK_BAR,     // лестница: текстурный скос
-    MA_SD_DEC, MA_SD_INC, MA_SD_BAR,     // лестница: сила спуска
     MA_MS_DEC, MA_MS_INC, MA_MS_BAR,     // чувствительность мыши
     MA_REND, MA_NOCLIP, MA_REFERENCE, MA_ENEMIES, MA_MAP, MA_MAPIDS, MA_PAUSEFULLMAP,
     MA_ASPECT, MA_FILTER, MA_FULLSCREEN, MA_RSCALE,      // СТР.3 видео: аспект / фильтр / фуллскрин / render scale
     MA_PHYSICS, MA_GAMEDIST, MA_INVUNLIM, MA_SND,        // СТР.4 точность: физика / дистанция / инвентарь / звук вкл-выкл
     MA_SV_DEC, MA_SV_INC, MA_SV_BAR,                     // громкость звука
+    MA_ET_DEC, MA_ET_INC, MA_ET_BAR,                     // масштаб тик-таймеров врагов (enemyTimerScale)
+    MA_VP_DEC, MA_VP_INC, MA_VP_BAR,                     // темп озвучки сообщений (voicePace, 0=выкл)
+    MA_MUSIC,                                            // музыка вкл/выкл (заставки/лифт)
     MA_PAGE, MA_SAVE, MA_QUIT, MA_RESUME,
+    MA_NEWGAME, MA_OPTIONS, MA_DEBUG, MA_BACK,           // ⭐корневое ESC-меню / возврат из подменю
+    MA_SAVEGAME, MA_LOADGAME,                            // ⭐корень: открыть меню слотов SAVE/LOAD
+    MA_FPSINV, MA_SB_DEC, MA_SB_INC, MA_SB_BAR,          // ⭐fps-инвариантность + sim base fps
+    MA_INTRES,                                           // ⭐эксперимент: внутр. разрешение вида (SSAA 1..4)
+    MA_PASSWORD,                                         // ⭐корень ESC: открыть экран ввода пароля (ROM 58054)
+    MA_ABOUT,                                            // ⭐корень ESC: экран ABOUT (версия/инфо о порте)
+    MA_SLOT = 240,                                       // MA_SLOT + слот (0..5) в меню SAVE/LOAD
     MA_PRESET = 200,      // CONTROLS: MA_PRESET + preset (0..3) — выбор пресета управления
     MA_KEYBIND = 220      // CONTROLS: MA_KEYBIND + action (0..GA_COUNT-1) — клик по кнопке-клавише действия
 };
+
+// Действие корневого ESC-меню по индексу пункта (0..NROOT-1) — общее для клика и клавиатуры (menuSel).
+// (PASSWORD в корне НЕТ — он только в пред-геймплейных OPTIONS, как в оригинале.)
+inline MenuAction rootAction(int i) {
+    static const MenuAction A[menu::NROOT] = {
+        MA_RESUME, MA_NEWGAME, MA_SAVEGAME, MA_LOADGAME, MA_OPTIONS, MA_ABOUT, MA_QUIT, MA_DEBUG };
+    return (i >= 0 && i < menu::NROOT) ? A[i] : MA_NONE;
+}
 
 // Хит-тест клика (с учётом СТРАНИЦЫ). Для *_BAR возвращает долю 0..1 в frac.
 MenuAction menuHit(int mx, int my, int page, double& frac);   // ui.cpp

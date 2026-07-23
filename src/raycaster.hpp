@@ -35,7 +35,7 @@ inline bool   rcUpdateDoors(int floor, double px, double py, const Level& lvl) {
             bool onCell = (cx == x && cy == y);          // игрок СТОИТ на клетке двери (ZT step-on)
             int k = doorKey(floor, x, y);
             double o = m.count(k) ? m[k] : 0.0, prev = o;
-            o += (onCell ? 0.20 : -0.10);                // открыть на клетке (быстро), иначе закрыть (анимация)
+            o += (onCell ? 0.20 : -0.10) * simDt();      // ⭐фаза в ROM-тиках (fps-инвариантно)
             if (o < 0) o = 0; if (o > 1) o = 1;
             if (onCell && prev < 0.01 && o > 0.0) justOpened = true;   // фронт открытия двери
             m[k] = o;
@@ -102,8 +102,12 @@ inline bool itemBillboardForCt(uint8_t ct, DecorDef& d) {
     else if (ct == 0x36)           tile = 17;           // ПУЛЬС-ЛАЗЕР — пикап ct0x36 (хендлер 0x115ea → 0x110bbe → tile17)
     else if (ct == 0x82)           tile = 60;           // ОГНЕМЁТ — пикап ct0x82 (хендлер 0x115cc → 0x1161be → tile60)
     else return false;
-    uint8_t h = 4, w = 4;                                // ~S/4 квадрат (позиционер 0x11a52)
-    if (tile == 15) { w = 6; h = 3; }                   // FireSuit — широкий 2:1
+    // ⭐РАЗМЕР пикапа (2026-07-15, VERIFIED дампом+юзером): ширина по cwd (мир-аспект = ROM X-растяжка дисплея ×2). ROM eda0-хелперы:
+    //   обычные $11a52 s/4×s/4 → экран ШИРОКИЙ 2:1 (width=Sd/2 cwd, height=Sd/4); БИОСКАНЕР(0x19)/ОГНЕМЁТ(0x82) $11a3a s/4×s/2 → экран
+    //   КВАДРАТ (height вдвое = Sd/2 компенсирует растяжку); огнезащ.костюм(0x1d) 0x11608 s/2×s/4 → экран ШИРОКИЙ 4:1 (width=Sd).
+    uint8_t h = 4, w = 4;                                // обычные (огнетушитель/аптечка/оружие/...): ШИРОКИЙ 2:1 на экране ($11a52)
+    if (ct == 0x19 || ct == 0x82) h = 8;                // ⭐биосканер/огнемёт: h вдвое → КВАДРАТ на экране (ZT $11a3a)
+    else if (ct == 0x1d)          w = 8;                // огнезащ.костюм: w вдвое → ШИРОКИЙ 4:1 (ZT 0x11608)
     int8_t topOff = (int8_t)(8 - h);                    // НИЗ на полу (горизонт + S/2 = +8/16)
     d = {{{tile, topOff, h, w, 0}}, 1};
     return true;
@@ -115,12 +119,38 @@ inline bool (*&pickupHiddenFn())(int, int, int) { static bool (*p)(int, int, int
 // Заполняет updateShots (weapons.hpp) каждый кадр; рисуются в drawDecorBillboards. Доли в 1/16 S.
 struct WorldFx { double wx, wy; int floor; uint8_t tile; int8_t topOff16; uint8_t hFrac16, wFrac16;
                  int sprId = -1; uint8_t efr = 0; bool corpse = false; float zlift = 0;
-                 uint8_t dir = 0, animSt = 0, variant = 0; bool foam = false; bool burned = false; };  // sprId≥0 → спрайт врага; zlift подъём; animSt 0walk/1fire/2hit/3death; foam пена; burned обугленный труп
+                 uint8_t dir = 0, animSt = 0, variant = 0; bool foam = false; bool burned = false; uint8_t atkPose = 0; bool overlay = false;
+                 bool wide = false; };  // wide=огонь: ширина по cwd (X-растяжка дисплея ×2, ROM eda0), а не квадрат Sd. overlay=поверх стен (сейчас не исп.)
 inline std::vector<WorldFx>& worldFx() { static std::vector<WorldFx> v; return v; }
 
 #include "tuning.hpp"   // gameDist/playerPhysics/gameDistOctagonal — общие тумблеры reference-точности
 
 #include "camera.hpp"   // struct Camera (вынесена в отдельный заголовок)
+
+// ── СОЛИДНЫЙ ДЕКОР (ROM a1d2→a33a/a38c, VERIFIED): цилиндр-выталкивание игрока из ЦЕНТРА клетки декора.
+// Мелкие (0x5D лампа/0x5F стул/0x60,0x76 столбы): dist<0x28 → pos = центр + d·0x30/(dist+1).
+// Крупные (0x37,0x5C деревья/0x5E стол/0x61 столб): dist<0x58 → pos = центр + d·0x60/(dist+1).
+// dist = (|dx|+|dy|+max)/2 (d7c0); потолочные лампы/вентилятор (0x62-64,0x75,0x78) хендлера НЕ имеют.
+inline void rcDecorPush(Camera& c, const Level& lvl) {
+    int cx = (int)c.px, cy = (int)c.py;
+    if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return;
+    uint8_t ct = lvl.cellType(c.floor, cx, cy);
+    int thr, r;
+    switch (ct) {
+        case 0x5D: case 0x5F: case 0x60: case 0x76: thr = 0x28; r = 0x30; break;
+        case 0x37: case 0x5C: case 0x5E: case 0x61: thr = 0x58; r = 0x60; break;
+        default: return;
+    }
+    int px = (int)std::lround(c.px * 256.0), py = (int)std::lround(c.py * 256.0);
+    int ctrX = (px & ~0xFF) | 0x80, ctrY = (py & ~0xFF) | 0x80;
+    int dx = px - ctrX, dy = py - ctrY;
+    int ax = std::abs(dx), ay = std::abs(dy);
+    int dist = (ax + ay + (ax > ay ? ax : ay)) >> 1;            // approx-дистанция d7c0
+    if (dist >= thr) return;
+    int nd = dist + 1;
+    px = ctrX + dx * r / nd; py = ctrY + dy * r / nd;           // divs = trunc к нулю (как ROM)
+    c.px = px / 256.0; c.py = py / 256.0; c.pxI = px; c.pyI = py;
+}
 
 // Кэш метатекстур стены 128x64 (4x2 тайла 32x32). Ключ — индекс метатекстуры эпизода.
 // Раскладка: тайл i -> col=i/2, row=i%2 (верх=0,2,4,6 / низ=1,3,5,7) — как _build_metatexture.
@@ -567,7 +597,9 @@ static const uint16_t STAIR_PROF[18][2][4] = {
     {{0x0040,0x407f,0x4040,0x7f00},{0x80c0,0xc000,0xc0c0,0x0080}},  // 0x4B
 };
 // ==0-СЛОВА cat4 (beq→ФИКСИРОВАННОЕ слово, когда -0x6e92==0 = кабина ровно на этаже, ДО спуска):
-// ct 0x11@9594 / 0x3b@967c / 0x43@9764 / 0x4b@984c. Порядок граней [N,W,E,S] (как STAIR_PROF).
+// ct 0x11@9594 / 0x3b@967c / 0x43@9764 / 0x4b@984c. Порядок ХРАНЕНИЯ [N,S,W,E] (как STAIR_PROF:
+// N@-6e8c=hi(L1), S@-6e8a=lo(L1), W@-6e86=lo(L2), E@-6e88=hi(L2)); доступ через ремап F2A.
+// Адверсарно сверено с сырыми словами 9594 (2026-07-16): 0x11 N=40c0 S=0000 E=0040 W=c000 ✓.
 static const uint16_t STAIR_PROF_ZERO4[4][4] = {
     {0x40c0,0x0000,0xc000,0x0040},  // 0x11 @9594: L1=$40c00000 L2=$0040c000
     {0x0000,0x40c0,0x0040,0xc000},  // 0x3B @967c: L1=$000040c0 L2=$c0000040
@@ -623,23 +655,33 @@ inline bool stairProfile(uint8_t ct, int face, int cabinSign, int dx, int dy, in
 // 9d4a = СИНИЙ idx1 (площадки/вход/area; источник 0xd074 = сплошной idx1). Ребро рисуется поверх стен →
 // иллюзия пол/потолок шахты. Геометрия извлечена из всех ~30 хендлеров (axis+знак → ближнее ребро).
 // Возвращает 1=синий, 2=градиент, 0=нет. Ребро (целочисл. углы клетки) в ex0,ey0..ex1,ey1.
-inline int shaftSeg(uint8_t ct, int cx, int cy, int camCX, int camCY,
-                    int& ex0, int& ey0, int& ex1, int& ey1) {
-    int edge = -1, type = 0;     // edge: 0=N(y=cy) 1=S(y=cy+1) 2=W(x=cx) 3=E(x=cx+1)
+// КАНОНИЧЕСКОЕ РЕБРО+ТИП сегмента транзит-клетки (сверено со ВСЕМИ 16 хендлерами 988a-9a4a, 2026-07-16):
+// каждый celltype пакует ровно ОДНО фиксированное ребро (не «ближнее к камере» вообще — оно задано
+// хендлером и совпадает с направлением его строгого гейта tst d0/d1). edge: 0=N(y=cy) 1=S(y=cy+1)
+// 2=W(x=cx) 3=E(x=cx+1). Возврат: 0=нет сегмента, 1=СИНИЙ idx1 (9d4a), 2=ГРАДИЕНТ (9d42).
+inline int segEdgeType(uint8_t ct, int& edge) {
+    edge = -1;
     switch (ct) {
-        // ГРАДИЕНТ (9d42) — направленные клетки шахты лифта/лестницы
-        case 0x12: case 0x14: case 0x55: case 0x56: case 0x57: edge = 1; type = 2; break; // South
-        case 0x3c: case 0x3e: case 0x59: case 0x5a: case 0x5b: edge = 0; type = 2; break; // North
-        case 0x44: case 0x46: case 0x32: case 0x33: case 0x34: edge = 2; type = 2; break; // West
-        case 0x4c: case 0x4e: case 0x51: case 0x52: case 0x53: edge = 3; type = 2; break; // East
-        // СИНИЙ (9d4a) — площадки/вход (area/landing)
-        case 0x3d: case 0x58: edge = 1; type = 1; break; // South
-        case 0x13: case 0x54: edge = 0; type = 1; break; // North
-        case 0x45: case 0x31: edge = 3; type = 1; break; // East
-        case 0x4d: case 0x50: edge = 2; type = 1; break; // West
+        // ГРАДИЕНТ (9d42) — ризы лестницы / кабина-стойки лифта
+        case 0x12: case 0x14: case 0x55: case 0x56: case 0x57: edge = 1; return 2; // S (988a: dy<0 / 99f2)
+        case 0x3c: case 0x3e: case 0x59: case 0x5a: case 0x5b: edge = 0; return 2; // N (98aa: dy>0 / 9a2e)
+        case 0x44: case 0x46: case 0x32: case 0x33: case 0x34: edge = 2; return 2; // W (98c6: dx>0 / 997a)
+        case 0x4c: case 0x4e: case 0x51: case 0x52: case 0x53: edge = 3; return 2; // E (98e2: dx<0 / 99b6)
+        // СИНИЙ (9d4a) — площадки/вход лестницы + area лифта
+        case 0x3d: case 0x58: edge = 1; return 1; // S (991e: dy<0 / 9a4a)
+        case 0x13: case 0x54: edge = 0; return 1; // N (9902: dy>0 / 9a12)
+        case 0x45: case 0x31: edge = 3; return 1; // E (993e: dx<0 / 9996)
+        case 0x4d: case 0x50: edge = 2; return 1; // W (995e: dx>0 / 99d6)
         default: return 0;
     }
-    int dx = cx - camCX, dy = cy - camCY;          // ребро рисуется, только если ОБРАЩЕНО к камере (near-edge)
+}
+
+inline int shaftSeg(uint8_t ct, int cx, int cy, int camCX, int camCY,
+                    int& ex0, int& ey0, int& ex1, int& ey1) {
+    int edge = -1;
+    int type = segEdgeType(ct, edge);              // канон. ребро+тип по celltype (988a-9a4a)
+    if (type == 0) return 0;
+    int dx = cx - camCX, dy = cy - camCY;          // направленный гейт хендлера (строгий tst d0/d1)
     if (edge == 0 && !(dy > 0)) return 0;          // North-ребро видно, если клетка южнее камеры
     if (edge == 1 && !(dy < 0)) return 0;          // South — клетка севернее
     if (edge == 2 && !(dx > 0)) return 0;          // West — клетка восточнее
@@ -846,7 +888,7 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
                                 const ShadeRamps& ramps, bool doShade, int drawDist,
                                 Put put, WallCloser wallCloser, SX sx, ColH colH) {
     const int ccx = (int)cam.px, ccy = (int)cam.py;
-    struct Item { double f, l; DecorDef d; bool square = false; int sprId = -1; uint8_t efr = 0; bool corpse = false; float zlift = 0; uint8_t dir = 0, animSt = 0, variant = 0; bool foam = false; bool burned = false; };  // враг: zlift; dir/animSt; foam пена; burned обугл.
+    struct Item { double f, l; DecorDef d; bool square = false; int sprId = -1; uint8_t efr = 0; bool corpse = false; float zlift = 0; uint8_t dir = 0, animSt = 0, variant = 0; bool foam = false; bool burned = false; uint8_t atkPose = 0; bool overlay = false; };  // overlay=огонь поверх стен
     std::vector<Item> items;
     for (int y = ccy - drawDist; y <= ccy + drawDist; ++y) {
         if (y < 0 || y >= Level::H) continue;
@@ -854,6 +896,20 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
             if (x < 0 || x >= Level::W) continue;
             uint8_t ct = lvl.cellType(cam.floor, x, y);
             DecorDef dd;
+            // ⭐ДЕКОР-ТРУП / BURNT-REMAINS как окружение (ZT celltype 0x2C/0x6C-0x74 = corpse-anim врага, 0x35 = burnt-remains;
+            // хендлеры 0x11772-0x11854 → jmp 1bd72). Рисуется тем же enemy-спрайтом (death-anim / g_burntRemains), что и динамич.труп.
+            int corpseSlot = decorCorpseSlot(ct); bool burntDecor = decorBurntCt(ct);
+            if (corpseSlot >= 0 || burntDecor) {
+                int slot = burntDecor ? 0 : corpseSlot;
+                if (slot < 0 || !g_enemyAnim[slot].ok) continue;
+                double rx0 = (x + 0.5) - cam.px, ry0 = (y + 0.5) - cam.py;
+                double f0 = rx0 * cam.dirX + ry0 * cam.dirY; if (f0 < 0.05) continue;
+                double l0 = ry0 * cam.dirX - rx0 * cam.dirY;
+                DecorDef dummy = {{{0, 0, 1, 1, 0}}, 1};
+                // sprId=slot, animSt=3(death/corpse-anim); burnt → burned=true (спрайт заменится на g_burntRemains). efr=0 статик.
+                items.push_back({f0, l0, dummy, false, slot, 0, false, 0.f, 0, (uint8_t)(burntDecor ? 0 : 3), 0, false, burntDecor, 0, false});
+                continue;
+            }
             if (!decorForCt(ct, dd)) {                        // не декор → может быть пикап оружия/предмета
                 if (!itemBillboardForCt(ct, dd)) continue;
                 if (pickupHiddenFn() && pickupHiddenFn()(cam.floor, x, y)) continue;  // уже подобран
@@ -862,7 +918,7 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
             double f = rx * cam.dirX + ry * cam.dirY;          // forward (как faProject)
             if (f < 0.05) continue;                            // позади камеры / слишком близко
             double l = ry * cam.dirX - rx * cam.dirY;          // lateral
-            items.push_back({f, l, dd});
+            items.push_back({f, l, dd});                       // ширина по cwd (мир-аспект = ROM X-растяжка дисплея ×2)
         }
     }
     // Динамические эффекты стрельбы (взрывы/снаряды): мировые позиции → билборды того же прохода.
@@ -873,7 +929,7 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
         if (f < 0.05) continue;
         double l = ry * cam.dirX - rx * cam.dirY;
         DecorDef d = {{{fx.tile, fx.topOff16, fx.hFrac16, fx.wFrac16, 0}}, 1};
-        items.push_back({f, l, d, true, fx.sprId, fx.efr, fx.corpse, fx.zlift, fx.dir, fx.animSt, fx.variant, fx.foam, fx.burned});   // эффекты/враги/пена/обугл.
+        items.push_back({f, l, d, !fx.wide, fx.sprId, fx.efr, fx.corpse, fx.zlift, fx.dir, fx.animSt, fx.variant, fx.foam, fx.burned, fx.atkPose, fx.overlay});   // square=!wide: огонь по cwd (×2), эффекты/враги квадрат Sd
     }
     // painter's: дальние раньше, ближние поверх (z-тест только против стен)
     std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.f > b.f; });
@@ -939,8 +995,15 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
                 uint8_t bd = it.dir < (uint8_t)A.walkBDirs ? it.dir : 0;
                 if (!A.walkB[bd].empty()) lst = &A.walkB[bd];
             }
-            if (it.animSt == 1 && !A.fire.empty())  lst = &A.fire;
-            else if (it.animSt == 2 && !A.hit.empty())   lst = &A.hit;
+            if (it.animSt == 1) {                                          // огонь: fire2 по atkPose, иначе DIRECTIONAL (ROM 1ba04)
+                lst = (it.atkPose && !A.fire2.empty()) ? &A.fire2
+                    : (A.fireDirs > 0 && it.dir < (uint8_t)A.fireDirs && !A.fireD[it.dir].empty()) ? &A.fireD[it.dir]
+                    : (!A.fire.empty() ? &A.fire : lst);
+            }
+            else if (it.animSt == 2) {                                     // стаггер: DIRECTIONAL (facing=velocity, как ROM $2a/$2c)
+                if (A.hitDirs > 0 && it.dir < (uint8_t)A.hitDirs && !A.hitD[it.dir].empty()) lst = &A.hitD[it.dir];
+                else if (!A.hit.empty()) lst = &A.hit;
+            }
             else if (it.animSt == 3 && !A.death.empty()) lst = &A.death;
             else if (it.animSt == 4) {                                     // Hydaca лазанье: DIRECTIONAL вертик. поза (6) по ракурсу, иначе одиночная
                 if (A.climbDirs > 0 && it.dir < (uint8_t)A.climbDirs && !A.climbDir[it.dir].empty()) lst = &A.climbDir[it.dir];
@@ -951,9 +1014,22 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
                 else if (it.dir == 2 && !A.fallDead.empty()) lst = &A.fallDead;
                 else if (!A.climb.empty())                   lst = &A.climb;
             }
+            else if (it.animSt == 6 && !A.morph.empty())       lst = &A.morph;        // Sgt морф (ZT 1b628, ступени по efr)
+            else if (it.animSt == 7 && !A.pretendLie.empty())  lst = &A.pretendLie;   // Boss3 притворство: лежит (a10)
+            else if (it.animSt == 8 && !A.pretendJerkA.empty())lst = &A.pretendJerkA; // Boss3 дёрг (a7, 15/16)
+            else if (it.animSt == 9 && !A.pretendJerkB.empty())lst = &A.pretendJerkB; // Boss3 дёрг-альт (a8, 1/16)
+            else if (it.animSt == 10) {                                              // Revenant падение (ZT 1adfe): efr = стадия 0..3
+                int fi = it.efr > 3 ? 3 : it.efr;
+                if (!A.revFall[fi].empty()) lst = &A.revFall[fi];
+            }
+            // ⭐СПАЛЁННЫЙ труп → BURNT REMAINS спрайт (ZT 1b8d8, банк 0x1cb96a), НЕ обычный труп/перекраска.
+            // burned=true в worldFx ставится ТОЛЬКО у AT_CORPSE (живой AT_ENEMY его не передаёт), поэтому it.corpse
+            // (=!hasDeath, костыль сплющивания) тут не нужен — иначе горючие враги С death-анимацией (Imp/FH/Hydaca) не заменялись бы.
+            if (it.burned && !g_burntRemains.empty()) lst = &g_burntRemains;
             auto& frames = *lst;
             if (frames.empty()) continue;
-            const EnemySprite& es = frames[it.efr < frames.size() ? it.efr : 0];
+            size_t efi = it.efr; if (it.animSt == 10) efi = 0;   // revFall: стадия УЖЕ выбрала аним → внутри суб0
+            const EnemySprite& es = frames[efi < frames.size() ? efi : 0];
             if (!es.ok) continue;
             // РАЗМЕР ПО ТАЙЛ-СЕТКЕ спрайта (ИСПРАВЛЕН аспект): real px = Wтайл·32 × Hтайл·32 = es.w × es.h →
             // экранные W/H пропорц. РЕАЛЬНЫМ пикселям, единый скейл K (0.375·S держит гуманоида 1×2 на ~0.75·S).
@@ -965,17 +1041,24 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
             if (faSpriteDiscScale()) {
                 int scaleI = (int)(faSpriteScaleC() / fS);                  // ZT invDepth = 64/F, ЦЕЛЫЙ
                 if (scaleI < 1) scaleI = 1; if (scaleI > 0x12c) scaleI = 0x12c;
-                int hstep = (6 * scaleI) >> 4;                             // ZT высота эталона (drawH=6): ЦЕЛОЕ, огрублено /16 → ступени
-                if (hstep < 1) hstep = 1;
-                // ZT-ДОЛЯ вида: враг = hstep/80 высоты 3D-вида (человек f=1: 24/80=0.3). Порт рисовал 0.75 (2.5× крупнее).
-                double base = hstep * (SH / 80.0) * faSpriteSizeK();       // 1.0 = ZT-точно; было SH/32 (=2.5× больше)
-                height = base * (es.h / 64.0);                             // аспект по tiles (одобрен): гуманоид 1:2, пёс квадрат, Hydaca широкая
-                width  = base * (es.w / 64.0);
+                // ⭐ROM-ТОЧНАЯ ФОРМУЛА (1bcaa): на ТАЙЛ width=drawW·scale>>5, height=drawH·scale>>4; спрайт = Wт×Hт тайлов.
+                //   ⚠drawW/drawH — PER-SPRITE поля кадра (ROM +2/+3): ГУМАНОИДЫ 6, Dog/БОССЫ 8 → Dog/боссы КРУПНЕЕ человека.
+                //   Старый порт брал жёстко 6 + нормировал по tile-размеру (es.h/64) → Dog вдвое мельче, хотя в ROM drawH=8>6.
+                int dW = es.drawW > 0 ? es.drawW : 6, dH = es.drawH > 0 ? es.drawH : 6;
+                int wtile = (dW * scaleI) >> 5; if (wtile < 1) wtile = 1;  // ширина 1 тайла на экране (>>5)
+                int htile = (dH * scaleI) >> 4; if (htile < 1) htile = 1;  // высота 1 тайла на экране (>>4 → выше)
+                int Wt = es.w / 32, Ht = es.h / 32; if (Wt < 1) Wt = 1; if (Ht < 1) Ht = 1;   // тайлов по ширине/высоте
+                // ⚠НОРМИРОВКА на 2-тайловый эталон-гуманоид (·0.5 по H) → K=2.1 (существующий ini) даёт ТОТ ЖЕ гуманоид, что
+                // старая формула (hstep·es.h/64). Dog/боссы (drawH=8, Wт/Hт≠гуманоида) получают верный ОТНОСИТЕЛЬНЫЙ размер.
+                double unit = (SH / 80.0) * faSpriteSizeK();               // ZT-доля вида (K=2.1 совместим со старым ini)
+                height = htile * Ht * unit * 0.5;                          // Hтайлов·(drawH·scale>>4)·0.5 (норм. на эталон 2 тайла)
+                width  = wtile * Wt * unit;                                // Wтайлов·(drawW·scale>>5) (×2 дисплей ÷2 норм. = ×1)
             } else {
                 double K = 0.375 * S;                                       // старый плавный float-скейл
                 height = (es.h / 32.0) * K; width = (es.w / 32.0) * K;
             }
-            if (it.corpse) { height *= 0.42; width *= 1.25; }            // труп: сплющен в кучу на полу
+            if (it.corpse) { height *= 0.42; width *= 1.25; }            // ОБЫЧНЫЙ труп (без death-anim) сплющен в кучу; burnt-remains НЕ трогаем —
+            // у него свои drawW=7/drawH=6 (ROM 1cb96a) → размер уже задан формулой 1bcaa (было ×0.42 → неверно, юзер: «не соответствует оригиналу»)
             double bottomY = hz + S * 0.5 - it.zlift * S * 0.9;     // ноги на полу; zlift>0 = поднят к потолку (Hydaca «на стене/потолке»)
             double topY = bottomY - height;
             double xa = cx - width * 0.5;
@@ -1006,10 +1089,8 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
                     } else {
                         c = es.argb[(size_t)sv * es.w + su];
                         if (c == 0) continue;
-                        if (it.burned) {                                 // ОБУГЛЕННЫЙ труп: тёмно-серый силуэт
-                            int g = ((((c>>16)&0xFF)+((c>>8)&0xFF)+(c&0xFF))/3) / 4 + 12;
-                            c = 0xFF000000u | ((g+8)<<16) | (g<<8) | g;
-                        } else if (fdim < 1.0) { int r=(c>>16)&0xFF,g=(c>>8)&0xFF,b=c&0xFF;
+                        // ⭐БЕЗ перекраски: спалённый труп = ОТДЕЛЬНЫЙ спрайт burnt-remains (0x1cb96a, свои цвета), НЕ тонирование enemy.
+                        if (fdim < 1.0) { int r=(c>>16)&0xFF,g=(c>>8)&0xFF,b=c&0xFF;
                             c = 0xFF000000u | ((int)(r*fdim)<<16) | ((int)(g*fdim)<<8) | (int)(b*fdim); }
                     }
                     put(ix, iy, c);
@@ -1034,7 +1115,7 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
                        sbandD += faSpriteBandAdj(); if (sbandD < 0) sbandD = 0; if (sbandD > 11) sbandD = 11; }
         for (int si = 0; si < it.d.count; ++si) {
             const DecorSprite& sp = it.d.s[si];
-            uint8_t tnum = sp.tile; bool hflip = false;
+            uint8_t tnum = sp.tile; bool hflip = (it.variant & 1) != 0;  // ⭐worldFx-эффект (кровь): гориз.флип по $3e&1 (ZT eda0 -$6f78); level-декор variant=0
             if (sp.anim == 1) {                                       // вентилятор: 4 кадра (tile/tile+1 ± hflip)
                 int ph = (frame >> 3) & 3;
                 if (ph == 1 || ph == 2) tnum = sp.tile + 1;
@@ -1055,7 +1136,7 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
             if (iy0 < 0) iy0 = 0; if (iy1 > SH - 1) iy1 = SH - 1;
             obj.decode(tnum, tile);
             for (int ix = ix0; ix <= ix1; ++ix) {
-                if (wallCloser(ix, f)) continue;                      // за стеной
+                if (!it.overlay && wallCloser(ix, f)) continue;       // за стеной (огонь-overlay НЕ клипится — ROM eda0 рисует поверх, юзер: в тесноте не обрезалось)
                 int su = (int)((ix + 0.5 - xa) / width * 32.0);  if (su < 0) su = 0; if (su > 31) su = 31;
                 if (hflip) su = 31 - su;
                 const bool hiNib = !(ix & 1);
@@ -1136,9 +1217,9 @@ void renderFPS(PutFn&& put, int W, int H, const Level& lvl, const Palette& wallP
                 mapY < camCYd - ddist || mapY > camCYd + ddist) { culled = true; break; }  // за дальностью
             uint8_t ctc = lvl.cellType(cam.floor, mapX, mapY);
             uint8_t cid = lvl.cellId(cam.floor, mapX, mapY);
-            if (ctc == 6 || ctc == 7) {
-                // ДВЕРЬ: панель в ЦЕНТРЕ ячейки. ct6 гориз. (y=mapY+0.5), ct7 верт. (x=mapX+0.5).
-                bool horiz = (ctc == 6);
+            if (cellRendersDoor(ctc)) {
+                // ДВЕРЬ: панель в ЦЕНТРЕ ячейки. гориз (0x06/фейк 0x83) y=mapY+0.5, верт (0x07/фейк 0x84) x=mapX+0.5.
+                bool horiz = doorIsHoriz(ctc);
                 double denom = horiz ? rayY : rayX;
                 if (std::fabs(denom) > 1e-9) {
                     double td = horiz ? ((mapY + 0.5 - cam.py) / denom)

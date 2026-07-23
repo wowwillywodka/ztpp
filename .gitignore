@@ -23,6 +23,8 @@ compile_commands.json
 *.bin
 *.md5
 *.ppm
+*.ini
+*.sav
 
 # Nuked-OPN2 — fetched separately (LGPL) / качается отдельно
 src/opn2/ym3438.c
@@ -30,6 +32,7 @@ src/opn2/ym3438.h
 
 # dev notes kept locally / старый dev-README только локально
 README.dev.md
+BACKLOG.md
 
 # dev artefacts — renders / screenshots / videos: kept on disk, NOT published.
 # dev-арты — рендеры / скриншоты / видео: остаются на диске, в git НЕ публикуем.
@@ -44,3 +47,7 @@ videos/
 # misc
 ztpp_settings.ini
 .DS_Store
+/profiles
+/shots
+dist/
+BACKLOG.md
