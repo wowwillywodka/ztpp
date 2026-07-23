@@ -1292,13 +1292,13 @@ int main(int argc, char** argv) {
     };
 
     // ⭐КОНЕЦ СЕССИИ ЗАСТАВОК (Start-скип И авто-доскролл — одна логика). ROM-флоу:
-    //  межэпизодный переход (1a40): эпизод+1 (снаряжение переносится) → ЭКРАН ПАРОЛЯ (58054-показ) → игра;
-    //  финал/game over (976): возврат в BOOT-цикл (SEGA→…→титул), НЕ сразу выбор бойца (юзер 2026-07-22).
+    //  межэпизодный переход (1a40): эпизод+1, снаряжение переносится (экрана пароля МЕЖДУ эпизодами
+    //  в оригинале НЕТ — юзер 2026-07-23; эпизод-пароль виден на пауза-карте);
+    //  финал/game over (976): возврат в BOOT-цикл (SEGA→…→титул), НЕ сразу выбор бойца.
     auto finishBriefSession = [&]() {
         briefState.idx = -1;
         snd::musicStop();                                       // конец сессии заставок → тишина
         bool restart   = (pendingEpisode == 0);                 // victory/badend → рестарт с начала
-        bool interlude = (pendingEpisode > 0);                  // межэпизодный переход
         if (pendingEpisode >= 0) { Inventory keep = inv; int keepHp = player().hp;
             floor = 0; cam.floor = 0; msgFloor = 0;             // старт с этажа 0
             setEp(pendingEpisode);                              // пароль ROM (58720) переносит жизни/оружие/патроны
@@ -1306,9 +1306,6 @@ int main(int argc, char** argv) {
             pwStack.clear(); pwProgressFloor() = 0;             // новый эпизод: стек с нуля (pwEpisodePass остаётся)
             if (pendingEpisode == 0) pwEpisodePass.clear();
             pendingEpisode = -1; }
-        if (interlude && !pwEpisodePass.empty()) {              // ⭐MISSION CODE между эпизодами (показ, START=игра)
-            pwscr::st().open(); pwscr::st().showOnly = true; pwscr::st().buf = pwEpisodePass;
-        }
         if (briefThenSelect) { briefThenSelect = false;
             if (restart && (!gd.introFrames.empty() || !gd.logoFrames.empty() || !gd.titleGfxBlk.empty())) {
                 bootPhase = 0; bootFrame = 0; bootPhaseMs = SDL_GetTicks(); bootThenBrief = true;   // заново с заставки
@@ -1360,11 +1357,6 @@ int main(int argc, char** argv) {
                 // ⭐ЭКРАН ВВОДА ПАРОЛЯ (модально, поверх меню/выбора): навигация сетки + Enter/Esc/Backspace.
                 if (pwscr::st().active) {
                     auto& ps = pwscr::st();
-                    if (ps.showOnly) {                          // ⭐MISSION CODE (показ): START/ESC → в игру
-                        if (key == SDL_SCANCODE_RETURN || key == SDL_SCANCODE_SPACE ||
-                            key == SDL_SCANCODE_RCTRL || key == SDL_SCANCODE_ESCAPE) { ps.close(); snd::playSfx(0x6b); }
-                        dirty = true; continue;
-                    }
                     switch (key) {
                         case SDL_SCANCODE_ESCAPE: ps.close(); SDL_StopTextInput(); break;
                         case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: handlePwAct(pwscr::A_SUBMIT); break;   // Enter = DONE (QoL)

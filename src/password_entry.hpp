@@ -36,7 +36,6 @@ enum Act { A_NONE = 0, A_TYPED, A_DELETED, A_SUBMIT, A_CANCEL };
 
 struct State {
     bool active = false;
-    bool showOnly = false;       // ⭐режим ПОКАЗА пароля (межэпизодный «MISSION CODE», ROM-флоу 1a40): без сетки, START=закрыть
     int  cx = 0, cy = 0;         // курсор: cx 0..7 (столбец), cy 0..8 (8 = строка действий DEL/CANCEL/DONE)
     std::string buf;             // введённые символы (макс PW_LEN)
     std::string msg;             // сообщение на месте поля ввода msgT кадров (ROM 0x58496 ~0x28 кадров)
@@ -44,7 +43,7 @@ struct State {
     bool msgOk = false;          // true = принят (зелёный), false = ошибка (красный)
     bool doneClose = false;      // закрыть экран после того как сообщение о принятии погаснет
 
-    void open()  { active = true; showOnly = false; cx = cy = 0; buf.clear(); msg.clear(); msgT = 0; doneClose = false; }
+    void open()  { active = true; cx = cy = 0; buf.clear(); msg.clear(); msgT = 0; doneClose = false; }
     void close() { active = false; }
     void fail()  { msg = "INCORRECT PASSWORD"; msgT = 90; msgOk = false; }   // ⭐буфер НЕ очищается (ROM: reprint)
     void ok()    { msg = "PASSWORD ACCEPTED";  msgT = 90; msgOk = true; doneClose = true; }
@@ -134,13 +133,6 @@ inline void render(FB& fb, const SelFont& fnt) {
         for (const char* p = str; *p; ++p) { ch1(x, y, *p, sc); x += 8 * sc; }
     };
 
-    if (s.showOnly) {                                            // ⭐МЕЖЭПИЗОДНЫЙ ПОКАЗ ПАРОЛЯ (ROM 1a40: слайд → пароль → игра)
-        textC(FBW / 2, 120*k, "MISSION CODE", 3*k);
-        textC(FBW / 2, 200*k, s.buf.c_str(), 4*k);
-        drawTextBigC(fb, FBW / 2, 300*k, "WRITE IT DOWN - RESTORES EPISODE + GEAR", 0xFF8090A0u, k, true, nullptr);
-        drawTextBigC(fb, FBW / 2, 424*k, "PRESS START", 0xFF8090A0u, 2*k, true, nullptr);
-        return;
-    }
     textC(FBW / 2, 14*k, "ENTER PASSWORD", 2*k);
 
     // ⭐ПОЛЕ ВВОДА (вверху, видно набор): 9 слотов, введённое + '_'-плейсхолдеры. Сообщение (ROM 0x58496) на этом же
