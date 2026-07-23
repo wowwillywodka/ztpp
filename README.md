@@ -49,8 +49,9 @@ a **demo release (v0.8)** is being prepared.
 
 ## Not done yet
 - Gamepad support
-- German build and the Beyond Zero Tolerance prototypes
 - A fully fixed-point render path (the math is float today, verified against MAME within 0.1%)
+- There are still some discrepancies with the original here and there — behaviour keeps being
+  verified against the disassembly and MAME and fixed as they are found
 - Minor polish: elevator blue-void edge cases, exact flashlight ramp, small HUD discrepancies
 
 ## Planned
@@ -185,9 +186,10 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
 
 ## Что не сделано
 - Поддержка геймпада
-- Немецкий билд и прототипы Beyond Zero Tolerance
 - Полностью целочисленный (fixed-point) рендер-путь (математика пока float, сверена с MAME
   в пределах 0.1%)
+- Местами ещё встречаются расхождения с оригиналом — поведение продолжает сверяться
+  с дизассемблированием и MAME, найденное исправляется
 - Мелкая полировка: краевые случаи синего фона лифта, точная рампа фонаря, мелкие расхождения HUD
 
 ## Планируется
