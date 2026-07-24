@@ -5,6 +5,12 @@
 
 void updateActors(const Level& lvl, const Camera& cam) {
     auto& v = actors();
+    // ⭐ЭВИКЦИЯ-ТИК (ROM 16094: сервис зовётся каждый 8-й кадр на актёра, стаггер по номеру слота):
+    // актёры живут только «пузырём» вокруг игрока — дальние сериализуются из пула (враг→маркер, труп→статик)
+    static uint32_t s_evTick = 0; ++s_evTick;
+    // порог: ROM = жёстко 0xA00 (10 кл, октаг., 2D — ЭТАЖ НЕ УЧАСТВУЕТ); пробуждение статуи-маркера
+    // капнуто 8 кл (updateEnemySpawns) → гистерезис 8/10 ROM-точный, кольца спавн/эвикт нет.
+    const double evictDist = 10.0;
     openDoorsAtEnemies(lvl, cam.floor);   // ZT b35c: дверь держится ОТКРЫТОЙ, пока в её клетке актёр (bit4)
     updatePlayerStepOnFire(cam);          // ZT e662: урон огнём при ВХОДЕ в клетку карта-огня (step-on, не радиус)
     // скорость игрока (для УПРЕЖДЕНИЯ точки прицела врага, как ZT добавляет target.vx/vy): дельта позы за кадр
@@ -124,7 +130,9 @@ void updateActors(const Level& lvl, const Camera& cam) {
                 break;
             }
             case AT_FOAM: {                              // ПЕНА огнетушителя: ПАДАЕТ вниз, ТУШИТ огонь, БЕЗ урона
-                for (auto& e : v) if (e.active && (e.think == AT_FIRE || e.think == AT_FLAME) && e.floor == a.floor &&
+                for (int fp = 0; fp < 2; ++fp)           // огонь: транзиент в пуле + карта-огни в статик-мире
+                 for (auto& e : (fp ? staticActors() : v))
+                  if (e.active && (e.think == AT_FIRE || e.think == AT_FLAME) && e.floor == a.floor &&
                                       std::hypot(e.x - a.x, e.y - a.y) < 0.6) {
                     if (e.think == AT_FIRE && e.timer < 0)                       // вечный карта-огонь → запомнить как потушенный
                         fireExtinguished().insert(e.floor * 1024 + (int)e.y * 32 + (int)e.x);
@@ -239,6 +247,20 @@ void updateActors(const Level& lvl, const Camera& cam) {
                     break;                                              // пауза кадр на восстановление
                 }
                 if (enemiesFrozen()) break;                              // чит: враги замерли
+                // ⭐ЭВИКЦИЯ ВРАГА (ROM 16094→14a56, objdef+0xC): каждый 8-й тик — если 2D-октаг. дистанция до игрока
+                // ≥ порога, враг «пере-засыпает»: обратно в pendingSpawns СВЕЖИМ маркером в текущей клетке
+                // (HP/морф теряются — ROM-верно, маркер состояния не несёт), слот освобождается. Боссы не
+                // эвиктятся (фазы/притворство Boss3 нельзя терять; ROM-люфт: они и не уходят от игрока далеко).
+                if (((s_evTick + (uint32_t)(&a - v.data())) & 7) == 0 && a.hitT == 0 && a.hp > 0 &&
+                    a.srcType != 0x67 && a.srcType != 0x6A && a.srcType != 0x6B &&
+                    gameDist(a.x - cam.px, a.y - cam.py) >= evictDist) {
+                    int mx = (int)a.x, my = (int)a.y;
+                    if (mx >= 0 && my >= 0 && mx < Level::W && my < Level::H) {
+                        pendingSpawns().push_back({mx, my, a.floor, a.srcType});
+                        a.active = false;
+                    }
+                    break;
+                }
                 // ⭐ОФФ-ЭТАЖНАЯ СИМУЛЯЦИЯ (BACKLOG; ROM 13232: диспетчер think БЕЗ гейта по этажу — разбуженные
                 // идут к (x,y) игрока и «встречают у лестницы», таймеры тикают). Порт-аппроксимация: движение
                 // к (px,py) игрока ROM-скоростью с клеточной коллизией (двери виртуально открывает: canOpen)
@@ -684,6 +706,14 @@ void updateActors(const Level& lvl, const Camera& cam) {
             }
             case AT_CORPSE: {                            // труп СКОЛЬЗИТ от смертельного отлёта, затухает, упирается в стены
                 ++a.frameT;                                          // тик анимации трупа (FH мерцает по LUT, Hydaca «ножки» RNG)
+                // ⭐ЭВИКЦИЯ ТРУПА (ROM 16094→14454: даль ≥10 кл → труп-celltype (+0x47) штампуется в грид, актёр free):
+                // порт-эквивалент — труп переезжает в СТАТИК-мир (лежит на месте гибели, застывший кадр; пул свободен).
+                // Вблизи труп остаётся актёром — дёргается/простреливается/пинается, как в ROM до эвикции.
+                if (((s_evTick + (uint32_t)(&a - v.data())) & 7) == 0 &&
+                    gameDist(a.x - cam.px, a.y - cam.py) >= evictDist) {
+                    staticActors().push_back(a);                     // копия со всеми полями (drop/burned/variant/state)
+                    a.active = false; break;
+                }
                 if (a.timer > 0 && std::abs(a.vx) + std::abs(a.vy) > 0.004) {
                     double nx = a.x + a.vx, ny = a.y + a.vy;
                     if (!enemyBlockedAt(lvl.cellType(a.floor, (int)nx, (int)a.y), a.floor, (int)nx, (int)a.y, nx - (int)nx, a.y - (int)a.y)) a.x = nx;
@@ -696,9 +726,33 @@ void updateActors(const Level& lvl, const Camera& cam) {
         }
     }
 
-    // ОЧЕРЕДЬ СПРАЙТОВ: каждый актёр → билборд в worldFx (рисуется drawDecorBillboards с z-тестом по стенам).
+    // ОБСЛУЖИВАНИЕ СТАТИК-МИРА: огни мерцают (frameT) и гаснут от пены (fireCd); трупы застывшие (кадр не тикает).
+    for (Actor& sa : staticActors()) if (sa.active && sa.think == AT_FIRE) {
+        ++sa.frameT;
+        if (sa.fireCd > 0 && --sa.fireCd <= 0) sa.active = false;   // затухание после пены
+    }
+
+    // ОЧЕРЕДЬ СПРАЙТОВ: каждый актёр (пул + статик-мир) → билборд в worldFx (drawDecorBillboards, z-тест по стенам).
     auto& fx = worldFx(); fx.clear();
-    for (Actor& a : v) {                       // non-const: walkFrame аккумулирует walkAcc (ROM $3c)
+    // ⭐СТАТУИ СПЯЩИХ МАРКЕРОВ (ROM 9a6a: клетка спящего врага рендерится СТАТИЧНЫМ биллбордом врага
+    // через 1131e — враги НЕ «появляются из ниоткуда»; оживают при dist<0x800=8 кл, эвикция обратно 10).
+    // Стоячая поза 0 фронтом к камере; вариант/потолок — той же формулой, что даст будущий спавн.
+    for (auto& m : pendingSpawns()) {
+        if (m.floor != cam.floor) continue;
+        uint8_t ct = m.ct ? m.ct : lvl.cellType(m.floor, m.x, m.y);
+        if (!((ct >= 0x29 && ct <= 0x2B) || (ct >= 0x65 && ct <= 0x6B))) continue;
+        int slot = enemyGfxSlot(ct);
+        if (slot < 0 || slot >= 16 || !g_enemyAnim[slot].ok) continue;
+        EnemyAnimSet& A = g_enemyAnim[slot];
+        double mx = m.x + 0.5, my = m.y + 0.5;
+        uint8_t variant = 0; double z = 0.0;
+        if (ct == 0x65) { bool onCeil = ((m.x * 5 + m.y * 3) & 1); z = onCeil ? 1.0 : 0.0; variant = onCeil ? 1 : 0; }
+        else if (ct == 0x2A) variant = (uint8_t)((m.x * 5 + m.y * 3) & 1);
+        uint8_t dir = (uint8_t)enemyDirIndex(cam.px - mx, cam.py - my, cam.px - mx, cam.py - my, A.walkDirs);  // «идёт» на камеру = фронт
+        fx.push_back({mx, my, cam.floor, 0, (int8_t)-8, 16, 7, slot, 0, false, (float)z, dir, 0, variant});
+    }
+    for (int pass = 0; pass < 2; ++pass)
+    for (Actor& a : (pass ? staticActors() : v)) {       // non-const: walkFrame аккумулирует walkAcc (ROM $3c)
         if (!a.active) continue;
         switch (a.think) {
             case AT_EXPLOSION: case AT_DEATH: {            // взрыв: БЫСТРО раскрывается (2 кадра) → сжимается (квадрат)

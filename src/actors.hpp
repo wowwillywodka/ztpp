@@ -71,10 +71,21 @@ struct Actor {
 // реаллоцировать вектор и инвалидировать итераторы (взрыв гранаты спавнит актёров прямо в цикле). ──
 static const int MAX_ACTORS = 256;
 inline std::vector<Actor>& actors() { static std::vector<Actor> v(MAX_ACTORS); return v; }
-inline void clearActors() { for (auto& a : actors()) a.active = false; worldFx().clear(); }
-inline Actor& allocActor() {
-    for (auto& a : actors()) if (!a.active) { a = Actor{}; a.active = true; return a; }
-    return actors()[0];                      // пул полон — fallback (перезапишем слот 0)
+// ⭐СТАТИК-МИР вне пула (ROM: дальние трупы и карта-огни = ГРИД-КЛЕТКИ, не актёры): эвиктированные
+// трупы (ROM 14454: труп-celltype +0x47 = 0x2C/0x6C-0x74 штампуется в пустую клетку 3×3, актёр free;
+// клетка рендерится статичным биллбордом 944E и ПЕРСИСТЕНТНА — трупы при уходе с этажа НЕ стираются)
+// и вечные огни 0x18 (в ROM — грид-декор). Обновляется минимально (мерцание), рисуется вместе с пулом.
+inline std::vector<Actor>& staticActors() { static std::vector<Actor> v; return v; }
+inline void clearActors() { for (auto& a : actors()) a.active = false; staticActors().clear(); worldFx().clear(); }
+// alloc по ROM 13466: пул полон → NULL, спавн ПРОВАЛИВАЕТСЯ. НИКОГДА не затираем занятый слот
+// (старый фолбэк «перезаписать слот 0» стирал живых врагов при переполнении — «пропавшие Hydaca»).
+inline Actor* allocActorPtr() {
+    for (auto& a : actors()) if (!a.active) { a = Actor{}; a.active = true; return &a; }
+    return nullptr;
+}
+inline Actor& allocActor() {                 // обёртка для эффектов: провал → scratch вне пула (эффект молча не появится — как в ROM)
+    if (Actor* p = allocActorPtr()) return *p;
+    static Actor scratch; scratch = Actor{}; return scratch;   // active=false → не в пуле, не обновляется, не рисуется
 }
 // Число живых врагов на этаже (для сообщений «FLOOR SECURED» / «ZERO ENEMIES REMAINING»).
 inline int aliveEnemies(int floor) {
@@ -316,7 +327,8 @@ inline void spawnCorpse(double x, double y, int f, uint8_t ct, double kvx = 0, d
 // Подбор оброненного оружия при шаге на труп: ищет труп под игроком с drop≥0, возвращает id (и снимает drop). cb добавляет в инвентарь.
 template <typename AddFn>
 inline void corpsePickup(const Camera& cam, AddFn add) {
-    for (auto& a : actors()) {
+    for (int pass = 0; pass < 2; ++pass)                 // трупы: свежие в пуле + эвиктированные в статик-мире
+      for (auto& a : (pass ? staticActors() : actors())) {
         if (!a.active || a.think != AT_CORPSE || a.drop < 0 || a.floor != cam.floor) continue;
         if (std::hypot(cam.px - a.x, cam.py - a.y) < 0.375) { if (add(a.drop)) a.drop = -1; }  // ROM 0x60/256≈0.375 кл (18714 cmpi #$60); взял → снять
     }
@@ -636,10 +648,12 @@ inline void spawnEnemyShot(double x, double y, int f, double dx, double dy, int 
                      a.z = 8.0; a.vz = (double)((int)(enemyRng() & 7) - 4); }  // ⭐Z-полоса снаряда (ROM 15f38: Z=8, zVel=(rnd&7)−4) — для верт.ДОЖА
 }
 
-// Создать ОДНОГО врага в клетке (x,y) этажа.
-inline void spawnOneEnemy(const Level& lvl, int floor, int x, int y) {
-    uint8_t ct = lvl.cellType(floor, x, y);
-    Actor& a = allocActor(); a.think = AT_ENEMY; a.floor = floor;
+// Создать ОДНОГО врага в клетке (x,y) этажа. ctOv≠0 — тип из маркера (эвиктированный враг мог стоять
+// на «чужой» клетке). false = ПРОВАЛ alloc (пул полон, ROM 13466) — вызывающий ОСТАВЛЯЕТ маркер (ретрай).
+inline bool spawnOneEnemy(const Level& lvl, int floor, int x, int y, uint8_t ctOv = 0) {
+    uint8_t ct = ctOv ? ctOv : lvl.cellType(floor, x, y);
+    Actor* ap = allocActorPtr(); if (!ap) return false;
+    Actor& a = *ap; a.think = AT_ENEMY; a.floor = floor;
     a.x = x + 0.5; a.y = y + 0.5; a.hp = enemyHp(ct); a.srcType = ct; a.tile = enemyTileForCt(ct);
     a.homeX = a.x; a.homeY = a.y;                                          // дом = точка спавна
     a.state = 0; a.timer = 0; a.fireCd = 20 + ((x * 7 + y * 13) % 40);
@@ -648,6 +662,7 @@ inline void spawnOneEnemy(const Level& lvl, int floor, int x, int y) {
     a.variant = (ct == 0x2A) ? (uint8_t)((x * 5 + y * 3) & 1) : 0;         // только FH: 2 визуальные вариации (Hydaca драйвит variant по z)
     if (ct == 0x65) { bool onCeil = ((x * 5 + y * 3) & 1); a.z = onCeil ? 1.0 : 0.0; a.variant = onCeil ? 1 : 0; }  // Hydaca: ПОЛ/ПОТОЛОК 50/50 (ZT init $34=rnd&1)
     { int as = snd::enemyAppearSfx(ct); if (as >= 0) snd::playSfx(as); }  // ЗВУК ПОЯВЛЕНИЯ врага (подтверждён на слух в оригинале)
+    return true;
 }
 // Спавн врага ЗАДАННОГО типа в точке (для консоли). ct — celltype врага (0x29..0x6b).
 inline void spawnEnemyByType(int floor, double x, double y, uint8_t ct) {
@@ -664,7 +679,10 @@ inline void spawnEnemyByType(int floor, double x, double y, uint8_t ct) {
 // ⭐ПЕРСИСТЕНТНОСТЬ ЭТАЖЕЙ (ROM b8fc, 2026-07-16): смена этажа НЕ переинициализирует мир — грид каждого
 // этажа живёт в RAM постоянно ($FF7CD6+floor*0x400, 16 гридов), пул актёров ГЛОБАЛЬНЫЙ (чистится только
 // на загрузке уровня, 133a4). Маркеры несут ЭТАЖ; collect вызывается ОДИН РАЗ на первый визит этажа.
-struct PendingSpawn { int x, y, floor; };
+// ct: тип врага маркера. 0 = прочитать из грида (первичный маркер уровня); ≠0 = ЭВИКТИРОВАННЫЙ враг
+// (ROM 14a56: даль ≥10 кл → актёр штампуется обратно в грид спящим маркером СВОЕГО ct (+0x46);
+// состояние HP/морфа ТЕРЯЕТСЯ — разбуженный заново враг свежий, ROM-верно).
+struct PendingSpawn { int x, y, floor; uint8_t ct = 0; };
 inline std::vector<PendingSpawn>& pendingSpawns() { static std::vector<PendingSpawn> v; return v; }
 inline int pendingOnFloor(int floor) {
     int n = 0; for (auto& m : pendingSpawns()) if (m.floor == floor) ++n; return n;
@@ -673,7 +691,7 @@ inline void collectEnemyMarkers(const Level& lvl, int floor) {        // ПЕР�
     auto& p = pendingSpawns();
     for (int y = 0; y < Level::H; ++y)
         for (int x = 0; x < Level::W; ++x)
-            if (cellIcon(lvl.cellType(floor, x, y)) == 9) p.push_back({x, y, floor});
+            if (cellIcon(lvl.cellType(floor, x, y)) == 9) p.push_back({x, y, floor, lvl.cellType(floor, x, y)});
 }
 inline void clearFloorState() { pendingSpawns().clear(); }            // полный сброс (смена уровня/эпизода)
 // КАРТА-ОГОНЬ: клетки celltype 0x18 (Flame) → вечный AT_FIRE (хазард). Вызывать при загрузке/смене этажа.
@@ -683,7 +701,15 @@ inline void spawnMapFires(const Level& lvl, int floor) {
         for (int x = 0; x < Level::W; ++x)
             if (lvl.cellType(floor, x, y) == 0x18) {
                 if (fireExtinguished().count(floor * 1024 + y * 32 + x)) continue;   // потушено игроком — не возрождать
-                spawnFire(x + 0.5, y + 0.5, floor, -1);                              // вечный огонь-хазард
+                // ⭐СТАТИК-МИР, не пул (ROM: огонь 0x18 = грид-клетка с анимацией, актёром не является):
+                // вечные огни копятся со всех посещённых этажей и забивали пул (стирание врагов при переполнении)
+                bool dup = false;
+                for (auto& e : staticActors()) if (e.active && e.think == AT_FIRE && e.floor == floor &&
+                                                   (int)e.x == x && (int)e.y == y) { dup = true; break; }
+                if (dup) continue;
+                Actor a{}; a.active = true; a.think = AT_FIRE; a.x = x + 0.5; a.y = y + 0.5; a.floor = floor;
+                a.tile = A_FIRE_TILE; a.timer = -1; a.frameT = (x * 7 + y * 13) & 7; a.state = 0;   // state0 = хазард (жжёт step-on)
+                staticActors().push_back(a);
             }
 }
 // ⭐STEP-ON УРОН ОГНЁМ ИГРОКУ (ZT e662 через e3f8): срабатывает ПРИ СМЕНЕ КЛЕТКИ (не per-frame — ROM e88e сравнивает
@@ -702,8 +728,10 @@ inline void updatePlayerStepOnFire(const Camera& cam) {
     int key = cam.floor * 1024 + cy * 32 + cx;
     if (key == p.lastCellKey) return;                    // клетка не сменилась → step-on не триггерится (ZT e88e)
     p.lastCellKey = key;
-    for (auto& e : actors()) if (e.active && e.think == AT_FIRE && e.state == 0 && e.floor == cam.floor &&
-                                 (int)e.x == cx && (int)e.y == cy) {          // вошёл в клетку карта-огня
+    for (int pass = 0; pass < 2; ++pass)                 // карта-огни живут в СТАТИК-мире (грид-клетки ROM), пул — на всякий
+      for (auto& e : (pass ? staticActors() : actors()))
+        if (e.active && e.think == AT_FIRE && e.state == 0 && e.floor == cam.floor &&
+            (int)e.x == cx && (int)e.y == cy) {          // вошёл в клетку карта-огня
         if (p.fireImmune) { ++suitBurnAbsorbs(); return; }   // костюм гасит ожог; расход 1.0 спишет main (ROM d7dc→10f98)
         int distU = (int)(std::hypot(cam.px - e.x, cam.py - e.y) * 256.0);    // смещение от центра клетки (юниты)
         int dmg = 16 - (distU >> 6); if (dmg < 1) dmg = 1;                    // ZT d800: 16 − (dist>>6)
@@ -731,14 +759,18 @@ inline double lightRange(int env) {
     return 5.0;                                      // Dim/Haze/Black
 }
 inline void updateEnemySpawns(const Level& lvl, int floor, double px, double py, double range = 0.0) {
-    if (range <= 0.0) range = lightRange(lvl.env(floor));            // ROM: бокс -$714c по свету/фонарю
+    // ⭐ПРОБУЖДЕНИЕ по ROM (рендер-wake 9a6a: спящий маркер-СТАТУЯ оживает при dist<0x800 = 8 кл):
+    // кап 8 кл; в темноте окно обзора -$714c (5 кл) режет раньше — фонарь/ночник поднимают до капа.
+    // Статуи маркеров этажа рисуются в updateActors → враги больше не «появляются из ниоткуда».
+    if (range <= 0.0) range = std::min(8.0, lightRange(lvl.env(floor)));
     auto& p = pendingSpawns();
     for (size_t i = 0; i < p.size(); ) {                              // спавн маркеров в радиусе (box ±range) от игрока
         if (p[i].floor != floor) { ++i; continue; }                   // маркеры других этажей спят (прокси 11×11 = этаж игрока)
         double mx = p[i].x + 0.5, my = p[i].y + 0.5;
         // LOS-гейт: не спавнить СКВОЗЬ стену/ЗАКРЫТУЮ дверь (юзер: «триггерятся до того как дверь открыл»)
-        if (std::abs(px - mx) <= range && std::abs(py - my) <= range && enemyLOS(lvl, floor, mx, my, px, py)) {
-            spawnOneEnemy(lvl, floor, p[i].x, p[i].y); p[i] = p.back(); p.pop_back();
+        if (std::abs(px - mx) <= range && std::abs(py - my) <= range && enemyLOS(lvl, floor, mx, my, px, py) &&
+            spawnOneEnemy(lvl, floor, p[i].x, p[i].y, p[i].ct)) {   // провал alloc (ROM 13466) → маркер ОСТАЁТСЯ, ретрай
+            p[i] = p.back(); p.pop_back();
         } else ++i;
     }
 }
@@ -816,8 +848,9 @@ inline void triggerAlarm(const Level& lvl, int floor, int cx, int cy, double px,
     for (size_t i = 0; i < p.size();) {
         // ⚠ФИЛЬТР ЭТАЖА обязателен (persist-баг 2026-07-16): маркеры ВСЕХ посещённых этажей в одном списке —
         // без фильтра тревога спавнила врагов ЧУЖИХ этажей по совпадению координат («стреляющие спрайты» эп2 эт4)
-        if (p[i].floor == floor && std::abs(p[i].x - cx) <= 5 && std::abs(p[i].y - cy) <= 5) {
-            spawnOneEnemy(lvl, floor, p[i].x, p[i].y); p[i] = p.back(); p.pop_back();
+        if (p[i].floor == floor && std::abs(p[i].x - cx) <= 5 && std::abs(p[i].y - cy) <= 5 &&
+            spawnOneEnemy(lvl, floor, p[i].x, p[i].y, p[i].ct)) {   // провал alloc → маркер остаётся
+            p[i] = p.back(); p.pop_back();
         } else ++i;
     }
     for (auto& a : actors()) {                                        // все враги радиуса → бегут к игроку (тревога = знают где ты)
@@ -1048,8 +1081,9 @@ inline void blastAt(const Level& lvl, double x, double y, int f, const Camera& c
     // чтобы дремлющий враг, ещё не видевший игрока и потому не инстанцированный, попал под урон ниже.
     { auto& p = pendingSpawns();
       for (size_t i = 0; i < p.size();) {
-          if (p[i].floor == f && std::abs(p[i].x + 0.5 - x) < 4.0 && std::abs(p[i].y + 0.5 - y) < 4.0) {
-              spawnOneEnemy(lvl, f, p[i].x, p[i].y); p[i] = p.back(); p.pop_back();   // материализуем (state0 — НЕ авто-агро)
+          if (p[i].floor == f && std::abs(p[i].x + 0.5 - x) < 4.0 && std::abs(p[i].y + 0.5 - y) < 4.0 &&
+              spawnOneEnemy(lvl, f, p[i].x, p[i].y, p[i].ct)) {   // материализуем (state0 — НЕ авто-агро); провал alloc → маркер остаётся
+              p[i] = p.back(); p.pop_back();
           } else ++i;
       } }
     for (auto& a : actors()) {                                   // ВРАГИ в радиусе 4 кл С LOS: урон (0x400−dist)/100 + отлёт (ZT 16294)

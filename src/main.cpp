@@ -717,6 +717,12 @@ int main(int argc, char** argv) {
             if (ct) spawnEnemyByType(cam.floor, cam.px + cam.dirX * d, cam.py + cam.dirY * d, ct);
         }
         for (int t = 0, n = argInt(argc, argv, "--simticks", 0); t < n; ++t) updateActors(gd.levels[ep], cam);  // отладка: прокрутить N игровых тиков
+        if (argStr(argc, argv, "--poolstat")) {                        // отладка: занятость пула/статик-мира/маркеров
+            int used = 0, en = 0, co = 0;
+            for (auto& a : actors()) if (a.active) { ++used; if (a.think == AT_ENEMY) ++en; else if (a.think == AT_CORPSE) ++co; }
+            std::printf("poolstat: pool=%d/%d enemies=%d corpses=%d static=%zu pending=%zu\n",
+                        used, MAX_ACTORS, en, co, staticActors().size(), pendingSpawns().size());
+        }
         if (int kt = argInt(argc, argv, "--killspawned", -1); kt >= 0) {   // отладка: убить ПОСЛЕДНЕГО заспавненного врага + прокрутить N тиков
             for (int i = (int)actors().size() - 1; i >= 0; --i) if (actors()[i].active && actors()[i].think == AT_ENEMY) {
                 Actor& a = actors()[i]; hitEnemy(a, a.hp + 1, cam.px, cam.py, 0x400); break; }
@@ -1041,9 +1047,10 @@ int main(int argc, char** argv) {
         for (auto& kv : doorMap())      f << "door=" << kv.first << ":" << kv.second << "\n";
         for (int k : pickedSet())       f << "picked=" << k << "\n";
         for (int k : fireExtinguished()) f << "fireout=" << k << "\n";
-        for (auto& m : pendingSpawns()) f << "pend=" << m.x << ":" << m.y << ":" << m.floor << "\n";
+        for (auto& m : pendingSpawns()) f << "pend=" << m.x << ":" << m.y << ":" << m.floor << ":" << (int)m.ct << "\n";
         for (auto& c : alarmCams())     f << "cam=" << c.x << ":" << c.y << ":" << c.floor << ":" << c.state << ":" << c.timer << ":" << (c.dead?1:0) << "\n";
-        for (auto& a : actors()) {      // враги/трупы/огни (transient снаряды/fx не сохраняем)
+        for (int ap = 0; ap < 2; ++ap)
+        for (auto& a : (ap ? staticActors() : actors())) {   // враги/трупы/огни, пул + статик-мир (transient снаряды/fx не сохраняем)
             if (!a.active || (a.think != AT_ENEMY && a.think != AT_CORPSE && a.think != AT_FIRE)) continue;
             f << "actor=" << a.think << ":" << a.x << ":" << a.y << ":" << a.floor << ":" << a.state << ":" << a.timer
               << ":" << a.hp << ":" << (int)a.variant << ":" << (int)a.srcType << ":" << a.drop << ":" << (a.burned?1:0)
@@ -1083,7 +1090,9 @@ int main(int argc, char** argv) {
             else if (k == "pwprog") lpwprog = std::atoi(v);
             else if (k == "pwep")   lpwep = v;
             else if (k == "pwstk")  lpwstk.push_back(v);
-            else if (k == "pend")   { PendingSpawn m{}; if (std::sscanf(v, "%d:%d:%d", &m.x, &m.y, &m.floor) == 3) pend.push_back(m); }
+            else if (k == "pend")   { PendingSpawn m{}; int mc = 0;                     // ct опционален (старые сейвы — 3 поля)
+                int nf = std::sscanf(v, "%d:%d:%d:%d", &m.x, &m.y, &m.floor, &mc);
+                if (nf >= 3) { m.ct = (uint8_t)mc; pend.push_back(m); } }
             else if (k == "cam")    { AlarmCam c{}; int d=0; if (std::sscanf(v, "%d:%d:%d:%d:%d:%d", &c.x,&c.y,&c.floor,&c.state,&c.timer,&d) == 6) { c.dead = d != 0; cams.push_back(c); } }
             else if (k == "actor")  { Actor a{}; int var=0, st=0, bu=0, rv=0, tl=0;
                 if (std::sscanf(v, "%d:%lf:%lf:%d:%d:%d:%d:%d:%d:%d:%d:%lf:%lf:%lf:%lf:%d:%d:%d",
@@ -1109,7 +1118,10 @@ int main(int argc, char** argv) {
         pickedSet().clear(); for (int k2 : picked) pickedSet().insert(k2);
         fireExtinguished().clear(); for (int k2 : fireout) fireExtinguished().insert(k2);
         pendingSpawns() = pend; alarmCams() = cams;
-        for (const Actor& a : acts) { Actor& na = allocActor(); na = a; }
+        for (const Actor& a : acts) {                                 // трупы и вечные карта-огни → в СТАТИК-мир
+            if (a.think == AT_CORPSE || (a.think == AT_FIRE && a.timer < 0)) { staticActors().push_back(a); continue; }
+            if (Actor* na = allocActorPtr()) *na = a;                 // пул полон → пропуск (ROM 13466); враги вблизи восстановятся
+        }
         visitedFloors = lvis; floorSecT = lsec; prevAlive = -1;
         pwStack = lpwstk; pwEpisodePass = lpwep;                      // ⭐стек паролей из сейва
         pwProgressFloor() = (lpwprog >= 0 && lpwprog < 16) ? lpwprog : (int)pwStack.size();
