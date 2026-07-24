@@ -142,6 +142,8 @@ struct GameData {
     std::vector<FighterCard> fighters;  // 5 бойцов PLANET DEFENSE CORPS (экран выбора; текст @0xC6B36)
     SelFont  selFont;                   // фирменный шрифт экрана выбора (8×16, засечки, градиент)
     uint16_t startInv[5][4] = {};       // СТАРТОВЫЙ ИНВЕНТАРЬ по бойцу (ZT @0xF98): 2 пары (id, count 8.8). RAMOS=пусто (кулаки)
+    // ⭐ПОЕЗД МЕТРО ZTU (FSM 0xDE8DA, см. train.hpp): скрипты текстур ROM 0xDE578..0xDE7E0 (0x268 Б).
+    std::vector<uint8_t> trainScript;   // пусто = подсистемы нет (все билды кроме ZTU)
     // ⭐ЗАСТАВКИ/БРИФИНГИ (ZT @0xCB1E4): скроллящийся текст поверх фона. Фон = MD nametable 40×28, 64-цвет палитра
     // (линии 0-1 из screen-pal, линии 2-3 из общей 0xCD47A). Текст = палитра-линия 3 (шрифт-LUT 0xCD30E).
     struct Briefing { std::vector<std::string> lines; std::vector<uint32_t> bg; int bgW = 0, bgH = 0;

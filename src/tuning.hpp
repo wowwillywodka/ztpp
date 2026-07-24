@@ -27,7 +27,8 @@ inline bool&   soundOn()     { static bool b = false; return b; }   // ДЕФО�
 inline double& soundVolume() { static double v = 0.7; return v; }
 // ОЗВУЧКА HUD-СООБЩЕНИЙ (ROM Options «Voice:»): темп реплик = множитель ROM-пауз между словами-сэмплами
 // (1/60 с, VBLANK-клок @0xAA2). 1.0 = ROM-темп; 0 = озвучка ВЫКЛ (паттерн «Mouse sens 0=off»). Меню стр.4 + ini.
-inline double& voicePace() { static double v = 1.0; return v; }
+// Дефолт 1.2 (юзер 2026-07-24: чуть разреженнее ROM звучит лучше).
+inline double& voicePace() { static double v = 1.2; return v; }
 // МУЗЫКА (заставки/лифт/победа): вкл/выкл. Синхронится с snd::musicEnabled в main; OFF = немедленный стоп.
 inline bool& musicOn() { static bool b = true; return b; }
 // ⭐НОЧНИК/ФОНАРЬ активны = ЛЕЖАТ в инвентаре (ROM 13182/10cc6: скан слотов по id, наличие = активность;

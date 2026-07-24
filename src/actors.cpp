@@ -353,7 +353,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                         a.atkPose = (d < 1.0 || a.timer < 6) ? 1 : 0;           // ⭐прыжок-поза a2 при близко/скоро; иначе бег a1 (ZT draw 198c4: $35<6||dist<1кл→a2)
                         if (--a.timer <= 0 || dcx < 0.06 || d < 0.5) {          // ДОСТИГ игрока (d<0.5 = контакт, ZT 19606 dist к цели≤0xa) ИЛИ таймер → укус СРАЗУ (без задержки)
                             a.state = 2; a.aimX = a.homeX; a.aimY = a.homeY;     // цель = точка СТАРТА (ZT 1961c: $38/$3a=$48/$4a)
-                            if (d < 0.5) { damagePlayer(6, cam.px, cam.py, a.x, a.y); a.fireAnimT = 12; snd::playSfx(0x1b);
+                            if (d < 0.5) { damagePlayer(6, cam.px, cam.py, a.x, a.y); a.fireAnimT = 12; snd::playSfxPolite(0x1b, 0x0F);
                                            player().knockVx *= 2.0; player().knockVy *= 2.0; }  // ОДИН укус dist<0x80 (ZT 19678, урон 0x28a→6, звук 0x1b) + ОТБРОС ×2 (196ae: asl скоростей игрока)
                             a.timer = ticks(20);                                 // $35=0x14 ×enemyTimerScale
                         }
@@ -527,7 +527,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                     if (a.state == 1) revEngage();                       // только что обнаружен (патруль→бой) → первый engage
                     moveTo(a.aimX, a.aimY, 1.0);                          // РЫВОК к AIM-точке (±0x40, ZT 0x1a9aa/0x1a9b0), НЕ к игроку
                     if (a.state == 8) {                                   // APPROACH: контакт-урон + переход к прицелу
-                        if (d < 0.25) { damagePlayer(2, cam.px, cam.py, a.x, a.y); snd::playSfx(0x1b); }  // контакт ≤0x40 (ZT 0x1a9f6 d0=0x384→2) КАЖДЫЙ тик + звук 0x1b (ROM без инвулна — так и есть)
+                        if (d < 0.25) { damagePlayer(2, cam.px, cam.py, a.x, a.y); snd::playSfxPolite(0x1b, 0x0F); }  // контакт ≤0x40 (ZT 0x1a9f6 d0=0x384→2) КАЖДЫЙ тик + звук 0x1b (ROM без инвулна — так и есть)
                         double da = std::hypot(a.aimX - a.x, a.aimY - a.y);
                         if (da < 0.15 || --a.timer <= 0) { a.state = 9; a.timer = 10; a.fireAnimT = 0; }  // достиг aim / таймер → ПРИЦЕЛ 10т ($35=0xa)
                     } else {                                              // state 9 AIM/FIRE (ZT 0x1aa28): движется к aim, ОДИН выстрел на tick6
@@ -537,9 +537,9 @@ void updateActors(const Level& lvl, const Camera& cam) {
                             if (los) {
                                 bool cm = enemyShotMiss(lvl.env(a.floor));    // стелс-ролл (стойка+тьма, ZT 0x1aa76 — как FH)
                                 if (!cm && d < 2.0) { int rd = 16 - (int)(d * 8.0); if (rd < 1) rd = 1; damagePlayer(rd, cam.px, cam.py, a.x, a.y); }  // урон 16−(dist·2>>6), ≤2кл (ZT 0x1aac4)
-                                snd::playSfx(0x1e);                       // лазер (hit ИЛИ miss, ZT 0x1aad8)
+                                snd::playSfxPolite(0x1e, 0);                       // лазер (hit ИЛИ miss, ZT 0x1aad8)
                             }
-                        } else if (t == 5 || t == 4) snd::playSfx(0x1e);  // ZT $35==5/4 → заряд-звук 0x1e
+                        } else if (t == 5 || t == 4) snd::playSfxPolite(0x1e, 0);  // ZT $35==5/4 → заряд-звук 0x1e
                         if (t <= 0) revEngage();                          // aim-окно кончилось → ре-engage (новый рывок к новой aim)
                     }
                     break;
@@ -624,7 +624,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                             bool cm = enemyShotMiss(lvl.env(a.floor));
                             int gmask = (a.srcType == 0x29) ? 7 : 15;    // шанс гранаты Sgt 1/8, FH-SF 1/16
                             if (ec == EC_GRENADIER && d >= 1.0 && (enemyRng() & gmask) == 0) {
-                                spawnGrenade(a.x, a.y, a.floor, rx, ry, 1, 1.0, true); a.fireAnimT = 12; a.atkPose = 1; snd::playSfx(0x1b);
+                                spawnGrenade(a.x, a.y, a.floor, rx, ry, 1, 1.0, true); a.fireAnimT = 12; a.atkPose = 1; snd::playSfxPolite(0x1b, 0x0F);
                             } else if (d < 4.0) {
                                 if (!cm) damagePlayer(zdamage(d), cam.px, cam.py, a.x, a.y);
                                 a.fireAnimT = 12; a.atkPose = 0;
@@ -655,8 +655,8 @@ void updateActors(const Level& lvl, const Camera& cam) {
                         // (=20 порт) И rnd бит7. Порт делал наоборот (ближний всегда, дальний только enrage).
                         if (t == 5) {
                             bool melee3 = (a.hp < 20) && (enemyRng() & 0x80) && d < 0.5;
-                            if (melee3) { if (!bmiss) damagePlayer(12, cam.px, cam.py, a.x, a.y); a.fireAnimT = 12; a.atkPose = 0; snd::playSfx(0x1b); }   // ближний a2
-                            else if (d < 4.0) { if (!bmiss) damagePlayer(9, cam.px, cam.py, a.x, a.y); a.fireAnimT = 12; a.atkPose = 1; snd::playSfx(0x1e); }   // hitscan a4 (промах/выстрел 0x1E)
+                            if (melee3) { if (!bmiss) damagePlayer(12, cam.px, cam.py, a.x, a.y); a.fireAnimT = 12; a.atkPose = 0; snd::playSfxPolite(0x1b, 0x0F); }   // ближний a2
+                            else if (d < 4.0) { if (!bmiss) damagePlayer(9, cam.px, cam.py, a.x, a.y); a.fireAnimT = 12; a.atkPose = 1; snd::playSfxPolite(0x1e, 0); }   // hitscan a4 (промах/выстрел 0x1E)
                         }
                     }
                 }

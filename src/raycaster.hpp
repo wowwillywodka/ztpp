@@ -22,11 +22,12 @@ static const uint16_t DOOR_METATEX = 18; // канонич. метатексту
 // ── ДВЕРИ: открытие при ВСТАВАНИИ НА ЯЧЕЙКУ двери (как ZT step-on b202: наступил на клетку ct6/7 →
 // дверь в список открытия). НЕ «перед дверью» — именно НА её клетке. Створки разъезжаются (раздвижные),
 // проходимы. Закрываются (анимация) когда игрок сошёл с клетки. doorMap/doorOpen/doorKey — в cells.hpp. ──
-// Возвращает true, если какая-то дверь ТОЛЬКО ЧТО начала открываться (для звука двери — caller играет SFX_DOOR).
+// Возвращает true на ФРОНТАХ звука двери (caller играет SFX_DOOR=0x67): начало ОТКРЫТИЯ (ROM b2f2)
+// И момент ПОЛНОГО ЗАКРЫТИЯ (ROM b3f4: фаза дошла до 0 → тот же звук 0x67 — «щелчок»; VERIFIED 2026-07-24).
 inline bool   rcUpdateDoors(int floor, double px, double py, const Level& lvl) {
     auto& m = doorMap();
     int cx = (int)px, cy = (int)py;
-    bool justOpened = false;
+    bool sndEdge = false;
     for (int y = cy - 3; y <= cy + 3; ++y)
         for (int x = cx - 3; x <= cx + 3; ++x) {
             if (x < 0 || y < 0 || x >= Level::W || y >= Level::H) continue;
@@ -37,10 +38,11 @@ inline bool   rcUpdateDoors(int floor, double px, double py, const Level& lvl) {
             double o = m.count(k) ? m[k] : 0.0, prev = o;
             o += (onCell ? 0.20 : -0.10) * simDt();      // ⭐фаза в ROM-тиках (fps-инвариантно)
             if (o < 0) o = 0; if (o > 1) o = 1;
-            if (onCell && prev < 0.01 && o > 0.0) justOpened = true;   // фронт открытия двери
+            if (onCell && prev < 0.01 && o > 0.0) sndEdge = true;      // фронт открытия (b2f2)
+            if (!onCell && prev > 0.0 && o <= 0.0)  sndEdge = true;    // дверь ДОЗАКРЫЛАСЬ (b3f4: тот же 0x67)
             m[k] = o;
         }
-    return justOpened;
+    return sndEdge;
 }
 
 // Общий коэффициент гор. растяжки дисплея (faithful И DDA). 1.0 = без растяжки.

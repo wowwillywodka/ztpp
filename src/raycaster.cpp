@@ -5,38 +5,18 @@
 
 void rcSpawn(Camera& cam, const Level& lvl) {
     int bx = -1, by = -1;
-    // ТОЧКА СПАВНА игрока = ПЕРВАЯ (row-major) клетка с иконкой 8 «player start» (ZT celltype 0x77).
+    // ⭐ROM-спавн (респавн-путь смерти 0x1916-0x1954, VERIFIED 2026-07-24): линейный (row-major) скан
+    // ВСЕЙ карты этажа на celltype 0x77 «респавн-камера», позиция = ЦЕНТР клетки (+0x80 в 8.8).
     for (int y = 0; y < Level::H && by < 0; ++y)
         for (int x = 0; x < Level::W; ++x)
             if (cellIcon(lvl.cellType(cam.floor, x, y)) == 8) { bx = x; by = y; break; }
-    if (bx < 0) {                                   // ФОЛБЭК: самая открытая пустая клетка
-        int best = -1;
-        for (int y = 0; y < Level::H; ++y)
-            for (int x = 0; x < Level::W; ++x) {
-                if (cellIcon(lvl.cellType(cam.floor, x, y)) != 0) continue;
-                int sc = 0;
-                for (int dy = -2; dy <= 2; ++dy)
-                    for (int dx = -2; dx <= 2; ++dx)
-                        if (!rcSolidRay(lvl, cam.floor, x + dx, y + dy)) ++sc;
-                if (sc > best) { best = sc; bx = x; by = y; }
-            }
-    }
-    if (bx < 0) { cam.px = cam.py = 1.5; cam.dirX = 1; cam.dirY = 0; cam.planeX = 0; cam.planeY = 0.66; cam.ang512 = 0; return; }
+    if (bx < 0) { bx = 8; by = 20; }                // ⭐ФОЛБЭК ROM 0x1938: индекс 0x288 = x8,y20 (была эвристика «открытая клетка»)
     cam.px = bx + 0.5; cam.py = by + 0.5;
-    static const int D[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-    int bd = 0, bc = -1;
-    for (int d = 0; d < 4; ++d) {
-        int cnt = 0;
-        for (int s = 1; s <= 12; ++s) {
-            if (rcSolidRay(lvl, cam.floor, bx + D[d][0] * s, by + D[d][1] * s)) break;
-            ++cnt;
-        }
-        if (cnt > bc) { bc = cnt; bd = d; }
-    }
-    cam.dirX = D[bd][0]; cam.dirY = D[bd][1];
+    // ⭐УГОЛ = 0 (ВОСТОК, +X): ROM 0x1856 clr -$71FC → вектор из LUT 0x8124[0]. Была эвристика
+    // «направление с наибольшей свободой» — НЕфейтфул (после смерти оригинал всегда смотрит на восток).
+    cam.dirX = 1; cam.dirY = 0;
     cam.planeX = -cam.dirY * 0.66; cam.planeY = cam.dirX * 0.66;
-    cam.ang512 = std::atan2(cam.dirY, cam.dirX) * (512.0 / 6.28318530717958648);  // синхр. аккумулятор угла
-    if (cam.ang512 < 0) cam.ang512 += 512.0;
+    cam.ang512 = 0;
     cam.angI = -1;                                                                  // fixedmove пере-синхр. из новой позы
 }
 

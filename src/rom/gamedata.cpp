@@ -417,7 +417,9 @@ bool loadGameDataFromRom(GameData& gd, const Rom& rom) {
             lw = rom.u16(a.logoNt[L] + 4), lh = rom.u16(a.logoNt[L] + 6);
         if (lw < 1 || lw > 40 || lh < 1 || lh > 28) continue;
         uint32_t lpal[16]; for (int i = 0; i < 16; ++i) lpal[i] = cramToArgb(rom.u16(a.logoPal[L] + (size_t)i * 2));
-        std::vector<uint32_t> fr((size_t)HUD_W * HUD_H, 0xFF000000u);
+        // ⭐ФОН = BACKDROP-цвет (ROM 2638E: рег 0x87→CRAM-цвет 0 линии лого): PIKO = 0x0EEE БЕЛЫЙ,
+        // разработчик = 0x0000 чёрный. Была жёсткая чёрная заливка — PIKO терял белый фон (юзер 2026-07-24).
+        std::vector<uint32_t> fr((size_t)HUD_W * HUD_H, lpal[0]);
         for (int ty = 0; ty < lh; ++ty)
             for (int tx = 0; tx < lw; ++tx) {
                 int e = rom.u16(a.logoNt[L] + 8 + (size_t)(ty * lw + tx) * 2), idx = e & 0x7FF;
@@ -796,7 +798,23 @@ bool loadGameDataFromRom(GameData& gd, const Rom& rom) {
         // ⭐ЗАСТАВКИ/БРИФИНГИ (ZT @0xCB1E4): тексты (записи 0x25 ASCII, пустая=конец) + фоны (тайлмап 40×28 + тайлы + палитра).
         auto briefLines = [&](size_t addr) {
             std::vector<std::string> out; if (!addr) return out; size_t a = addr;
-            for (int ln = 0; ln < 128; ++ln) {                 // ⭐до 0-терминатора (ROM cb288): intro=31, victory=117 строк С ТИТРАМИ (CREDITS @0xCC429)
+            if (gd.build == Build::ZTU) {
+                // ⭐ZTU-рендерер 0x9BC92 (verified дизасмом): строки = ПОСЛЕДОВАТЕЛЬНЫЕ NUL-терминированные
+                // C-строки ПЕРЕМЕННОЙ длины (draw до NUL; следующая сразу за ним; `cmpi.b #0,(a0)` =
+                // пустая строка → конец блока). Фикс-стрид 0x25 здесь ломал victory-текст мода (рваные
+                // длины строк → у каждой съедалась 1-я буква: «iko Interractive», «RTISTS:»). Хвост-доскролл
+                // 0x9DED4 (17 пустых строк, скроллер прыгает туда после НЕ-последнего блока) не читаем —
+                // порт доскролливает сам (BriefingState::done).
+                for (int ln = 0; ln < 200 && rom.u8(a) != 0; ++ln) {
+                    std::string s;
+                    for (; rom.u8(a) != 0; ++a) { char ch = (char)rom.u8(a); if (ch >= 32 && ch < 127) s += ch; }
+                    ++a;                                       // съесть NUL строки
+                    while (!s.empty() && s.back() == ' ') s.pop_back();
+                    out.push_back(s);
+                }
+                return out;
+            }
+            for (int ln = 0; ln < 200; ++ln) {                 // ⭐ZT: фикс-записи 0x25 до 0-терминатора (ROM cb288): intro=31, victory=117 С ТИТРАМИ (CREDITS @0xCC429)
                 if (rom.u8(a) == 0) break;                 // пустая запись = конец блока
                 std::string s; for (int c = 0; c < 0x25; ++c) { char ch = (char)rom.u8(a + c); if (ch == 0) break; if (ch >= 32 && ch < 127) s += ch; }
                 while (!s.empty() && s.back() == ' ') s.pop_back();   // trailing trim (leading пробелы = выравнивание, сохраняем)
@@ -841,20 +859,23 @@ bool loadGameDataFromRom(GameData& gd, const Rom& rom) {
             {0,       0xF84DA,  0xEFC3A,  0xF8D9A},    // 8 взрыв   — финал зон1/2 (cb0be, БЕЗ текста, held-экран)
             {0xCBDF0, 0x1016DA, 0xF8E1A,  0x101F9A},   // 9 EXIT    — зона2 badend2 (текст 0xCBDF0 на EXIT-фоне)
         };
-        // ⭐ZTU: тексты = КОПИИ ZT со сдвигом −0x2F664 (байт-в-байт, кроме victory-слота 0x9C96F — свой
-        // текст мода «Aliens ambushed the subway…»). Экраны (gfx,tm,pal) и пары текст↔экран — из
-        // draw-функций 0x9B498..0x9BA5E (lea gfx → NT 40×28 → пал → текст-пал 0x9E2B6; verified):
-        // солдат+intro @9B498, станция+mission @9B528, станция+decoy @9B5BE, крыша+central @9B64E,
-        // коридор+НОВЫЙ текст @9B6E4, концовка БЕЗ текста @9B826, станция+badend @9B8DA, крыша+badend @9B952,
-        // взрыв БЕЗ текста @9BA5E. Слот 4 = новый текст мода (сюжет ZTU), слоты бэд-эндов = ZT-тексты
-        // (недоделка мода: game over ведёт на ZT-брифинг — воспроизводим данные как есть).
+        // ⭐ZTU-заставки: тексты = КОПИИ ZT со сдвигом −0x2F664 (байт-в-байт), КРОМЕ двух авторских
+        // текстов мода: subway-intro 0x9C96F («Aliens ambushed the subway…») и victory 0x9CABD
+        // («You've done it!…Relocate to the main base»). Диспетчер playCutscene @0x9B3EE: индекс со
+        // стека → таблица переходов @0x9BD2C (6 функций-последовательностей, verified дизасмом):
+        //   [0] intro(0x9BD44)+mission(0x9C1C0) @9B490   [1] decoy(0x9C4CB)+central(0x9C663) @9B5B6
+        //   [2] subway(0x9C96F) @9B6DC — ОДИН экран      [3] intro-only(0x9BD44) @9B778
+        //   [4] VICTORY(0x9CABD) @9B81E — ОДИН экран      [5] badend 0x9C37D+0x9C78C+0x9C78C+взрыв @9B8BA
+        // ⭐Игровой ФЛОУ (verified): СТАРТ игры = playCutscene(2)=subway (0xEB8: move #2,d0), НЕ intro+mission;
+        //   ПОБЕДА = playCutscene(4)=victory (0x1B44: move #4,d0) с текстом 0x9CABD; мод одноэпизодный
+        //   (0x1B62: ep+1==1 → ребут 0x976). Таблица ниже индексируется НАШИМ BriefId (не индексом диспетчера).
         static const BR brsZtu[10] = {
             {0x9BD44, 0xA62F6, 0x9E2D6, 0xA6BB6},      // 0 intro   — солдат (ZT-текст интро)
             {0x9C1C0, 0xAE476, 0xA6C36, 0xAED36},      // 1 mission — станция метро
             {0x9C4CB, 0xAE476, 0xA6C36, 0xAED36},      // 2 decoy   — станция
             {0x9C663, 0xB75D6, 0xAEDB6, 0xB7E96},      // 3 central — крыша
-            {0x9C96F, 0xC0136, 0xB7F16, 0xC09F6},      // 4 — НОВЫЙ текст мода (subway ambush) на коридоре
-            {0,       0xDB616, 0xD2E56, 0xDBED6},      // 5 victory — концовка (текст в моде не подключён)
+            {0x9C96F, 0xC0136, 0xB7F16, 0xC09F6},      // 4 subway  — НОВЫЙ текст мода (ambush); СТАРТ игры ZTU
+            {0x9CABD, 0xDB616, 0xD2E56, 0xDBED6},      // 5 victory — ⭐текст мода 0x9CABD (F5@0x9B81E, playCutscene(4))
             {0x9C78C, 0xAE476, 0xA6C36, 0xAED36},      // 6 badend1 — станция + ZT badend-текст
             {0x9C78C, 0xB75D6, 0xAEDB6, 0xB7E96},      // 7 badend2 — крыша + ZT badend-текст
             {0,       0xC9316, 0xC0A76, 0xC9BD6},      // 8 взрыв   — БЕЗ текста
@@ -864,6 +885,13 @@ bool loadGameDataFromRom(GameData& gd, const Rom& rom) {
         gd.briefings.clear();
         for (int i = 0; i < 10; ++i) { GameData::Briefing b; b.lines = briefLines(brs[i].text);
             briefBg(brs[i].tm, brs[i].gfx, brs[i].pal, b); gd.briefings.push_back(std::move(b)); }
+    }
+
+    // ⭐ПОЕЗД МЕТРО ZTU (FSM 0xDE8DA; VERIFIED 2026-07-24, см. train.hpp): скрипты текстур вагонов —
+    // ROM 0xDE578..0xDE7E0 (прибытие @0, отъезд @0x138; по 8 байт/тик в texorder face0 клеток 0x67..0x6E).
+    if (gd.build == Build::ZTU) {
+        gd.trainScript.resize(0x268);
+        for (size_t i = 0; i < 0x268; ++i) gd.trainScript[i] = rom.u8(0xDE578 + i);
     }
 
     gd.valid = !gd.levels.empty() && gd.levels[0].valid();

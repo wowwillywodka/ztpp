@@ -31,6 +31,12 @@ struct VP { uint8_t dur, id; };
 // Озвучка (ROM: пункт Options «Voice:», бит1 $FF0014; дефолт ROM = OFF, порт = ON как QoL): вкл/выкл и темп
 // через ползунок voicePace() (tuning.hpp, меню стр.4 «Voice pace», 0 = выкл).
 inline bool voiceEnabled() { return voicePace() > 0.01; }
+// ⭐БИЛД сообщений (2026-07-24, ROM-дифф ZT↔ZTU): 0=ZT (дефолт), 1=ZTU — ставится в main по gd.build.
+// ZTU: таблица этажей @0x1F844 (ref level-load 0xBA88) = «ENTERING SUBWAY LEVEL 1..13» со своей озвучкой;
+// предметы @0x1F8C4 = байт-в-байт ZT; 4 системных хвоста с ДРУГИМИ голос-id — ZTU вставил 3 не-голосовых
+// SFX на 0x9A..0x9C (SFX-таблица @0x96848), сдвинув DAC-реплики ZT 0x9A..0xA1 → ZTU 0x9D..0xA4 (+3).
+// ⚠ЗТ-id на ZTU звучат МУСОРОМ (0x9C..0x9E там type-01, не речь) — потому variant-таблицы обязательны.
+inline int& msgBuild() { static int b = 0; return b; }
 //                        "ряд0----.ряд1----.ряд2----.ряд3----"  (по 9 символов)
 inline const char* FLOOR_UP        = "STEPPING ONE FLOORUP                ";
 inline const char* FLOOR_DOWN      = "STEPPING ONE FLOORDOWN              ";
@@ -77,6 +83,12 @@ inline const VP V_PROCEED[]  = {{65,0x9e},{30,0x3d},{0,0}};
 inline const VP V_AMMO[]     = {{45,0x60},{55,0x45},{30,0x3e},{0,0}};
 inline const VP V_HP_LOW[]   = {{45,0x3c},{30,0x3e},{0,0}};
 inline const VP V_HP_CRIT[]  = {{45,0x3c},{30,0x35},{0,0}};
+// ⭐ZTU-варианты (байт-в-байт из ROM: singles @0x1F014/0x1F042/0x1F180/0x1F1B2): те же тексты,
+// голос-id речи сдвинуты +3 (см. msgBuild). Остальные singles/предметы ZTU = байт-в-байт ZT (verified).
+inline const VP V_SECURED_ZTU[] = {{17,0x56},{30,0xa3},{0,0}};
+inline const VP V_NOT_SEC_ZTU[] = {{17,0x56},{20,0xa0},{30,0xa3},{0,0}};
+inline const VP V_ZERO_EN_ZTU[] = {{25,0xa4},{25,0x9f},{30,0xa2},{0,0}};
+inline const VP V_PROCEED_ZTU[] = {{65,0xa1},{30,0x3d},{0,0}};
 // Предметы id1..14 (таблица подбора 0x1ef14):
 inline const VP V_ITEM[15][4] = {
     /*0 */ {{0,0}},
@@ -117,11 +129,38 @@ inline const VP V_EP1[16][6] = {
     {{30,0x53},{20,0x56},{40,0x92},{27,0x4c},{30,0x47},{0,0}}, {{30,0x53},{20,0x56},{40,0x92},{27,0x4c},{30,0x47},{0,0}},
 };
 
+// ⭐Этажи ZTU (таблица @0x1F844[floor], 16 записей → тексты 0x1F1E0..): субвей LEVEL 1..13, этажи 13-15
+// в ROM повторяют LEVEL 13 (указатели одинаковые). Озвучка БЕЗ слова-имени этажа: ENTERING(0x53)+LEVEL(0x3d)+
+// цифра; уровни 10..13 = ENTERING+0x3E(«ten»)+LEVEL(+цифра). Байт-в-байт из ROM (msgdiff 2026-07-24).
+inline const VP V_ZTU_FLOOR[16][5] = {
+    {{30,0x53},{20,0x3d},{30,0x47},{0,0}},           {{30,0x53},{20,0x3d},{30,0x48},{0,0}},
+    {{30,0x53},{20,0x3d},{30,0x49},{0,0}},           {{30,0x53},{20,0x3d},{30,0x4a},{0,0}},
+    {{30,0x53},{20,0x3d},{30,0x4b},{0,0}},           {{30,0x53},{20,0x3d},{30,0x4e},{0,0}},
+    {{30,0x53},{20,0x3d},{30,0x4f},{0,0}},           {{30,0x53},{20,0x3d},{30,0x5b},{0,0}},
+    {{30,0x53},{20,0x3d},{30,0x5f},{0,0}},           {{30,0x53},{20,0x3e},{20,0x3d},{0,0}},
+    {{30,0x53},{20,0x3e},{20,0x3d},{30,0x47},{0,0}}, {{30,0x53},{20,0x3e},{20,0x3d},{30,0x48},{0,0}},
+    {{30,0x53},{20,0x3e},{20,0x3d},{30,0x49},{0,0}}, {{30,0x53},{20,0x3e},{20,0x3d},{30,0x49},{0,0}},
+    {{30,0x53},{20,0x3e},{20,0x3d},{30,0x49},{0,0}}, {{30,0x53},{20,0x3e},{20,0x3d},{30,0x49},{0,0}},
+};
 // «ENTERING ‹название› LEVEL n» при смене этажа — ТОЛЬКО эпизоды 0/1 (ROM level_load: если -0x58e4≠2 →
 // таблица @0x1ee94[ep*16+floor]). Эпизод 2 (третий) → generic «STEPPING ONE FLOOR UP/DOWN» (см. main).
 // Тексты байт-в-байт из ROM (36 симв 4×9). ep 0-based, floor = индекс этажа 0..15.
+// ⭐ZTU (msgBuild()==1): единственный эпизод — таблица субвея на ЛЮБОЙ ep.
 inline const char* enteringFloor(int ep, int floor) {
     if (floor < 0 || floor > 15) return nullptr;
+    if (msgBuild() == 1) {
+        static const char* ZTU[16] = {   // ZTU @0x1F1E0.. (13-15 = повтор LEVEL 13, как указатели ROM)
+            "ENTERING SUBWAY   LEVEL 1           ", "ENTERING SUBWAY   LEVEL 2           ",
+            "ENTERING SUBWAY   LEVEL 3           ", "ENTERING SUBWAY   LEVEL 4           ",
+            "ENTERING SUBWAY   LEVEL 5           ", "ENTERING SUBWAY   LEVEL 6           ",
+            "ENTERING SUBWAY   LEVEL 7           ", "ENTERING SUBWAY   LEVEL 8           ",
+            "ENTERING SUBWAY   LEVEL 9           ", "ENTERING SUBWAY   LEVEL 10          ",
+            "ENTERING SUBWAY   LEVEL 11          ", "ENTERING SUBWAY   LEVEL 12          ",
+            "ENTERING SUBWAY   LEVEL 13          ", "ENTERING SUBWAY   LEVEL 13          ",
+            "ENTERING SUBWAY   LEVEL 13          ", "ENTERING SUBWAY   LEVEL 13          ",
+        };
+        return ZTU[floor];
+    }
     static const char* EP0[16] = {   // эпизод 1: корабль/платформа U.S.S.
         "ENTERING DOCKING  BAY LEVEL1        ", "ENTERING DOCKING  BAY LEVEL2        ",
         "ENTERING BRIDGE   LEVEL 1           ", "ENTERING ENGINE   LEVEL 1           ",
@@ -148,6 +187,7 @@ inline const char* enteringFloor(int ep, int floor) {
 }
 inline const VP* enteringFloorVoice(int ep, int floor) {
     if (floor < 0 || floor > 15) return nullptr;
+    if (msgBuild() == 1) return V_ZTU_FLOOR[floor];   // ⭐ZTU: субвей на любой ep
     if (ep == 0) return V_EP0[floor];
     if (ep == 1) return V_EP1[floor];
     return nullptr;
@@ -155,19 +195,20 @@ inline const VP* enteringFloorVoice(int ep, int floor) {
 // Озвучка по указателю ТЕКСТА (все тексты — inline-синглтоны, сравнение указателей корректно).
 // Так push() сам находит реплику — вызывающим не надо тянуть второй аргумент.
 inline const VP* voiceFor(const char* s) {
+    bool ztu = (msgBuild() == 1);                     // ⭐ZTU: 4 системных хвоста с другими голос-id (см. шапку)
     if (s == FLOOR_UP)        return V_FLOOR_UP;
     if (s == FLOOR_DOWN)      return V_FLOOR_DN;
-    if (s == FLOOR_SECURED)   return V_SECURED;
-    if (s == FLOOR_NOT_SEC)   return V_NOT_SEC;
-    if (s == ZERO_ENEMIES)    return V_ZERO_EN;
-    if (s == PROCEED_NEXT)    return V_PROCEED;
+    if (s == FLOOR_SECURED)   return ztu ? V_SECURED_ZTU : V_SECURED;
+    if (s == FLOOR_NOT_SEC)   return ztu ? V_NOT_SEC_ZTU : V_NOT_SEC;
+    if (s == ZERO_ENEMIES)    return ztu ? V_ZERO_EN_ZTU : V_ZERO_EN;
+    if (s == PROCEED_NEXT)    return ztu ? V_PROCEED_ZTU : V_PROCEED;
     if (s == AMMO_LOW)        return V_AMMO;
     if (s == HEALTH_LOW)      return V_HP_LOW;
     if (s == HEALTH_CRITICAL) return V_HP_CRIT;
     if (s == MEDIPACK)        return V_MEDIPACK;
     for (int i = 1; i <= 14; ++i) if (s == itemCollected(i)) return V_ITEM[i];
-    for (int f = 0; f < 16; ++f) { if (s == enteringFloor(0, f)) return V_EP0[f];
-                                   if (s == enteringFloor(1, f)) return V_EP1[f]; }
+    for (int f = 0; f < 16; ++f) { if (s == enteringFloor(0, f)) return enteringFloorVoice(0, f);
+                                   if (s == enteringFloor(1, f)) return enteringFloorVoice(1, f); }
     return nullptr;                 // CONNECTION_LOST и прочие — без озвучки (как ROM)
 }
 }
@@ -214,7 +255,7 @@ struct HudMessages {
         queue.push_back(m);
     }
     void pushItem(int id) { push(ztmsg::itemCollected(id)); }
-    void clear() { queue.clear(); timer = 0; vSeq = nullptr; vIdx = 0; vTimer = 0; }
+    void clear() { queue.clear(); timer = 0; vSeq = nullptr; vIdx = 0; vTimer = 0; snd::voiceBusy() = false; }
 
     // ⭐Длительности реплик — в 1/60 с: таймер -$7734 декрементирует VBLANK-обработчик @0xAA2
     // (`subq #1,$ff08cc` каждую развёртку, 60 Гц), а НЕ игровой цикл. (Дисплей-таймер -$76f0 — наоборот,
@@ -229,13 +270,16 @@ struct HudMessages {
     // ОЗВУЧКИ (см. шапку): пары (длительность, сэмпл), гейт «Voice:» = бит1 $FF0014 (меню Options; я сперва
     // счёл его мёртвым — грепал байт -7feb=$FF0015, а пишется он СЛОВОМ через $FF0014, юзер поправил).
     void update() {
+        // ⭐ОБРЫВ РЕПЛИКИ ФОРС-ЗВУКОМ (ROM: оружейные сайты чистят -$58EA; менеджер 1e2cc по tst
+        // прекращает цепь): snd::playSfxForce сбросил voiceBusy → бросаем последовательность.
+        if (vSeq && !snd::voiceBusy()) { vSeq = nullptr; vIdx = 0; vTimer = 0; }
         // РЕПЛИКА (менеджер ROM 1e2cc): тикает независимо от показа; по истечении пары — следующий сэмпл.
         if (vSeq) {
             if (--vTimer <= 0) {
                 ++vIdx;
                 const ztmsg::VP& p = vSeq[vIdx];
-                if (p.dur == 0 && p.id == 0) { vSeq = nullptr; vIdx = 0; }         // конец последовательности
-                else { snd::playSfx(p.id); vTimer = vScale(p.dur); }
+                if (p.dur == 0 && p.id == 0) { vSeq = nullptr; vIdx = 0; snd::voiceBusy() = false; }   // конец (ROM 1e2a6: clr -58EA)
+                else { snd::playSfx(p.id); vTimer = vScale(p.dur); }   // слово гейтится -$58E8 (тип3): после выстрела может выпасть — как ROM
             }
         }
         bool wasShowing = (timer > 0);
@@ -251,8 +295,8 @@ struct HudMessages {
             // голос этого сообщения ПРОПУСКАЕТСЯ (1e294 tst -58ea), не прерывает и не ставится в очередь.
             const ztmsg::VP* v = queue.front().voice;
             if (ztmsg::voiceEnabled() && !vSeq && v && !(v[0].dur == 0 && v[0].id == 0)) {
-                vSeq = v; vIdx = 0;
-                snd::playSfx(v[0].id); vTimer = vScale(v[0].dur);              // 1-й сэмпл сразу (1e2bc→d796)
+                vSeq = v; vIdx = 0; snd::voiceBusy() = true;                   // ⭐ROM 1e2b6: -$58EA=1 (глушит вежливые PCM)
+                snd::playSfx(v[0].id); vTimer = vScale(v[0].dur);              // 1-й сэмпл сразу (1e2bc→d796; гейтится -$58E8)
             }
         }
     }

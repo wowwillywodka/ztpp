@@ -44,7 +44,7 @@ void fireSpawn(const Inventory& inv, const Level& lvl, const Camera& cam) {
         // (dmg 256); БОЕЦ3 X=0xc8 (dmg 824, силач, ≥0x338=с кровью); БОЕЦ4 X=0x1f4 (dmg 524). Кулаки НАНОСЯТ урон
         // (заблуждение «кулаки безвредны» — неверно; урон в анимации на кадре контакта). Руки чередуются (punchSide).
         int fg = playerFighter();
-        snd::playSfx(0x1b);                                     // ЗАМАХ на КАЖДЫЙ удар (ZT 12bac move #$1b,d0→d760); лёгкий «вжух»
+        snd::playSfxForce(0x1b, 0x0F);                          // ЗАМАХ на КАЖДЫЙ удар (ZT 12bac→12bca: ФОРС-сайт оружия, arm 0xF)
         int reachScale = (fg == 3) ? 100 : 160;                 // порог ближней дальности (0x64 / 0xa0)
         int ti = coneTargetEnemy(lvl, cam.floor, cam.px, cam.py, cam.dirX, cam.dirY, 0, reachScale);
         snipTryAimKill(lvl, cam);        // хвост 167b0 — исполняется и на кулачном конусе (ROM)
@@ -54,11 +54,11 @@ void fireSpawn(const Inventory& inv, const Level& lvl, const Camera& cam) {
             Actor& a = actors()[ti];
             if (a.think == AT_CORPSE) corpseHit(a, cam.px, cam.py, raw);   // пнуть/ударить ТРУП (из приседа) → лёгкий отлёт
             else { int dmg = raw / 100 < 1 ? 1 : raw / 100; hitEnemy(a, dmg, cam.px, cam.py, raw); }
-            snd::playSfx(inv.punchVariant >= 2 ? 0x1a : 0x17);      // КОНТАКТ по врагу: кик-вниз(вар2)=0x1a / удар-нейтр/вверх=0x17 (ZT 12146: var<2→0x1a; var нейтр=3/вверх=5/вниз=1)
+            snd::playSfxForce(inv.punchVariant >= 2 ? 0x1a : 0x17, 0x0F);   // КОНТАКТ по врагу: кик-вниз(вар2)=0x1a / удар=0x17 (ZT 12146→12158: ФОРС, arm 0xF)
         } else {                                                     // промах: удар в стену вплотную → 0x1c; в воздух → только замах 0x1b (ZT 12178 beq)
             int cx = (int)(cam.px + cam.dirX * 0.5), cy = (int)(cam.py + cam.dirY * 0.5);
             if (cx >= 0 && cy >= 0 && cx < Level::W && cy < Level::H &&
-                cellBlockedAt(lvl.cellType(cam.floor, cx, cy), 0.5, 0.5)) snd::playSfx(0x1c);
+                cellBlockedAt(lvl.cellType(cam.floor, cx, cy), 0.5, 0.5)) snd::playSfxForce(0x1c, 0x0F);   // ZT 12186→12192: ФОРС, arm 0xF
         }
         return;
     }

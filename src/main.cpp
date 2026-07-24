@@ -36,6 +36,7 @@
 #include "password.hpp"
 #include "select_screen.hpp" // ⭐экран выбора бойца (PLANET DEFENSE CORPS) + DECEASED (после ui.hpp/gamedata)
 #include "briefing.hpp"      // ⭐заставки/брифинги (скроллящийся текст поверх фона)
+#include "train.hpp"         // ⭐поезд метро ZTU (FSM 0xDE8DA: клетки ряда + скрипт-текстуры)
 #include "password_entry.hpp" // ⭐экран ввода пароля (сетка ROM 58054 + клавиатура)
 #include "title_fx.hpp"
 #include "version.hpp"      // ⭐версия порта (ZTPP_VERSION из CMake)
@@ -381,6 +382,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "ВНИМАНИЕ: ZMAP-сигнатура E1 не совпала — данные могут быть неверны\n");
     std::printf("Билд: %s\n", buildName(gd.build));
     initProfile(gd.build);   // ⭐КОНТУР ДАННЫХ: настройки/сейвы этого билда — в profiles/<key>/
+    ztmsg::msgBuild() = (gd.build == Build::ZTU) ? 1 : 0;   // ⭐HUD-сообщения/озвучка: ZTU-таблицы (этажи субвея + голос-id +3)
     // ⭐ФОНОВЫЙ СНАЙПЕР эп2 (sniper_overlay.hpp): тайлы 0x16DA58/0x16E058 + таблицы 2510/2600/265E/297A.
     // Адреса релиза ZT — на других билдах не инициализируем (клеток 0x27/0x28 у них нет).
     if (gd.build == Build::ZT) snip::init(rom);
@@ -428,6 +430,7 @@ int main(int argc, char** argv) {
     MetaCache meta; meta.wall = &gd.wall; meta.obj = &gd.obj; meta.shadeRampData = gd.shadeRamps.data();
     meta.fcTemplateData = gd.fcTemplates.data();   // слой пол/потолок (ROM-шаблоны по env)
     WallAnimator wallAnim;                          // анимация текстур стен (мигание экранов/ламп/глаз)
+    SubwayTrain train; train.script = gd.trainScript;   // ⭐поезд метро (ZTU; пустой скрипт = выкл)
     std::vector<double> zbuf;
     Inventory inv;                  // инвентарь игрока (старт: пусто = кулаки, current=−1)
     int aEp = -1, aFloor = -1;      // эпизод/этаж, для которого заспавнены враги-актёры (респавн при смене)
@@ -468,7 +471,9 @@ int main(int argc, char** argv) {
     // экранов ни было в очереди), БЕЗ рестартов между экранами. Играется только при СТАРТЕ сессии.
     // Треки: интро-сессия=id0x00 (caade), межэпизодные=0x03, victory=0x89, bad-end=0x01/0x02 (предп.).
     auto briefMusic = [&](int idx) {
-        int sid = 0x03;                                    // общий трек текст-заставок (вкл. интро; id0 = тема эп0, НЕ интро)
+        // ⭐ZTU (verified прологи 0x9B490/9B5B6/9B6DC: move #id,d0 → плеер 96af6): текст-заставки
+        //   (вкл. subway-интро) = УНИКАЛЬНЫЙ трек 0x01; victory 0x89 / badend 0x87 совпадают с ZT.
+        int sid = (gd.build == Build::ZTU) ? 0x01 : 0x03;  // ZT: общий трек текст-заставок (id0 = тема эп0, НЕ интро)
         if (idx == BR_VICTORY)      sid = 0x89;
         else if (idx == BR_BADEND1 || idx == BR_BADEND2 || idx == BR_EXPLODE || idx == BR_EXIT)
             sid = 0x87;                                    // game-over/эпилог (caf1a; юзер: 0x01/0x02 неверны)
@@ -506,8 +511,24 @@ int main(int argc, char** argv) {
             for (int id = 1; id <= 14; ++id) if (inv.has(id)) std::fprintf(stderr, " id%d(x%d)", id, inv.ammo[id]);
             std::fprintf(stderr, " armor=%d current=%d\n", player().armor, inv.current); }
     };
+    // ⭐ВЫДАЧА стартового набора БЕЗ СБРОСА (ROM смерть→выбор, VERIFIED 2026-07-24: E78 снапшотит 5 слотов
+    // погибшего → C6362 выбор → EB6 восстанавливает их новому бойцу, F2A добавляет его стартовый набор
+    // (0xF98) через выдачу 11084 — ИНВЕНТАРЬ НАСЛЕДУЕТСЯ, applyFighterStart с inv.reset() тут неверен).
+    auto grantFighterStart = [&](int f) {
+        if (f < 0 || f >= 5) { inv.syncCurrent(); return; }
+        for (int i = 0; i < 2; ++i) {
+            int id = gd.startInv[f][i * 2], cnt = gd.startInv[f][i * 2 + 1] >> 8;
+            if (id >= 1 && id <= 14) {
+                if (!inv.has(id)) inv.addItem(id);
+                inv.ammo[id] += cnt;                       // как пикап (выдача 11084 суммирует боезапас)
+                if (id == 3) { player().armor += cnt * 10; if (player().armor > 100) player().armor = 100; }
+            }
+        }
+        inv.syncCurrent();
+    };
     respawn();
     wallAnim.init(gd.levels[ep], meta);   // живой texdef эпизода → MetaCache (анимация стен)
+    train.init(gd.levels[ep]);            // ⭐поезд метро ZTU: ряды клеток + сброс FSM (ROM DE7F0)
 
     // Тест-override позиции/угла камеры (для отладки граней): --px --py --ang(градусы)
     if (argStr(argc, argv, "--px")) cam.px = std::atof(argStr(argc, argv, "--px"));
@@ -684,6 +705,8 @@ int main(int argc, char** argv) {
           if (mode == 3) for (int i = 0; i < di; ++i) rcUpdateDoors(cam.floor, cam.px, cam.py, gd.levels[ep]); }
         for (int i = 0, af = argInt(argc, argv, "--animframe", 0); i < af; ++i)
             wallAnim.update();                              // прокрутить N игр.кадров анимации стен (отладка)
+        for (int i = 0, tt = argInt(argc, argv, "--trainticks", 0); i < tt; ++i)   // ⭐прокрутить FSM поезда ZTU
+            train.tick(gd.levels[ep], (int)cam.px, (int)cam.py, cam.floor);        //   (ROM-тики; отладка дампом)
         decorFrame() = argInt(argc, argv, "--animframe", 0);  // фаза анимации декора (вентилятор/мигание)
         if (const char* w = argStr(argc, argv, "--weap")) {   // отладка: показать ствол N в руках
             int wi = (int)std::strtol(w, nullptr, 0);
@@ -954,7 +977,7 @@ int main(int argc, char** argv) {
         floor = nf; dirty = true;
         if (mode == 3) respawn();
     };
-    auto setEp = [&](int ne) { if (ne < 0 || ne >= gd.episodes()) return; ep = ne; snd::musicStop(); activeBg() = gd.bgForEpisode(ep); dirty = true; if (mode == 3) respawn(); wallAnim.init(gd.levels[ep], meta); inv.reset(); fullInv = false; resetPlayerHP(); rcResetPickups(); clearActors(); clearWallState(); aEp = aFloor = -1; };  // новый эпизод → инвентарь/HP/актёры/стены с нуля
+    auto setEp = [&](int ne) { if (ne < 0 || ne >= gd.episodes()) return; ep = ne; snd::musicStop(); activeBg() = gd.bgForEpisode(ep); dirty = true; if (mode == 3) respawn(); wallAnim.init(gd.levels[ep], meta); train.init(gd.levels[ep]); inv.reset(); fullInv = false; resetPlayerHP(); rcResetPickups(); clearActors(); clearWallState(); aEp = aFloor = -1; };  // новый эпизод → инвентарь/HP/актёры/стены с нуля (+поезд ZTU: ROM DE7F0)
     auto setMode = [&](int nm) { mode = nm; dirty = true; if (mode == 3) respawn(); };
 
     // ── ⭐ПАРОЛИ (ROM 58720/58a74, password.hpp — бит-в-бит): построение из текущего состояния + применение ──
@@ -1283,10 +1306,13 @@ int main(int argc, char** argv) {
         if (wantBoot) {                                   // ⭐ROM 0x976: копирайт → TECHNOPOP-заставка → интро
             bootPhase = 0; bootFrame = 0; bootPhaseMs = SDL_GetTicks(); bootThenBrief = wantBrief;
             snd::playSfx(0x03);                           // ⭐ROM 976: jsr c6156(#3) — музыка id3 играет с самого старта
-        } else if (wantBrief) {                           // старт → INTRO + MISSION → потом выбор бойца
-            briefState.idx = BR_INTRO; briefState.scroll = 0; briefFade = 0;
-            briefMusic(BR_INTRO);                          // ⭐ROM caade: интро-заставка = музыка id0
-            briefQueue = { BR_MISSION };                  // следующая после intro
+        } else if (wantBrief) {                           // старт → интро-заставка → потом выбор бойца
+            // ⭐ZTU (verified 0xEB8: playCutscene(2)=subway): старт = ОДИН экран субвея (текст 0x9C96F),
+            //   НЕ intro+mission. ZT-флоу: INTRO(0x9BD44)+MISSION(0x9C1C0).
+            bool ztu = (gd.build == Build::ZTU);
+            briefState.idx = ztu ? BR_SUBBASE : BR_INTRO; briefState.scroll = 0; briefFade = 0;
+            briefMusic(briefState.idx);                    // ⭐ROM caade: интро-заставка = музыка id0 (ZTU: id3)
+            briefQueue.clear(); if (!ztu) briefQueue = { BR_MISSION };   // ZT: mission после intro; ZTU: очереди нет
             briefThenSelect = true;
         } else {
             selectActive = wantSelect;
@@ -1298,9 +1324,20 @@ int main(int argc, char** argv) {
     auto endBoot = [&]() {
         bootPhase = -1;
         if (bootThenBrief && !startPwPending && !gd.briefings.empty()) {   // ⭐continue по паролю → БЕЗ интро-заставки, сразу выбор
-            briefState.idx = BR_INTRO; briefState.scroll = 0; briefFade = 0;
-            briefQueue = { BR_MISSION }; briefThenSelect = true;   // музыка id3 УЖЕ играет с boot (ROM: непрерывно)
+            bool ztu = (gd.build == Build::ZTU);           // ⭐ZTU старт = subway (playCutscene(2)), не intro+mission
+            briefState.idx = ztu ? BR_SUBBASE : BR_INTRO; briefState.scroll = 0; briefFade = 0;
+            briefQueue.clear(); if (!ztu) briefQueue = { BR_MISSION };
+            briefThenSelect = true;   // ZT: музыка id3 УЖЕ играет с boot (ROM: непрерывно)
+            if (ztu) briefMusic(briefState.idx);           // ⭐ZTU: F3-пролог 0x9B6DC переключает трек 3→1
         } else { selectActive = true; selFade = 0; }
+    };
+    // ⭐СКИП boot-фазы (кнопка/клик): ZTU-флоу (мод-лого, без SEGA) — с лого СРАЗУ титул (ROM 0xA2C:
+    // 2638E → 0xE58 → титул; копирайт/Accolade/Technopop в ZTU-boot не показываются). ZT — по цепочке +1.
+    auto skipBootPhase = [&]() {
+        bootPhase = (bootPhase == 0 && !gd.hasSega && !gd.logoFrames.empty()) ? 4 : bootPhase + 1;
+        bootFrame = 0; bootPhaseMs = SDL_GetTicks();
+        if (bootPhase == 4) { titleMenuOn = false; titleSel = 1; }
+        dirty = true;
     };
 
     // ⭐КОНЕЦ СЕССИИ ЗАСТАВОК (Start-скип И авто-доскролл — одна логика). ROM-флоу:
@@ -1397,11 +1434,8 @@ int main(int argc, char** argv) {
                         }
                         dirty = true; continue;
                     }
-                    if (key == SDL_SCANCODE_RETURN || key == SDL_SCANCODE_SPACE || key == SDL_SCANCODE_RCTRL) {
-                        bootPhase = bootPhase + 1; bootFrame = 0; bootPhaseMs = SDL_GetTicks();
-                        if (bootPhase == 4) { titleMenuOn = false; titleSel = 1; }
-                        dirty = true;
-                    }
+                    if (key == SDL_SCANCODE_RETURN || key == SDL_SCANCODE_SPACE || key == SDL_SCANCODE_RCTRL)
+                        skipBootPhase();                          // ⭐ZTU: с мод-лого сразу титул (не копирайт)
                     continue;   // заставка поглощает ввод
                 }
                 // ⭐ЗАСТАВКА (ZT @0xCB1E4): Start/Enter пропускает к следующей, остальной ввод поглощается.
@@ -1550,8 +1584,7 @@ int main(int argc, char** argv) {
             }
             else if (e.type == SDL_MOUSEBUTTONDOWN && bootPhase >= 0 && !menu && e.button.button == SDL_BUTTON_LEFT) {
                 // ⭐МЫШЬ на стартовых заставках/титуле: клик = пропуск фазы; на титуле — выбор START/OPTIONS
-                if (bootPhase < 4) { bootPhase++; bootFrame = 0; bootPhaseMs = SDL_GetTicks();
-                    if (bootPhase == 4) { titleMenuOn = false; titleSel = 1; } dirty = true; }
+                if (bootPhase < 4) skipBootPhase();               // ⭐ZTU: с мод-лого сразу титул (не копирайт)
                 else {
                     int ww = FBW, wh = FBH; SDL_GetWindowSize(win, &ww, &wh);
                     SDL_Rect src, dst; presentRects(ww, wh, false, src, dst);
@@ -1741,7 +1774,10 @@ int main(int argc, char** argv) {
                     // 0x1d5d0 (рампа к целевой палитре; порт: in/out по 30 кадров, длительность из дизасма).
                     const Uint32 DUR = 180 * 1000 / 60, RAMP = 30 * 1000 / 60;
                     int li = (int)(el / DUR);
-                    if (li >= (int)gd.logoFrames.size()) { bootPhase = 1; bootFrame = 0; bootPhaseMs = SDL_GetTicks(); el = 0; }
+                    // ⭐ROM ZTU 0xA2C: jsr 2638E (ДВА лого: PIKO на белом + разработчик) → bra 0xE58 → ТИТУЛ.
+                    // Копирайта/Accolade/Technopop в boot ZTU НЕТ (данные в ROM есть, но показ отключён —
+                    // аудит: «1d7ba кончается RTS») — после лого сразу титул (юзер 2026-07-24).
+                    if (li >= (int)gd.logoFrames.size()) { bootPhase = 4; titleMenuOn = false; titleSel = 1; bootFrame = 0; bootPhaseMs = SDL_GetTicks(); el = 0; }
                     else {
                         img = &gd.logoFrames[li];
                         Uint32 pe = el - (Uint32)li * DUR;
@@ -1844,7 +1880,13 @@ int main(int argc, char** argv) {
                     applyPassword(startPwState);
                     if (startPwState.cheatFull) applyFighterStart(playerFighter());   // чит-слово: снаряжение бойца по умолчанию
                     startPwPending = false;
-                } else { applyFighterStart(playerFighter()); respawn(); }   // ⭐стартовый инвентарь выбранного бойца
+                } else if (selPending) {              // ⭐СМЕРТЬ→НОВЫЙ БОЕЦ (ROM 17F8..19D4, VERIFIED 2026-07-24):
+                    grantFighterStart(playerFighter());   // инвентарь погибшего НАСЛЕДУЕТСЯ + стартовый набор (EB6+F2A)
+                    msgs.clear();                     // ROM 1910: jsr 1E0DE — очередь HUD-сообщений в ноль
+                    // (ROM 1826: c6156(эпизод) = старт ВНУТРИИГРОВОЙ темы эпизода — порт in-game музыку пока
+                    //  не играет вовсе; подключить вместе с задачей «музыка-автоплей по уровням», BACKLOG)
+                    respawn();                        // ct0x77 текущего этажа, взгляд на ВОСТОК (rcSpawn)
+                } else { applyFighterStart(playerFighter()); respawn(); }   // старт игры: стартовый инвентарь (сброс)
                 floor = cam.floor;                    // синхронизировать внешний floor с загруженным этажом
                 // СМЕРТЬ → новый боец: мир ПЕРСИСТЕНТЕН (ROM: респавн ct0x77 без reload — убитые/разбуженные/
                 // позиции сохраняются; пул чистится только на загрузке уровня 133a4). Прежний clearActors+re-collect
@@ -1988,7 +2030,7 @@ int main(int argc, char** argv) {
                 }
             }
             // ПУЛЬС: доиграть очередь звука 0x1e (2 повтора после выстрела, ~70мс) — 1 выстрел звучит 3×, патрон 1
-            if (pulseSndBurst > 0 && SDL_GetTicks() >= pulseSndNext) { snd::playSfx(0x1e); --pulseSndBurst; pulseSndNext = SDL_GetTicks() + 70; }
+            if (pulseSndBurst > 0 && SDL_GetTicks() >= pulseSndNext) { snd::playSfxForce(0x1e, 0x0F); --pulseSndBurst; pulseSndNext = SDL_GetTicks() + 70; }   // ROM 12f7c/130f8: форс-сайт оружия
             prevFireHeld = fireHeld;                          // edge-детект для semi-auto (следующий кадр)
             // ⭐ПЕРСИСТЕНТНОСТЬ ЭТАЖЕЙ (ROM b8fc): смена этажа НЕ переинициализирует мир. Пул актёров
             // глобальный (чистится только на загрузке уровня, ROM 133a4), убитые/разбуженные/позиции
@@ -2070,7 +2112,11 @@ int main(int argc, char** argv) {
                 pwEpisodePass = buildPasswordFor(ep * 16 + 15);
                 // ⭐ПОРЯДОК = ROM-секвенсер (блоки: intro,mission,decoy,central,subbase,intro,victory;
                 // вход caa4e: d0=1→[DECOY,CENTRAL], d0=2→[SUBBASE], d0=4→[VICTORY+титры в конце текста])
-                if (ep == 0)      { briefState.idx = BR_DECOY;   briefQueue = { BR_CENTRAL }; pendingEpisode = 1; }
+                if (gd.build == Build::ZTU) {   // ⭐ZTU одноэпизодный (verified 0x1B44 playCutscene(4)→victory,
+                                                //   0x1B62 ep+1==1→ребут): завершение субвея = ПОБЕДА → рестарт
+                    briefState.idx = BR_VICTORY; briefQueue = {}; pendingEpisode = 0; briefThenSelect = true;
+                }
+                else if (ep == 0) { briefState.idx = BR_DECOY;   briefQueue = { BR_CENTRAL }; pendingEpisode = 1; }
                 else if (ep == 1) { briefState.idx = BR_SUBBASE; briefQueue = {}; pendingEpisode = 2; }
                 else              { briefState.idx = BR_VICTORY; briefQueue = {}; pendingEpisode = 0; briefThenSelect = true; }  // финал: победа+титры → заново
                 briefState.scroll = 0; briefFade = 0;
@@ -2109,8 +2155,11 @@ int main(int argc, char** argv) {
                             briefMusic(briefState.idx);                     //  не с этажа смерти (юзер 2026-07-17)
                         } else { gameOver = true; selectActive = true; selFade = 0; }
                     }
+                    // ⭐ROM 0x17AE (VERIFIED 2026-07-24): jsr C62E8 = СТОП текущей музыки перед выбором
+                    // (-$58F8 = id последней ПРЯМО-играной музыки: SFX идут через d796→c615a МИМО записи;
+                    // c62e8 по типу 0 шлёт GEMS cmd 0x12 STOPSONG). На экране выбора после смерти — ТИШИНА.
                     else { selPending = true; selectActive = true; selState.cursor = playerFighter(); selFade = 0;
-                           snd::musicStop(); }  // ⭐на экране выбора музыки НЕТ (юзер: тема эпизода продолжала играть)
+                           snd::musicStop(); }
                 }   // затухание вспышки — VBlank-правило 0xB12 в главном цикле (не сим-тик)
             }
 
@@ -2143,7 +2192,7 @@ int main(int argc, char** argv) {
                 else    msgs.push(cam.floor > msgFloor ? ztmsg::FLOOR_DOWN : ztmsg::FLOOR_UP);
                 msgFloor = cam.floor;
             }
-            if (rcUpdateDoors(cam.floor, cam.px, cam.py, gd.levels[ep])) snd::ev(snd::SFX_DOOR);  // анимация дверей + ЗВУК открытия (0x6d)
+            if (rcUpdateDoors(cam.floor, cam.px, cam.py, gd.levels[ep])) snd::ev(snd::SFX_DOOR);  // анимация дверей + ЗВУК 0x67: открытие (b2f2) И дозакрытие (b3f4 — тот же звук)
             // ⭐МУЗЫКА ГЕЙМПЛЕЯ (ROM level_load 119c/1826: id = НОМЕР ЭПИЗОДА → seq0/7/2). В ЛИФТЕ (клетки
             // кабины/area) — музыка кабины 0x88 ВСЁ ВРЕМЯ пребывания, тема эпизода вернётся ТОЛЬКО по выходе
             // (юзер). want-модель: смена желаемого трека → стоп+старт; тишина (трек кончился) → перезапуск.
@@ -2180,7 +2229,7 @@ int main(int argc, char** argv) {
                              : (((int)std::lround(camDirToAng512(cam)) + 128) & 0x1FF);
                 snip::TickEv sev = snip::tick(entered, angRam);
                 if (sev.burst) { snd::playSfx(0x68); snd::playSfx(0x97); }   // очередь (2822/284a)
-                if (sev.shot)  snd::playSfx(0x18);                           // трассер долетел (2922)
+                if (sev.shot)  snd::playSfxForce(0x18, 0x32);                // трассер долетел (2922); взрыв = форс-сайт ROM 1413c (arm 0x32)
                 if (sev.hitCheck && onCell) {
                     // 0x27: укрытие если камера НИЗКО (2882: -71e6 ≤ −10) — присед ИЛИ нокдаун (ROM
                     // берёт полный -71e6). Порт: crouchY+knockPitch (jumpY>0 не спасает — только выше).
@@ -2190,6 +2239,8 @@ int main(int argc, char** argv) {
                 }
             }
             wallAnim.update();                              // анимация текстур стен (1 игр.кадр)
+            // ⭐ПОЕЗД МЕТРО ZTU (ROM: jsr DE8DA каждый кадр петли): FSM клеток ряда + скрипт-текстур.
+            train.tick(gd.levels[ep], (int)cam.px, (int)cam.py, cam.floor);
             ++decorFrame();                                 // анимация декора (вентилятор/мигание ламп)
             { bool wasUnlim = inv.unlimited; inv.unlimited = inventoryUnlimited();   // тумблер «безлимитный инвентарь»
               if (wasUnlim != inv.unlimited) inv.syncCurrent(); }                    // смена режима → кольцо меняет размер, пере-клампить sel

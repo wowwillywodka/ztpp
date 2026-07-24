@@ -369,6 +369,9 @@ void genNative(int& outL, int& outR) {
 void mix(void*, Uint8* stream, int len) {
     int16_t* out = (int16_t*)stream;
     int frames = len / (int)(2 * sizeof(int16_t));            // стерео S16
+    // ⭐DAC-гейт: декремент 60 Гц как VBLANK ROM (subq @0xAB4/0xADA) — тикает и при мьюте
+    { static double acc = 0.0; acc += frames * 60.0 / (double)devRate();
+      int n = (int)acc; if (n > 0) { acc -= n; int& g = dacGateVbl(); g -= n; if (g < 0) g = 0; } }
     double vol = soundOn() ? soundVolume() * 14.0 : 0.0;
     static double phase = 0.0; static int n0L = 0, n0R = 0, n1L = 0, n1R = 0;
     const double ratio = NATIVE_RATE / (double)devRate();
@@ -575,8 +578,27 @@ bool playSfx(int id) {
         if (d.p1 < (int)samples().size()) { play(d.p1); return true; }
         return false;
     }
+    // ⭐DAC-ГЕЙТЫ 68k-диспетчера (ZT c6284/c62c0, ZTU 96c24/96c60 — VERIFIED 2026-07-24): type2
+    // блокируется РЕПЛИКОЙ (-$58EA) И таймером (-$58E8); type3 (голос-слова) — только таймером.
+    // Заблокированный звук ОТБРАСЫВАЕТСЯ (не в очередь, не кража). Пробившийся — крадёт (Z80 12f9).
+    if (d.type == 2 && (voiceBusy() || dacGateVbl() > 0)) return false;
+    if (d.type == 3 && dacGateVbl() > 0) return false;
     { int s = dacSampleIdx(d); if (s >= 0 && s < (int)samples().size()) { play(s); return true; } }   // type2/3 DAC (type2→−48 ремап)
     return false;
+}
+// ⭐Классы ROM-сайтов DAC (скан `move #N,-$58E8(a6)` по обоим ROM, 2026-07-24):
+// вежливый (враги, d740-сайты 13xxx/16xxx): play гейтится, arm N БЕЗУСЛОВНО (даже если отброшен/чужой этаж);
+// форс (оружие игрока, 12xxx: `clr -58EA; clr -58E8; play; arm N`): обрывает реплику U-RON и гейт.
+bool playSfxPolite(int id, int armVbl) {
+    bool r = playSfx(id);
+    if (armVbl > 0) dacGateVbl() = armVbl;
+    return r;
+}
+bool playSfxForce(int id, int armVbl) {
+    voiceBusy() = false; dacGateVbl() = 0;           // clr -58EA/-58E8: менеджер сообщений увидит обрыв
+    bool r = playSfx(id);
+    if (armVbl > 0) dacGateVbl() = armVbl;
+    return r;
 }
 
 // ЛИФТ: 0x6f ОДНОЙ ДЛИННОЙ нотой (гудение на всю поездку). Патч 0x1a имеет долгую volume-огибающую.
@@ -609,6 +631,7 @@ void stopAllSfx() {
         wr(0, 0x28, keych); v.active = false; v.keyOff = 0; } }
     for (int i = 0; i < 6; ++i) dacv()[i].active = false;
     noiseV().active = false;
+    voiceBusy() = false; dacGateVbl() = 0;               // ⭐DAC-гейты не переживают переход (заставки/смена уровня)
     SDL_UnlockAudioDevice(dev());
 }
 
@@ -680,7 +703,10 @@ void load(const Rom& rom, size_t sampBase, size_t patchBase, size_t seqBase, siz
       } }
     // 2b) SFX-дескрипторы (таблица per-build, 3 байта/запись) — авторитетная карта id→(type,patch,note)
     sfxTable().clear();
-    for (int i = 0; i < 0xA2; ++i) { size_t o = sfxBase + (size_t)i * 3; if (o + 3 > rom.size()) break;   // 486 байт = 162 записи (0xa0 «secured»/0xa1 обрезались!)
+    // ⭐0xA5 записей: ZTU вставил 3 SFX на 0x9A..0x9C, сдвинув DAC-реплики до 0xA4 («REMAINING»=0xA2,
+    // «SECURED»=0xA3, «ZERO»=0xA4 — ROM-дифф 2026-07-24); прежний лимит 0xA2 их обрезал (playSfx → false).
+    // У ZT записи 0xA2..0xA4 = мусор за концом таблицы — безопасно: ZT-код id>0xA1 не зовёт, типы проверяются.
+    for (int i = 0; i < 0xA5; ++i) { size_t o = sfxBase + (size_t)i * 3; if (o + 3 > rom.size()) break;   // (было 0xA2: 0xa0 «secured»/0xa1 обрезались)
         SfxDesc d; d.type = rom.u8(o); d.p1 = rom.u8(o + 1); d.p2 = rom.u8(o + 2); sfxTable().push_back(d); }
     // 3) чип YM2612 + DAC включён
     OPN2_SetChipType(ym3438_mode_ym2612);

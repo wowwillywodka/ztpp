@@ -184,6 +184,19 @@ inline bool& dacRemap48() { static bool b = true; return b; }
 inline int dacSampleIdx(const SfxDesc& d) { if (!dacRemap48()) return d.p1; return (d.p1 >= 0x30) ? (d.p1 - 0x30) : (d.p1 + 0x30); }
 
 bool playSfx(int id);                                          // → sound.cpp (по игровому id)
+// ⭐DAC-ГЕЙТЫ 68k-диспетчера (VERIFIED дизасм 2026-07-24: ZT c6284/c62c0, ZTU 96c24/96c60 — байт-в-байт):
+// -$58EA ($FF2716) = «РЕПЛИКА U-RON ИДЁТ» (ставит менеджер сообщений 1e2b6, чистит 1e2a6);
+// -$58E8 ($FF2718) = vblank-ТАЙМЕР гейта (декремент 60 Гц в VBLANK @0xAB4/0xADA).
+// type2 (геймплей-PCM: выстрелы/крики) НЕ ИГРАЕТ при ЛЮБОМ из них; type3 (голос-слова) — при таймере.
+// Пробившийся сэмпл КРАДЁТ играющий (Z80 12f9: busy → steal). Классы ROM-сайтов:
+//   ФОРС (оружие игрока и пр., ~15 сайтов 12xxx: `clr -58EA; clr -58E8; play; arm N`) — режет реплику,
+//   ВЕЖЛИВЫЕ (враги, d740-сайты: `play (гейтится); arm N` — армят даже если звук отброшен),
+//   ПРЯМЫЕ (голос-слова 1e2c6→d796, смерти врагов: гейтятся, НЕ армят).
+// N по сайтам: 0x0F/0x14/0x1E/0x32 vblank ≈ длине сэмпла. plain playSfx = ПРЯМОЙ путь.
+inline int&  dacGateVbl() { static int v = 0; return v; }      // -$58E8 (порт: декремент в mix, 60 Гц)
+inline bool& voiceBusy()  { static bool b = false; return b; } // -$58EA (ставит/чистит HudMessages)
+bool playSfxPolite(int id, int armVbl);                        // вежливый сайт (d740-класс: враги)
+bool playSfxForce(int id, int armVbl);                         // форс-сайт (оружие: clr гейтов → play → arm)
 void playElevatorHum();                                        // → sound.cpp (лифт: 0x6f одной длинной нотой)
 void playSfxNote(int id, int note);                            // → sound.cpp (Sound Test: явная нота)
 void stopAllSfx();                                             // → sound.cpp
@@ -205,7 +218,26 @@ inline int* evMap() { static int m[SFX__COUNT] = {
     /*HURT     */ 0x68, /*DOOR    */ 0x67, /*SWITCH */ 0x6b, /*ENEMY_HIT*/ 0x68,                  // DOOR=0x67 (b35c/15c74); HURT/ENEMY_HIT не триггерятся
     /*ENEMY_FIRE*/ 0x1b, /*ENEMY_DEATH*/ 0x2d, /*WALL*/ 0x3b, /*ELEVATOR*/ 0x6f, /*GRENADE_BOUNCE*/ 0x18, /*MENU*/ 0x6b }; return m; }
     // ⚠ ещё уточнить: GRENADE(fire 12e7c)/FLAME(13024)/ENEMY_FIRE(per-enemy)/WALL(0x3b?=gameover-взрыв)
-inline void ev(Ev e) { if (e < 0 || e >= SFX__COUNT) return; playSfx(evMap()[e]); }
+// ⭐Режим ROM-сайта per-событие (скан всех `move #N,-$58E8(a6)` 2026-07-24): оружие игрока = ФОРС+arm,
+// рикошет гранаты = вежливый, остальное (FM/UI) = прямой путь. Одинаково в ZT и ZTU (сайты байт-в-байт).
+inline void ev(Ev e) {
+    if (e < 0 || e >= SFX__COUNT) return;
+    int id = evMap()[e];
+    switch (e) {
+        case SFX_HANDGUN:   playSfxForce(id, 0x14); break;   // ROM 12ec6 (0x19, arm 0x14)
+        case SFX_SHOTGUN:   playSfxForce(id, 0x14); break;   // 13056 (0x1d)
+        case SFX_LASER:     playSfxForce(id, 0x0F); break;   // 123b0/124d6 (0x1e)
+        case SFX_PULSE:     playSfxForce(id, 0x0F); break;   // 12f7c/130f8 (0x1e)
+        case SFX_ROCKET:    playSfxForce(id, 0x14); break;   // 13012 (0x96)
+        case SFX_FLAME:     playSfxForce(id, 0x14); break;   // 128aa (0x96)
+        case SFX_GRENADE:   playSfxForce(id, 0x0F); break;   // 12bca (0x1b, бросок)
+        case SFX_FOAM:      playSfxForce(id, 0x1E); break;   // 13ed6 (0x6d)
+        case SFX_WALL:      playSfxForce(id, 0x14); break;   // a78e (0x3b, +обрыв реплики)
+        case SFX_EXPLOSION: playSfxForce(id, 0x1E); break;   // 13de2 (0x8a)
+        case SFX_GRENADE_BOUNCE: playSfxPolite(id, 0x1E); break;   // 13886 (0x18, ВЕЖЛИВЫЙ)
+        default: playSfx(id); break;                          // FM/UI/прочее — прямой d796-путь
+    }
+}
 
 // ── PER-ENEMY звуки (celltype врага; выверено по annotated/zt enemy_ai.asm) ──
 inline int enemyDeathSfx(uint8_t ct) {
