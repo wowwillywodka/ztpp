@@ -3,6 +3,9 @@
 A from-scratch reimplementation of **Zero Tolerance** (Sega Mega Drive / Genesis, 1994) in
 C++/SDL2 — a first-person engine rebuilt from behaviour, not a decompilation. Work in progress.
 
+> 🎮 **The ztpp 0.8 demo is out.** Download it from the
+> [demo-v0.8 GitHub Release](https://github.com/wowwillywodka/ztpp/releases/tag/demo-v0.8).
+
 ![ztpp running in reference mode — the original Zero Tolerance cockpit HUD](screenshot.png)
 
 *Reference mode — the original ZT cockpit HUD with the first-person view, radar and inventory (macOS build).*
@@ -10,20 +13,40 @@ C++/SDL2 — a first-person engine rebuilt from behaviour, not a decompilation. 
 > Created with heavy use of **Claude (Anthropic's AI)** — the reverse-engineering,
 > analysis, and most of the implementation were done together with it.
 
-> ⚠ The original **Zero Tolerance** ROM (US/EU release, Rev A) is fully supported.
-> **Zero Tolerance Underground** is playable with **partial support**. The German build and
-> Beyond Zero Tolerance prototypes are planned — see [Planned](#planned).
+> ⚠ The original **Zero Tolerance** ROM (US/EU release, Rev A) and **Zero Tolerance Underground**
+> are playable from start to finish. The German build and Beyond Zero Tolerance prototypes are
+> planned — see [Planned](#planned).
 
 > Development is intentionally **very slow-paced** — this is a hobby project.
 
 > ⚠ Developed and tested **only on macOS**. Linux/Windows should work (portable CMake + SDL2) but are
 > untested — patches welcome.
 
+## Demo release 0.8
+
+The demo supports the original **Zero Tolerance (ZT)** and **Zero Tolerance Underground (ZTU)**.
+Both games can be completed from start to finish.
+
+**Passwords are not fully implemented yet.** Use in-game save files to keep progress; save-file
+compatibility with future versions is not guaranteed.
+
+**ROMs are not included.** Put your legally obtained original ROM files next to `ztpp`, then select
+the game in the launcher. The launcher scans only its own directory; ROMs from other locations can
+be opened with **Browse** or drag and drop.
+
+The macOS release archives are self-contained: they include SDL2 and SDL3, so end users do **not**
+need Homebrew or a separate SDL installation. Run `./ztpp` from Terminal. The Intel build was also
+tested on Apple Silicon through Rosetta 2.
+
+Found a bug, startup issue, or have an idea? Please [open an issue](https://github.com/wowwillywodka/ztpp/issues/new).
+Include the OS and version, CPU architecture, ROM used, steps to reproduce, and a screenshot or log
+when possible.
+
 ## Goal
 Build a port that is as **accurate to the original as possible** — reference-faithful to the Mega Drive
 game — plus modern **quality-of-life** features that don't change the game itself (rebindable controls,
 gamepad, save games, resolution / full-screen options, …). The game is playable start to finish —
-a **demo release (v0.8)** is being prepared.
+the **v0.8 demo is available now**.
 
 ## What works
 - Rendering as close to the original as possible, reconstructed from the reverse-engineered draw
@@ -47,7 +70,7 @@ a **demo release (v0.8)** is being prepared.
   on top of the bit-exact 15 Hz simulation)
 - Optional unlimited inventory (the original 5-slot carousel stays the default)
 - ROM launcher (native on macOS, SDL fallback everywhere; Win32/GTK best-effort)
-- **Zero Tolerance Underground** — playable, partial support
+- **Zero Tolerance Underground** — playable from start to finish
 
 ## Not done yet
 - Gamepad support
@@ -139,6 +162,9 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
 Реимплементация игры **Zero Tolerance** (Sega Mega Drive / Genesis, 1994) на C++/SDL2 с нуля —
 движок от первого лица, воссозданный по поведению (это **не** декомпиляция). В разработке.
 
+> 🎮 **Вышла демоверсия ztpp 0.8.** Скачать её можно на
+> [странице релиза demo-v0.8 на GitHub](https://github.com/wowwillywodka/ztpp/releases/tag/demo-v0.8).
+
 ![ztpp в reference-режиме — оригинальный кокпит-HUD Zero Tolerance](screenshot.png)
 
 *Reference-режим — оригинальный кокпит-HUD ZT: вид от первого лица, радар и инвентарь (сборка на macOS).*
@@ -146,19 +172,40 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
 > Сделано при активном участии **Claude (ИИ от Anthropic)** — реверс-инжиниринг,
 > анализ и бо́льшая часть реализации выполнены вместе с ним.
 
-> ⚠ Оригинальный ROM **Zero Tolerance** (релиз US/EU, Rev A) поддерживается полностью.
-> **Zero Tolerance Underground** играбелен с **частичной поддержкой**. Немецкий билд и прототипы
-> Beyond Zero Tolerance — в планах (см. [Планируется](#планируется)).
+> ⚠ Оригинальный ROM **Zero Tolerance** (релиз US/EU, Rev A) и **Zero Tolerance Underground**
+> проходятся от начала до конца. Немецкий билд и прототипы Beyond Zero Tolerance — в планах
+> (см. [Планируется](#планируется)).
 
 > Разработка сознательно ведётся **очень неспешно** — это хобби-проект.
 
 > ⚠ Разрабатывалось и тестировалось **только на macOS**. Linux/Windows должны работать (портативные
 > CMake + SDL2), но не проверялись — патчи приветствуются.
 
+## Демоверсия 0.8
+
+Демоверсия поддерживает оригинальные **Zero Tolerance (ZT)** и **Zero Tolerance Underground (ZTU)**.
+Обе игры можно пройти от начала до конца.
+
+**Пароли пока реализованы не полностью.** Для сохранения прогресса используйте внутриигровые
+сохранения; совместимость файлов сохранений между будущими версиями пока не гарантируется.
+
+**ROM’ы в архив не входят.** Положите легально полученные оригинальные ROM-файлы рядом с `ztpp`,
+затем выберите игру в лаунчере. Лаунчер сканирует только собственную папку; ROM из другого места
+можно открыть через **Browse** или drag and drop.
+
+Архивы macOS самодостаточны: SDL2 и SDL3 уже находятся внутри, поэтому конечному пользователю не
+нужны Homebrew и отдельная установка SDL. Запускайте `./ztpp` из Терминала. Intel-версия также
+проверялась на Apple Silicon через Rosetta 2.
+
+Нашли баг, проблему с запуском или хотите предложить улучшение? Пожалуйста,
+[создайте issue](https://github.com/wowwillywodka/ztpp/issues/new). Укажите ОС и её версию,
+архитектуру компьютера, используемый ROM, шаги воспроизведения и, если возможно, приложите
+скриншот или лог.
+
 ## Цель
 Сделать максимально **точный порт оригинала** — референс-достоверность к игре на Mega Drive — плюс современные
 **quality-of-life** фичи, которые не меняют саму игру (переназначаемое управление, геймпад, сохранения, настройки
-разрешения / полноэкранного режима, …). Игра проходится от начала до конца — готовится **демо-релиз (v0.8)**.
+разрешения / полноэкранного режима, …). Игра проходится от начала до конца — **демоверсия v0.8 уже доступна**.
 
 ## Что готово
 - Максимально близкий к оригиналу рендер по реверсу оригинального алгоритма отрисовки
@@ -184,7 +231,7 @@ Controls and the in-game console are documented in [`CONSOLE.md`](CONSOLE.md).
   (интерполяция кадров поверх бит-точной симуляции 15 Гц)
 - Возможность сделать инвентарь безграничным (по умолчанию — оригинальная карусель на 5 слотов)
 - Лаунчер выбора ROM (нативный на macOS, SDL-фолбэк везде; Win32/GTK best-effort)
-- **Zero Tolerance Underground** — играбелен, частичная поддержка
+- **Zero Tolerance Underground** — проходится от начала до конца
 
 ## Что не сделано
 - Поддержка геймпада
