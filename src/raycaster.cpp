@@ -7,16 +7,17 @@ void rcSpawn(Camera& cam, const Level& lvl) {
     int bx = -1, by = -1;
     // ⭐ROM-спавн (респавн-путь смерти 0x1916-0x1954, VERIFIED 2026-07-24): линейный (row-major) скан
     // ВСЕЙ карты этажа на celltype 0x77 «респавн-камера», позиция = ЦЕНТР клетки (+0x80 в 8.8).
-    for (int y = 0; y < Level::H && by < 0; ++y)
-        for (int x = 0; x < Level::W; ++x)
+    for (int y = 0; y < lvl.H && by < 0; ++y)
+        for (int x = 0; x < lvl.W; ++x)
             if (cellIcon(lvl.cellType(cam.floor, x, y)) == 8) { bx = x; by = y; break; }
     if (bx < 0) { bx = 8; by = 20; }                // ⭐ФОЛБЭК ROM 0x1938: индекс 0x288 = x8,y20 (была эвристика «открытая клетка»)
     cam.px = bx + 0.5; cam.py = by + 0.5;
     // ⭐УГОЛ = 0 (ВОСТОК, +X): ROM 0x1856 clr -$71FC → вектор из LUT 0x8124[0]. Была эвристика
     // «направление с наибольшей свободой» — НЕфейтфул (после смерти оригинал всегда смотрит на восток).
-    cam.dirX = 1; cam.dirY = 0;
+    // ⭐June: угол 0 = СЕВЕР (MAME live: -$71F4=0 на споне, вид на мету 24 к северу — findings раунд 5).
+    if (!lvl.transitT.empty()) { cam.dirX = 0; cam.dirY = -1; cam.ang512 = 384; }
+    else                       { cam.dirX = 1; cam.dirY = 0;  cam.ang512 = 0; }
     cam.planeX = -cam.dirY * 0.66; cam.planeY = cam.dirX * 0.66;
-    cam.ang512 = 0;
     cam.angI = -1;                                                                  // fixedmove пере-синхр. из новой позы
 }
 
@@ -46,7 +47,7 @@ bool rcStairCabin(Camera& c, uint8_t ct, double subX, double subY) {
 // ── ROM-ТОЧНЫЙ АВТОМАТ ПЕРЕХОДОВ (faElevZT) ──
 bool rcUpdateTransitZT(Camera& c, const Level& lvl, bool enteredNewCell) {
     int cx = (int)std::floor(c.px), cy = (int)std::floor(c.py);
-    bool inb = (cx >= 0 && cy >= 0 && cx < Level::W && cy < Level::H);
+    bool inb = (cx >= 0 && cy >= 0 && cx < lvl.W && cy < lvl.H);
     uint8_t ct = inb ? lvl.cellType(c.floor, cx, cy) : 0;
     double subX = (c.px - cx) * 256.0, subY = (c.py - cy) * 256.0;
 
@@ -97,10 +98,143 @@ bool rcUpdateTransitZT(Camera& c, const Level& lvl, bool enteredNewCell) {
 }
 
 // Вызывать КАЖДЫЙ кадр. enteredNewCell=true в кадре, когда игрок вошёл в новую клетку (x,y).
+// ── ⭐ТРАНЗИТ June: лифты по ТАБЛИЦЕ ПЕРЕХОДОВ эпизода [VERIFIED 0xAD84..0xAF5A] ──
+// (лестниц в June-картах НЕТ — findct 0x12-0x16 пуст; поезд эп.3 — отдельная подсистема.)
+static int juneCabinGroup(uint8_t t) {
+    if (t == 0x32 || t == 0x33 || t == 0x34) return 0; // left-side cabin group
+    if (t == 0x51 || t == 0x52 || t == 0x53) return 1; // right-side cabin group
+    if (t == 0x55 || t == 0x56 || t == 0x57) return 2; // bottom-side cabin group
+    if (t == 0x59 || t == 0x5A || t == 0x5B) return 3; // top-side cabin group
+    return -1;
+}
+
+static bool juneCabin(uint8_t t) { return juneCabinGroup(t) >= 0; }
+static bool juneCabinStartsPositive(uint8_t t) { return t == 0x32 || t == 0x51 || t == 0x55 || t == 0x59; }
+static bool juneCabinStartsNegative(uint8_t t) { return t == 0x33 || t == 0x52 || t == 0x56 || t == 0x5A; }
+static bool juneCabinStopsPositive(uint8_t t) { return juneCabinStartsNegative(t); } // AD84 arrival branch
+static bool juneCabinStopsNegative(uint8_t t) { return juneCabinStartsPositive(t); } // ADC6 arrival branch
+
+static void juneSetAngleDelta(Camera& c, int delta512) {
+    double base = (c.angI >= 0) ? (double)((c.angI - 128) & 0x1FF) : c.ang512;
+    camSetAngleU(c, base + delta512);
+    c.angI = (((int)std::lround(c.ang512)) + 128) & 0x1FF;
+}
+
+static void juneApplyTransitArrival(Camera& c, uint8_t fromCt, uint8_t toCt, int toX, int toY,
+                                    int oldLowX, int oldLowY) {
+    int fg = juneCabinGroup(fromCt), tg = juneCabinGroup(toCt);
+    int transform = 0; // 0 none, 1 +90/swap, 2 -90/swap, 3 180/neg
+    if (fg >= 0 && tg >= 0) {
+        // Matrix from AF5A dispatch:
+        // B174 = +0x80 angle + swap low bytes; B18C = -0x80 + swap; B1A4 = +0x100 + neg lows.
+        static constexpr int M[4][4] = {
+            {0, 3, 2, 1}, // src 0x32/33/34
+            {3, 0, 1, 2}, // src 0x51/52/53
+            {1, 2, 0, 3}, // src 0x55/56/57
+            {2, 1, 3, 0}, // src 0x59/5A/5B
+        };
+        transform = M[fg][tg];
+    }
+    int lx = oldLowX & 0xFF, ly = oldLowY & 0xFF;
+    if (transform == 1 || transform == 2) {
+        int t = lx; lx = ly; ly = t;
+        juneSetAngleDelta(c, transform == 1 ? +128 : -128);
+    } else if (transform == 3) {
+        lx = (-lx) & 0xFF; ly = (-ly) & 0xFF;
+        juneSetAngleDelta(c, +256);
+    }
+    c.px = toX + lx / 256.0;
+    c.py = toY + ly / 256.0;
+    c.pxI = (int)std::lround(c.px * 256.0);
+    c.pyI = (int)std::lround(c.py * 256.0);
+}
+
+static bool rcUpdateTransitJune(Camera& c, const Level& lvl, bool enteredNewCell) {
+    int cx = (int)c.px, cy = (int)c.py;
+    bool inb = (cx >= 0 && cy >= 0 && cx < lvl.W && cy < lvl.H);
+    uint8_t ct = inb ? lvl.cellType(c.floor, cx, cy) : 0;
+    // ── ⭐ЛИФТ June: назначение из ТАБЛИЦЫ ПЕРЕХОДОВ эпизода [VERIFIED 0xAD84..0xAF5A] ──
+    // Фаза -$6E52: ±4/тик до ±0x40 (питч-фейк); |фаза|≥0x18 → кламп игрока внутрь кабины;
+    // на переполнении — телепорт по записи {вниз/вверх: этаж,x,y} С СОХРАНЕНИЕМ суб-координат;
+    // прибытие = у клетки назначения нет продолжения в направлении движения. Лестниц в June нет.
+    {
+        if (c.elevState == +1 || c.elevState == -1) {
+            int dir = c.elevState;
+            if (!juneCabin(ct)) { c.elevState = 0; }
+            else {
+                if (c.cabin >= 24.0 || c.cabin <= -24.0) {          // ROM 9B14: кламп [0x20,0xDF] при |фазе|≥0x18
+                    double fx = c.px - cx, fy = c.py - cy;
+                    if (fx < 0.125) c.px = cx + 0.125; else if (fx > 0.871) c.px = cx + 0.871;
+                    if (fy < 0.125) c.py = cy + 0.125; else if (fy > 0.871) c.py = cy + 0.871;
+                    c.pxI = (int)std::lround(c.px * 256.0); c.pyI = (int)std::lround(c.py * 256.0);
+                }
+                const Level::Transit* tr = lvl.findTransit(c.floor, cx, cy);
+                if (dir > 0) {                                      // ROM -$6E50=+1: AD84, phase -= 4
+                    c.cabin -= 4.0 * simDt();
+                    if (juneCabinStopsPositive(ct)) {
+                        if (c.cabin < 0.0) { c.cabin = 0.0; c.elevState = +2; }
+                    } else if (c.cabin < -64.0) {
+                        if (!tr || tr->dnF == 0xFF) { c.cabin = 0.0; c.elevState = 0; }
+                        else {
+                            int oldLowX = ((int)std::floor(c.px * 256.0)) & 0xFF;
+                            int oldLowY = ((int)std::floor(c.py * 256.0)) & 0xFF;
+                            uint8_t fromCt = ct;
+                            c.cabin = 64.0;
+                            c.floor = tr->dnF;
+                            uint8_t toCt = lvl.cellType(c.floor, tr->dnX, tr->dnY);
+                            juneApplyTransitArrival(c, fromCt, toCt, tr->dnX, tr->dnY, oldLowX, oldLowY);
+                        }
+                    }
+                } else {                                            // ROM -$6E50=-1: ADC6, phase += 4
+                    c.cabin += 4.0 * simDt();
+                    if (juneCabinStopsNegative(ct)) {
+                        if (c.cabin >= 0.0) { c.cabin = 0.0; c.elevState = -2; }
+                    } else if (c.cabin > 64.0) {
+                        if (!tr || tr->upF == 0xFF) { c.cabin = 0.0; c.elevState = 0; }
+                        else {
+                            int oldLowX = ((int)std::floor(c.px * 256.0)) & 0xFF;
+                            int oldLowY = ((int)std::floor(c.py * 256.0)) & 0xFF;
+                            uint8_t fromCt = ct;
+                            c.cabin = -64.0;
+                            c.floor = tr->upF;
+                            uint8_t toCt = lvl.cellType(c.floor, tr->upX, tr->upY);
+                            juneApplyTransitArrival(c, fromCt, toCt, tr->upX, tr->upY, oldLowX, oldLowY);
+                        }
+                    }
+                }
+                c.pitch = -c.cabin;
+                return true;
+            }
+        }
+        // старт поездки: вход в кабину с записью в таблице
+        if (enteredNewCell && juneCabin(ct) && c.cabin == 0.0) {
+            if (const Level::Transit* tr = lvl.findTransit(c.floor, cx, cy)) {
+                bool dnOk = tr->dnF != 0xFF, upOk = tr->upF != 0xFF;
+                int dep = 0;
+                if (juneCabinStartsPositive(ct)) dep = +1;
+                else if (juneCabinStartsNegative(ct)) dep = -1;
+                else dep = (c.elevState < 0) ? -1 : +1;             // 0x34/53/57/5B preserve sign; idle -> +1
+                if ((dep > 0 && !dnOk) || (dep < 0 && !upOk)) dep = 0;
+                if (dep != 0) {
+                    c.elevState = dep; c.cabin = 0.0; c.pitch = 0.0;
+                    c.pxI = (int)std::lround(c.px * 256.0); c.pyI = (int)std::lround(c.py * 256.0);
+                    return true;
+                }
+            }
+        }
+        // питч плавно к нулю; ZT-веток лестниц/скана колонки для June нет
+        if (c.cabin > 0.0) { c.cabin -= 4.0 * simDt(); if (c.cabin < 0.0) c.cabin = 0.0; }
+        else if (c.cabin < 0.0) { c.cabin += 4.0 * simDt(); if (c.cabin > 0.0) c.cabin = 0.0; }
+        c.pitch = -c.cabin;
+        return false;
+    }
+}
+
 bool rcUpdateTransit(Camera& c, const Level& lvl, bool enteredNewCell) {
+    if (!lvl.transitT.empty()) return rcUpdateTransitJune(c, lvl, enteredNewCell);  // ⭐June: таблица переходов (до ZT-тумблера)
     if (faElevZT()) return rcUpdateTransitZT(c, lvl, enteredNewCell);   // ROM-точный автомат (дефолт)
     int cx = (int)c.px, cy = (int)c.py;
-    bool inb = (cx >= 0 && cy >= 0 && cx < Level::W && cy < Level::H);
+    bool inb = (cx >= 0 && cy >= 0 && cx < lvl.W && cy < lvl.H);
     uint8_t ct = inb ? lvl.cellType(c.floor, cx, cy) : 0;
     double subX = (c.px - cx) * 256.0, subY = (c.py - cy) * 256.0;
 

@@ -57,6 +57,10 @@
 #include "mapview.hpp"   // top-down виды карт (вынесены из main.cpp)
 
 // (см. README: враги — AI/LOS/типы атак в actors.hpp; карта — drawGameMap выше; настройки — ui.hpp)
+// ⭐ПЕРФ-СЧЁТЧИКИ (диагностика статтеров, консоль `perfstat`/`perflog`): работа кадра без сна vs бюджет.
+static struct { long frames = 0, spikes = 0; double worstMs = 0, worstAudioMs = 0; bool log = false;
+                void reset() { frames = spikes = 0; worstMs = worstAudioMs = 0; } } g_perf;
+
 // HUD оружия: имя текущего ствола + боезапас (низ-лево) + HP. Кулаки = "FISTS" без счётчика.
 static void drawWeaponHud(FB& fb, const Inventory& inv) {
     char line[64];
@@ -401,14 +405,19 @@ int main(int argc, char** argv) {
     // Фоны: E1=КОСМОС, E2=ГОРОД, E3=КОСМОС (дизасм 0x105e, выбор по эпизоду). Скролл по углу в рендере.
     if (argStr(argc, argv, "--findct")) {            // диаг: скан всех эпизодов/этажей на celltype HEX → печать локаций
         int want = (int)std::strtol(argStr(argc, argv, "--findct"), nullptr, 0);
-        for (int e = 0; e < gd.episodes(); ++e) for (int f = 0; f < Level::FLOORS; ++f)
-            for (int y = 0; y < Level::H; ++y) for (int x = 0; x < Level::W; ++x)
+        for (int e = 0; e < gd.episodes(); ++e) for (int f = 0; f < gd.levels[e].floors; ++f)
+            for (int y = 0; y < gd.levels[e].H; ++y) for (int x = 0; x < gd.levels[e].W; ++x)
                 if (gd.levels[e].cellType(f, x, y) == (uint8_t)want)
                     std::printf("ct=0x%02x ep=%d floor=%d x=%d y=%d\n", want, e + 1, f, x, y);
         return 0;
     }
     int ep    = argInt(argc, argv, "--ep", 1) - 1;   if (ep < 0 || ep >= gd.episodes()) ep = 0;
-    int floor = argInt(argc, argv, "--floor", 0);    if (floor < 0 || floor >= Level::FLOORS) floor = 0;
+    gd.applyEpisodeAssets(ep);                       // June: per-episode банк стен/палитра/fc-шаблоны
+    if (gd.build == Build::BZT_June || gd.build == Build::BZT_July) {
+        faJuneBands() = true;                        // ⭐BZT: банды затенения по лестнице скейлеров 0x3B58
+        juneEnemies() = true;                        // ⭐June-думалки врагов (роли пака/кружение/материализация)
+    }
+    int floor = argInt(argc, argv, "--floor", 0);    if (floor < 0 || floor >= gd.levels[ep].floors) floor = 0;
     int mode  = argInt(argc, argv, "--mode", 3);     if (mode < 0 || mode > 3) mode = 3; // ТОЛЬКО шутер (mode 3); прежние карта-режимы убраны, карта — по TAB (пауза)
     bool mapOpen = false;                            // ПАУЗА-КАРТА (по TAB): полная карта уровня + позиция игрока
     int  pauseViewFloor = 0;                         // ⭐листаемый этаж пауза-карты (ROM 2cec: бит0/бит1, не выше текущего)
@@ -433,6 +442,7 @@ int main(int argc, char** argv) {
     SubwayTrain train; train.script = gd.trainScript;   // ⭐поезд метро (ZTU; пустой скрипт = выкл)
     std::vector<double> zbuf;
     Inventory inv;                  // инвентарь игрока (старт: пусто = кулаки, current=−1)
+    juneDrainInventoryFn() = [&inv]() { return drainRandomInventory(inv); };
     int aEp = -1, aFloor = -1;      // эпизод/этаж, для которого заспавнены враги-актёры (респавн при смене)
     bool fullInv = false;           // V: тест-режим «всё оружие + неограниченный инвентарь» (Z/X листают карусель)
     Inventory savedInv;             // сохранённый инвентарь до входа в fullInv (восстанавливается на выходе)
@@ -595,9 +605,9 @@ int main(int argc, char** argv) {
         int want = (int)std::strtol(sc, nullptr, 0);
         const Level& L = gd.levels[ep];
         std::printf("scanct эп%d ct=0x%02X:\n", ep + 1, want);
-        for (int f = 0; f < Level::FLOORS; ++f)
-            for (int y = 0; y < Level::H; ++y)
-                for (int x = 0; x < Level::W; ++x)
+        for (int f = 0; f < L.floors; ++f)
+            for (int y = 0; y < L.H; ++y)
+                for (int x = 0; x < L.W; ++x)
                     if (L.cellType(f, x, y) == want)
                         std::printf("  этаж %2d  (%2d,%2d)\n", f, x, y);
         return 0;
@@ -613,7 +623,7 @@ int main(int argc, char** argv) {
         for (int y = cy - r; y <= cy + r; ++y) {
             std::printf("y%3d ", y);
             for (int x = cx - r; x <= cx + r; ++x) {
-                if (x < 0 || y < 0 || x >= Level::W || y >= Level::H) { std::printf("  ."); continue; }
+                if (x < 0 || y < 0 || x >= L.W || y >= L.H) { std::printf("  ."); continue; }
                 uint8_t ct = L.cellType(cf, x, y);
                 char mark = (x == cx && y == cy) ? '*' : (cellRenderWall(ct) ? '#' : ' ');
                 std::printf("%c%02X", mark, ct);
@@ -630,9 +640,9 @@ int main(int argc, char** argv) {
         for (int e = 0; e < gd.episodes(); ++e) {
             const Level& L = gd.levels[e];
             int hist[256] = {0};
-            for (int f = 0; f < Level::FLOORS; ++f)
-                for (int y = 0; y < Level::H; ++y)
-                    for (int x = 0; x < Level::W; ++x) {
+            for (int f = 0; f < L.floors; ++f)
+                for (int y = 0; y < L.H; ++y)
+                    for (int x = 0; x < L.W; ++x) {
                         uint8_t ct = L.cellType(f, x, y); DecorDef dd;
                         bool handled = (ct == 0) || cellRenderWall(ct) || cellRendersDoor(ct) ||
                                        decorForCt(ct, dd) || itemBillboardForCt(ct, dd) || (enemyGfxSlot(ct) >= 0) ||
@@ -657,9 +667,9 @@ int main(int argc, char** argv) {
     if (argStr(argc, argv, "--findelev")) {
         const Level& L = gd.levels[ep];
         int total = 0;
-        for (int f = 0; f < Level::FLOORS; ++f)
-            for (int y = 0; y < Level::H; ++y)
-                for (int x = 0; x < Level::W; ++x) {
+        for (int f = 0; f < L.floors; ++f)
+            for (int y = 0; y < L.H; ++y)
+                for (int x = 0; x < L.W; ++x) {
                     uint8_t ct = L.cellType(f, x, y);
                     const char* cls = ctElevUp(ct) ? "UP-cabin" : ctElevDown(ct) ? "DOWN-cabin"
                                     : ctElevUpdn(ct) ? "UPDOWN" : ctElevArea(ct) ? "area"
@@ -682,8 +692,8 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 200; ++i) {
             bool busy = rcUpdateTransit(sc, L, false);
             if (i % 4 == 0 || sc.elevState == 0 || sc.elevState == 2 || sc.elevState == -2)
-                std::printf("  k%3d: cabin=%+5.0f pitch=%+5.0f этаж=%2d elev=%+d ct=0x%02X %s\n",
-                            i, sc.cabin, sc.pitch, sc.floor, sc.elevState,
+                std::printf("  k%3d: cabin=%+5.0f pitch=%+5.0f этаж=%2d elev=%+d pos=(%.3f,%.3f) ang=%3.0f ct=0x%02X %s\n",
+                            i, sc.cabin, sc.pitch, sc.floor, sc.elevState, sc.px, sc.py, sc.ang512,
                             L.cellType(sc.floor, (int)sc.px, (int)sc.py), busy ? "ride" : "");
             // СТОП: приехал (elevState ±2) или простаивает без наклона
             if ((sc.elevState == 2 || sc.elevState == -2) || (sc.elevState == 0 && i > 2 && sc.cabin == 0.0)) {
@@ -748,14 +758,15 @@ int main(int argc, char** argv) {
         }
         if (int kt = argInt(argc, argv, "--killspawned", -1); kt >= 0) {   // отладка: убить ПОСЛЕДНЕГО заспавненного врага + прокрутить N тиков
             for (int i = (int)actors().size() - 1; i >= 0; --i) if (actors()[i].active && actors()[i].think == AT_ENEMY) {
-                Actor& a = actors()[i]; hitEnemy(a, a.hp + 1, cam.px, cam.py, 0x400); break; }
+                Actor& a = actors()[i]; hitEnemy(a, a.hp + 1, cam.px, cam.py, 0x400,
+                                                argInt(argc, argv, "--hitweapon", -1)); break; }
             for (int t = 0; t < kt; ++t) updateActors(gd.levels[ep], cam);
             for (auto& a : actors()) if (a.active && (a.think == AT_ENEMY || a.think == AT_CORPSE) && a.srcType >= 0x60)
                 std::printf("killspawned: think=%d hitT=%d hp=%d state=%d @(%.1f,%.1f)\n", a.think, a.hitT, a.hp, a.state, a.x, a.y);
         }
         if (argStr(argc, argv, "--desttest")) {                        // отладка: разрушить все разруш./секрет-клетки этажа
             Level& L = gd.levels[ep]; int n = 0, sx = -1, sy = -1; uint8_t sct = 0, sid = 0;
-            for (int yy = 0; yy < Level::H; ++yy) for (int xx = 0; xx < Level::W; ++xx) {
+            for (int yy = 0; yy < L.H; ++yy) for (int xx = 0; xx < L.W; ++xx) {
                 uint8_t ct = L.cellType(floor, xx, yy);
                 if (wallIsDestructible(ct)) { if (sx < 0) { sx = xx; sy = yy; sct = ct; sid = L.cellId(floor, xx, yy); } requestDestruct(floor, xx, yy); ++n; }
             }
@@ -803,8 +814,8 @@ int main(int argc, char** argv) {
             std::printf("probe (%d,%d): cellId %d celltype 0x%02X\n", cx, cy, gd.levels[ep].cellId(floor, cx, cy), gd.levels[ep].cellType(floor, cx, cy)); }
         if (argStr(argc, argv, "--actordbg")) std::fprintf(stderr, "CAM @(%.2f,%.2f) dir(%.2f,%.2f) floor=%d HP=%d\n", cam.px, cam.py, cam.dirX, cam.dirY, cam.floor, player().hp);
         if (argStr(argc, argv, "--actordbg")) for (auto& a : actors()) if (a.active)
-            std::fprintf(stderr, "actor think=%d state=%d ct=0x%02X hp=%d burned=%d timer=%d @(%.2f,%.2f)\n",
-                a.think, a.state, a.srcType, a.hp, a.burned, a.timer, a.x, a.y);
+            std::fprintf(stderr, "actor think=%d state=%d ct=0x%02X hp=%d burned=%d timer=%d juneHit=%d/%d @(%.2f,%.2f)\n",
+                a.think, a.state, a.srcType, a.hp, a.burned, a.timer, a.juneHitState, a.juneHitTimer, a.x, a.y);
         if (const char* pa = argStr(argc, argv, "--postang")) {   // отладка: развернуть камеру ПОСЛЕ симуляции (навестись на труп сзади)
             double a = std::atof(pa) * 3.14159265 / 180.0; cam.dirX = std::cos(a); cam.dirY = std::sin(a); }
         if (const char* px = argStr(argc, argv, "--postpx")) cam.px = std::atof(px);
@@ -973,11 +984,11 @@ int main(int argc, char** argv) {
     auto clampd = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
 
     auto setFloor = [&](int nf) {
-        if (nf < 0 || nf >= Level::FLOORS) return;
+        if (nf < 0 || nf >= gd.levels[ep].floors) return;
         floor = nf; dirty = true;
         if (mode == 3) respawn();
     };
-    auto setEp = [&](int ne) { if (ne < 0 || ne >= gd.episodes()) return; ep = ne; snd::musicStop(); activeBg() = gd.bgForEpisode(ep); dirty = true; if (mode == 3) respawn(); wallAnim.init(gd.levels[ep], meta); train.init(gd.levels[ep]); inv.reset(); fullInv = false; resetPlayerHP(); rcResetPickups(); clearActors(); clearWallState(); aEp = aFloor = -1; };  // новый эпизод → инвентарь/HP/актёры/стены с нуля (+поезд ZTU: ROM DE7F0)
+    auto setEp = [&](int ne) { if (ne < 0 || ne >= gd.episodes()) return; ep = ne; snd::musicStop(); activeBg() = gd.bgForEpisode(ep); dirty = true; if (mode == 3) respawn(); gd.applyEpisodeAssets(ep); wallAnim.init(gd.levels[ep], meta); train.init(gd.levels[ep]); inv.reset(); fullInv = false; resetPlayerHP(); rcResetPickups(); clearActors(); clearWallState(); aEp = aFloor = -1; };  // новый эпизод → инвентарь/HP/актёры/стены с нуля (+поезд ZTU: ROM DE7F0)
     auto setMode = [&](int nm) { mode = nm; dirty = true; if (mode == 3) respawn(); };
 
     // ── ⭐ПАРОЛИ (ROM 58720/58a74, password.hpp — бит-в-бит): построение из текущего состояния + применение ──
@@ -1000,7 +1011,7 @@ int main(int argc, char** argv) {
         // ⭐ROM 0x1062/0x107c: эпизод=(status>>4)&3, этаж=status&0xf — НАПРЯМУЮ (без ++nep; Boxing!!!=0x1f → эп1/эт15).
         int nep = (st.status >> 4) & 3, nfl = st.status & 15;
         if (nep >= gd.episodes()) nep = gd.episodes() - 1;
-        if (nfl >= Level::FLOORS) nfl = Level::FLOORS - 1;
+        if (nfl >= gd.levels[nep].floors) nfl = gd.levels[nep].floors - 1;
         // ⭐стек паролей (ROM 0x1094): слоты 0..N−1 = заглушки «*SECURED*», прогресс = N, эпизод-буфер пуст
         pwStack.assign((size_t)nfl, "*SECURED*");
         pwProgressFloor() = nfl; pwEpisodePass.clear();
@@ -1058,9 +1069,9 @@ int main(int argc, char** argv) {
             f << "slot" << i << "=" << inv.carried[i] << "\nammo" << i << "=" << inv.ammo[inv.carried[i]] << "\n";
         // грид уровня (cellId; cellType — производный) — фиксирует разрушенные стены/открытые навсегда двери
         static const char* HEX = "0123456789abcdef";
-        for (int fl = 0; fl < Level::FLOORS; ++fl) {
+        for (int fl = 0; fl < gd.levels[ep].floors; ++fl) {
             f << "grid" << fl << "=";
-            for (int y = 0; y < Level::H; ++y) for (int x = 0; x < Level::W; ++x) {
+            for (int y = 0; y < gd.levels[ep].H; ++y) for (int x = 0; x < gd.levels[ep].W; ++x) {
                 uint8_t c = gd.levels[ep].cellId(fl, x, y); f << HEX[c >> 4] << HEX[c & 15]; }
             f << "\n";
         }
@@ -1087,7 +1098,7 @@ int main(int argc, char** argv) {
         int lep=0, lfl=0, lfg=0, lhp=100, larm=0, lsel=0, lsec=0; uint32_t lvis=0;
         double lpx=-1, lpy=-1, ldx=1, ldy=0;
         int slots[5] = {0,0,0,0,0}, ammo[5] = {0,0,0,0,0}; bool ldead[5] = {false,false,false,false,false};
-        std::vector<std::string> grids(Level::FLOORS);
+        std::vector<std::string> grids(Level::MAXF);
         std::vector<std::pair<int,double>> doors; std::vector<int> picked, fireout;
         std::vector<PendingSpawn> pend; std::vector<AlarmCam> cams; std::vector<Actor> acts;
         std::vector<std::string> lpwstk; std::string lpwep; int lpwprog = 0;
@@ -1106,7 +1117,7 @@ int main(int argc, char** argv) {
             else if (k.size() == 5 && !k.compare(0, 4, "dead")) { int i = k[4]-'0'; if (i>=0&&i<5) ldead[i] = std::atoi(v) != 0; }
             else if (k.size() == 5 && !k.compare(0, 4, "slot")) { int i = k[4]-'0'; if (i>=0&&i<5) slots[i] = std::atoi(v); }
             else if (k.size() == 5 && !k.compare(0, 4, "ammo")) { int i = k[4]-'0'; if (i>=0&&i<5) ammo[i] = std::atoi(v); }
-            else if (!k.compare(0, 4, "grid")) { int fl = std::atoi(k.c_str() + 4); if (fl >= 0 && fl < Level::FLOORS) grids[fl] = v; }
+            else if (!k.compare(0, 4, "grid")) { int fl = std::atoi(k.c_str() + 4); if (fl >= 0 && fl < Level::MAXF) grids[fl] = v; }
             else if (k == "door")   { int dk; double dv; if (std::sscanf(v, "%d:%lf", &dk, &dv) == 2) doors.push_back({dk, dv}); }
             else if (k == "picked") picked.push_back(std::atoi(v));
             else if (k == "fireout") fireout.push_back(std::atoi(v));
@@ -1124,15 +1135,15 @@ int main(int argc, char** argv) {
                     a.variant=(uint8_t)var; a.srcType=(uint8_t)st; a.burned=bu!=0; a.revived=rv!=0; a.tile=(uint8_t)tl;
                     a.active = true; acts.push_back(a); } }
         }
-        if (!ok || lep < 0 || lep >= gd.episodes() || lfl < 0 || lfl >= Level::FLOORS) return false;
+        if (!ok || lep < 0 || lep >= gd.episodes() || lfl < 0 || lfl >= gd.levels[lep].floors) return false;
         for (int i = 0; i < 5; ++i) selState.dead[i] = ldead[i];
         playerFighter() = lfg; selState.cursor = lfg;
         floor = lfl; cam.floor = lfl; msgFloor = lfl; pauseViewFloor = lfl;
         setEp(lep); floor = lfl; cam.floor = lfl;                     // сброс контейнеров + базовая инициализация
-        for (int fl = 0; fl < Level::FLOORS; ++fl)                    // грид (разрушения/двери-навсегда)
-            if ((int)grids[fl].size() >= Level::W * Level::H * 2)
-                for (int y = 0; y < Level::H; ++y) for (int x = 0; x < Level::W; ++x) {
-                    const char* h = grids[fl].c_str() + (y * Level::W + x) * 2;
+        for (int fl = 0; fl < gd.levels[lep].floors; ++fl)            // грид (разрушения/двери-навсегда)
+            if ((int)grids[fl].size() >= gd.levels[lep].W * gd.levels[lep].H * 2)
+                for (int y = 0; y < gd.levels[lep].H; ++y) for (int x = 0; x < gd.levels[lep].W; ++x) {
+                    const char* h = grids[fl].c_str() + (y * gd.levels[lep].W + x) * 2;
                     auto hv = [](char c){ return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; };
                     gd.levels[lep].setCell(fl, x, y, (uint8_t)((hv(h[0]) << 4) | hv(h[1])));
                 }
@@ -1236,7 +1247,7 @@ int main(int argc, char** argv) {
                 int dr = enemyWeaponDrop(a.srcType);                                    // как смерть в бою (actors.cpp)
                 if (dr == -2) dr = (enemyRng() & 0x10) ? 10 : 7;                        // Sgt/FH-SF: laser/grenade
                 spawnCorpse(a.x, a.y, a.floor, a.srcType, 0, 0, a.variant, dr, a.burned);
-                if (a.srcType == 0x67 || a.srcType == 0x6A || a.srcType == 0x6B) episodeEndT() = 15;   // босс → конец эпизода (как ROM)
+                if (!juneEnemies() && (a.srcType == 0x67 || a.srcType == 0x6A || a.srcType == 0x6B)) episodeEndT() = 15;   // босс → конец эпизода (как ROM)
                 a.active = false; ++n;
             }
             int m = 0;                                                                   // дормантные маркеры ТЕКУЩЕГО этажа
@@ -1250,6 +1261,14 @@ int main(int argc, char** argv) {
             prevAlive = 0;
             con::log("killed " + std::to_string(n) + " enemies, cleared " + std::to_string(m) + " markers");
         });
+        con::registerCmd("perfstat", "perfstat [reset] - frame-time spike stats (stutter diagnosis)", [&](const std::vector<std::string>& a){
+            if (!a.empty() && a[0] == "reset") { g_perf.reset(); con::log("perf counters reset"); return; }
+            con::log("frames " + std::to_string(g_perf.frames) + ", spikes " + std::to_string(g_perf.spikes) +
+                     ", worst " + std::to_string((int)g_perf.worstMs) + "ms (audio-wait " +
+                     std::to_string((int)(g_perf.worstAudioMs * 10) / 10.0) + "ms)"); });
+        con::registerCmd("perflog", "perflog <on|off> - log every frame-time spike to console", [&](const std::vector<std::string>& a){
+            if (!a.empty()) g_perf.log = (a[0] != "off" && a[0] != "0");
+            con::log(std::string("perf spike log ") + (g_perf.log ? "ON" : "OFF")); });
         con::registerCmd("blood",  "blood <on|off> - toggle blood spatter (ZT 0x157ca)", [&](const std::vector<std::string>& a){ if(!a.empty()) faBlood()=(a[0]!="off"&&a[0]!="0"); con::log(std::string("blood ")+(faBlood()?"ON":"OFF")); });
         con::registerCmd("transitzt", "transitzt <on|off> - ROM-exact transit render: D4A6 gradient resample + full-strength column pitch (d214)", [&](const std::vector<std::string>& a){ if(!a.empty()) faTransitZT()=(a[0]!="off"&&a[0]!="0"); con::log(std::string("transitzt ")+(faTransitZT()?"ON (ROM-exact D4A6)":"OFF (tuned legacy)")); });
         con::registerCmd("camback", "camback <on|off> - render eye 1/8 cell behind player (ROM b9a6, always-on in game)", [&](const std::vector<std::string>& a){ if(!a.empty()) faCamBack()=(a[0]!="off"&&a[0]!="0"); con::log(std::string("camback ")+(faCamBack()?"ON (ROM-true)":"OFF")); });
@@ -1522,8 +1541,15 @@ int main(int argc, char** argv) {
                     if (mode == 3) { cycleWeapon(inv, +1); snd::ev(snd::SFX_SWITCH); }                            // оружие → (переназначаемо)
                 } else if (key == keyBind(GA_MAP)) {
                     mapOpen = !mapOpen;
+                    if (mapOpen && gd.build == Build::BZT_June) resetBztPauseMapScroll();
                     { int total = pwProgressFloor() + 1 + (pwEpisodePass.empty() ? 0 : 1);   // строк в списке паролей
                       int ms = total - 3; pauseViewFloor = ms < 0 ? 0 : ms; } dirty = true;  // скролл → текущий виден внизу
+                } else if (mapOpen && gd.build == Build::BZT_June && !pauseFullMap() &&
+                           (key == SDL_SCANCODE_LEFT || key == SDL_SCANCODE_RIGHT ||
+                            key == SDL_SCANCODE_UP   || key == SDL_SCANCODE_DOWN)) {
+                    int dx = (key == SDL_SCANCODE_LEFT) ? -1 : (key == SDL_SCANCODE_RIGHT ? +1 : 0);
+                    int dy = (key == SDL_SCANCODE_UP)   ? -1 : (key == SDL_SCANCODE_DOWN  ? +1 : 0);
+                    if (moveBztPauseMapWindow(gd.levels[ep], cam, dx, dy)) { snd::playSfx(0x6b); dirty = true; }
                 } else if (mapOpen && (key == SDL_SCANCODE_UP || key == SDL_SCANCODE_DOWN)) {
                     // ⭐ЛИСТАНИЕ на паузе (ROM 2cec бит0/бит1, звук 0x6b) СКРОЛЛИТ СПИСОК ПАРОЛЕЙ (карта НЕ меняется!)
                     int nf = pauseViewFloor + (key == SDL_SCANCODE_DOWN ? 1 : -1);
@@ -1727,15 +1753,9 @@ int main(int argc, char** argv) {
         // ⭐ПАУЗА МУЗЫКИ (ROM GEMS cmd 0x0D/0x0C при паузе игры): ESC-меню и Tab-карта замораживают секвенсер
         { static bool musPaused = false; bool want = menu || mapOpen || paused;
           if (want != musPaused) { musPaused = want; snd::musicSetPaused(want); } }
-        // ⭐ЗАТУХАНИЕ ВСПЫШКИ $FF1072 (ROM VBlank 0xB12, 60 Гц реального времени, идёт и на паузе как в ROM):
-        // >15 → −0x110/кадр (смерть: белый→красный за 15 кадров), ≤15 → −1/кадр (красный→чёрный), кламп 0.
-        { static Uint32 s_flashBase = 0; static long s_flashSeen = 0; Uint32 now = SDL_GetTicks();
-          if (s_flashBase == 0) s_flashBase = now;
-          long vbl = (long)(now - s_flashBase) * 60 / 1000;        // счётчик 60Гц-кадров (без потери остатка)
-          int steps = (int)(vbl - s_flashSeen); s_flashSeen = vbl;
-          { int& fc = player().flashCram;
-            while (steps-- > 0 && fc > 0) fc = (fc > 15) ? fc - 0x110 : fc - 1;
-            if (fc < 0) fc = 0; if (fc > 0) dirty = true; } }
+        // (затухание вспышки $FF1072 — в СИМ-ТИКЕ: B12 гейтится -$7FFE=2 и реально шагает 1×/игровой тик,
+        //  не 60 Гц — см. блок в цикле фикс-timestep. Прежний 60Гц-декремент гасил вчетверо быстрее ROM.)
+        if (player().flashCram > 0) dirty = true;
 
         if (pwscr::st().active) {
             // ⭐ЭКРАН ВВОДА ПАРОЛЯ (ROM 58054): сетка символов + курсор + буфер (поверх всего, мир на паузе).
@@ -1919,6 +1939,19 @@ int main(int argc, char** argv) {
           for (int _simStep = 0; _simStep < nSimTics && !paused && !selectActive && briefState.idx < 0; ++_simStep) {
                            // ⏸ ФОТОРЕЖИМ: при паузе весь этот блок не выполняется (nSimTics в расчёте участвует, но
                            // цикл сразу отсекается по !paused); камера/мир застывают, кадр рисуется ниже как есть.
+            // ⭐ЗАТУХАНИЕ ВСПЫШКИ $FF1072 = 1 ШАГ ЗА ИГРОВОЙ ТИК [VERIFIED 2026-07-28, AA2/B12]: цикл 0x1442
+            // ставит -$7FFE=2 на тик; VBlank: 2→1 → B12 (затухание), 1→0 → DMA-путь БЕЗ B12, 0 → пропуск.
+            // Итого B12 отрабатывает РОВНО РАЗ на игровой тик (~10-15 Гц), НЕ 60 Гц (порт гасил вчетверо
+            // быстрее — юзер: «в оригинале медленнее»). Ветки B12: -$721e≠0 (смерть/i-frame): >15 → −0x110,
+            // ≤15 → −1; -$721e==0 (обычный урон): −3. На паузе -$7FFE=0 → затухание замирает (тут сим стоит ✓).
+            { int& fcv = player().flashCram;
+              if (fcv > 0) {
+                  // -$721e≠0 (смерть/нокдаун-стан) → медленная ветка; иначе −3 (обычный урон)
+                  if (player().dead || deathAnim > 0 || player().knockTimer > 0)
+                      fcv = (fcv > 15) ? fcv - 0x110 : fcv - 1;
+                  else fcv -= 3;
+                  if (fcv < 0) fcv = 0;
+              } }
             // непрерывное движение по зажатым клавишам (скорости настраиваемые: O/P, K/L)
             static const Uint8 ZEROKS[SDL_NUM_SCANCODES] = {0};
             const Uint8* ks = (con::isOpen() || mapOpen) ? ZEROKS : SDL_GetKeyboardState(nullptr);  // консоль/пауза-карта → ввод заморожен
@@ -2022,6 +2055,7 @@ int main(int argc, char** argv) {
                         case 14: snd::ev(snd::SFX_PULSE); pulseSndBurst = 2; pulseSndNext = SDL_GetTicks() + 70; break;  // 1 выстрел = звук 3× (тут 1-й, ещё 2 по таймеру), 1 патрон
                         case 11: snd::ev(snd::SFX_ROCKET); break;
                         case 7:  snd::ev(snd::SFX_GRENADE); break;
+                        case 2:  snd::playSfx(0x6C); break;   // ⭐МИНА — звук установки (ROM 12c06: move #$6c,d0; jsr d760, ДО alloc)
                         case 13: if (SDL_GetTicks() >= flameSndNext) { snd::ev(snd::SFX_FLAME); flameSndNext = SDL_GetTicks() + 1000; } break;  // ретриггер ~1/сек (оригинал; было ~20/сек)
                         case 4:  if (inv.fire == 1) snd::ev(snd::SFX_FOAM); break;
                         default: break;
@@ -2096,13 +2130,20 @@ int main(int argc, char** argv) {
             // ⭐СЧИТАЕМ ТЕКУЩИЙ ЭТАЖ (cam.floor), где игрок — НЕ прогресс-этаж. Баг-фикс (юзер): раньше считался
             //   pwProgressFloor; зачистив нижний этаж (прогресс=0 врагов) и зайдя на верхний НЕзачищенный, порт
             //   ложно объявлял его зачищенным. «FLOOR SECURED» теперь про этаж, на котором игрок стоит.
-            { int pf = cam.floor;
-              int alive = aliveEnemies(pf);
-              if (prevAlive != 0 && alive == 0 && pendingOnFloor(pf) == 0) {   // prevAlive=-1 (приход) тоже объявляет (ROM b8fc→57e0c)
-                  msgs.push(ztmsg::ZERO_ENEMIES);
-                  floorSecT = 0xE1;                             // старт цикла напоминаний (ROM 0xE1, сим-тики)
-              }
-              prevAlive = alive; }
+            // ⭐КАДЕНС СЧЁТЧИКА ВРАГОВ = РАЗ В 64 ТИКА (ROM 57e0c из гл.цикла @0x1448) [2026-07-28]: порт
+            // проверял каждый тик → «ZERO ENEMIES» объявлялся сразу после убийства, и ПЕРВОЕ СЛОВО голоса
+            // глоталось DAC-гейтом предсмертного крика (вежливый сайт армит -$58E8). С ROM-каденсом гейт
+            // успевает истечь — реплика звучит целиком (юзер: «Zero Enemies Remaining теряется»).
+            { static uint32_t zeCnt = 0;
+              if ((zeCnt++ & 63) == 0) {
+                  int pf = cam.floor;
+                  int alive = aliveEnemies(pf);
+                  if (prevAlive != 0 && alive == 0 && pendingOnFloor(pf) == 0) {   // prevAlive=-1 (приход) тоже объявляет (ROM b8fc→57e0c)
+                      msgs.push(ztmsg::ZERO_ENEMIES);
+                      floorSecT = 0xE1;                         // старт цикла напоминаний (ROM 0xE1, сим-тики)
+                  }
+                  prevAlive = alive;
+              } }
             // ⭐КОНЕЦ ЭПИЗОДА (ROM 1728→1a40): смерть босса дотикивает episodeEndT → слайд-заставка →
             // эпизод+1 → загрузка нового с этажа 0 (setEp по концу очереди заставок). Маппинг заставок
             // (ROM-слайды 1/2/4 после эп 0/1/2): эп1→DECOY, эп2→CENTRAL+SUBBASE, эп3→VICTORY→выбор бойца.
@@ -2198,7 +2239,7 @@ int main(int argc, char** argv) {
             // (юзер). want-модель: смена желаемого трека → стоп+старт; тишина (трек кончился) → перезапуск.
             { static int musWant = -1; static bool liftMus = false;
               const int pcx = (int)cam.px, pcy = (int)cam.py;
-              const uint8_t pct2 = (pcx >= 0 && pcy >= 0 && pcx < Level::W && pcy < Level::H)
+              const uint8_t pct2 = (pcx >= 0 && pcy >= 0 && pcx < gd.levels[ep].W && pcy < gd.levels[ep].H)
                                    ? gd.levels[ep].cellType(cam.floor, pcx, pcy) : 0;
               // ⭐ЛИФТ (ROM e69e/e6fe): музыка кабины стартует С ПОЕЗДКОЙ (elevState ±1) и держится, пока
               // игрок остаётся на клетках лифта; ушёл с клеток → тема эпизода (юзер).
@@ -2217,7 +2258,7 @@ int main(int argc, char** argv) {
             // окне; рикошеты по крыше + трассер ракеты (звук долёта 0x18). Тумблер `snipers`.
             if (faSnipers() && ep == 1) {
                 const int scx = (int)cam.px, scy = (int)cam.py;
-                uint8_t pct = (scx >= 0 && scy >= 0 && scx < Level::W && scy < Level::H)
+                uint8_t pct = (scx >= 0 && scy >= 0 && scx < gd.levels[ep].W && scy < gd.levels[ep].H)
                               ? gd.levels[ep].cellType(cam.floor, scx, scy) : 0;
                 bool onCell = (pct == 0x27 || pct == 0x28);
                 // ⭐спавн = СОБЫТИЕ ВХОДА в клетку (ROM e870/e88a: step-on e3f8 только при смене кэша
@@ -2373,6 +2414,16 @@ int main(int argc, char** argv) {
         int fps = (selectActive || briefState.idx >= 0 || bootPhase >= 0) ? 60 : (frameLimit < 5 ? 5 : frameLimit);   // выбор/заставка/boot = 60fps (плавно)
         Uint32 target = (Uint32)(1000 / fps);
         Uint32 spent = SDL_GetTicks() - frameStart;
+        // ⭐ПЕРФ-ДИАГНОСТИКА СТАТТЕРОВ (`perfstat`/`perflog` в консоли): работа кадра (без сна) vs бюджет +
+        // худшее ожидание аудио-лока (главный поток ждёт коллбек Nuked-OPN2 при коллизии playSfx/mix).
+        { double aw = snd::takeAudioLockWaitMs();
+          g_perf.frames++;
+          if (spent > g_perf.worstMs) { g_perf.worstMs = spent; g_perf.worstAudioMs = aw; }
+          if (spent > target + target / 2) {                    // всплеск: работа кадра > 1.5 бюджета
+              g_perf.spikes++;
+              if (g_perf.log) con::log("perf: spike " + std::to_string(spent) + "ms (budget " +
+                                       std::to_string(target) + "ms, audio-wait " + std::to_string((int)(aw * 10) / 10.0) + "ms)");
+          } }
         if (spent < target) SDL_Delay(target - spent);
     }
     saveSettings(CFG_PATH, moveSpd, turnSpd, faHStretch(), frameLimit, enemySpeedScale(), faithful, noclip, reference, enemiesOn, gameMapMode()); // автосохранение при выходе

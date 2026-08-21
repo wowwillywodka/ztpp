@@ -25,23 +25,39 @@ static const uint16_t DOOR_METATEX = 18; // канонич. метатексту
 // Возвращает true на ФРОНТАХ звука двери (caller играет SFX_DOOR=0x67): начало ОТКРЫТИЯ (ROM b2f2)
 // И момент ПОЛНОГО ЗАКРЫТИЯ (ROM b3f4: фаза дошла до 0 → тот же звук 0x67 — «щелчок»; VERIFIED 2026-07-24).
 inline bool   rcUpdateDoors(int floor, double px, double py, const Level& lvl) {
+    // ⭐ROM-модель b35c [сверка 2026-07-28]: ГЛОБАЛЬНЫЙ список активных дверей (не бокс вокруг игрока!).
+    // На тик по каждой записи: «кто-то в клетке» (игрок b37c-b3a6 ИЛИ живой актёр с бит4 b3ae-b3d4) →
+    // фаза +0x20 (кап 0x80), никого → −0x20; фаза 0 → звук 0x67 + запись снимается. Запись СОЗДАЁТ
+    // step-on игрока (b25e/b29a, звук 0x67 @b2f2) или враг (b1c4 + свой 0x67 в AI-сайте). ТРУП дверь
+    // НЕ держит: смерть чистит бит4 (andi #$ff2f @184fa/189fa/15662) — дверь закрывается сквозь труп.
     auto& m = doorMap();
-    int cx = (int)px, cy = (int)py;
+    // смена этажа → ЗАКРЫТЬ ВСЕ активные двери сразу, БЕЗ звука (ROM b48a: хвост b35c при смене этажа)
+    { static int lastFloor = -1;
+      if (floor != lastFloor) { if (lastFloor >= 0) m.clear(); lastFloor = floor; } }
+    const int cx = (int)px, cy = (int)py;
     bool sndEdge = false;
-    for (int y = cy - 3; y <= cy + 3; ++y)
-        for (int x = cx - 3; x <= cx + 3; ++x) {
-            if (x < 0 || y < 0 || x >= Level::W || y >= Level::H) continue;
-            uint8_t ct = lvl.cellType(floor, x, y);
-            if (ct != 6 && ct != 7) continue;
-            bool onCell = (cx == x && cy == y);          // игрок СТОИТ на клетке двери (ZT step-on)
-            int k = doorKey(floor, x, y);
-            double o = m.count(k) ? m[k] : 0.0, prev = o;
-            o += (onCell ? 0.20 : -0.10) * simDt();      // ⭐фаза в ROM-тиках (fps-инвариантно)
-            if (o < 0) o = 0; if (o > 1) o = 1;
-            if (onCell && prev < 0.01 && o > 0.0) sndEdge = true;      // фронт открытия (b2f2)
-            if (!onCell && prev > 0.0 && o <= 0.0)  sndEdge = true;    // дверь ДОЗАКРЫЛАСЬ (b3f4: тот же 0x67)
-            m[k] = o;
+    const int pk = (cx >= 0 && cy >= 0 && cx < lvl.W && cy < lvl.H &&
+                    cellIsDoor(lvl.cellType(floor, cx, cy))) ? doorKey(floor, cx, cy) : -1;
+    // 1) создание записи step-on'ом игрока (b25e/b29a): встал на клетку двери, записи нет →
+    //    стартовая фаза 0x20/0x80 = 0.25 (b25e: `move.w #$20,(a3)+`) + звук 0x67 (b2f2)
+    if (pk >= 0 && (!m.count(pk) || m[pk] <= 0.0)) { m[pk] = 0.25; sndEdge = true; }
+    // 2) обновление ВСЕХ активных записей (b360-цикл)
+    for (auto it = m.begin(); it != m.end(); ) {
+        const int k = it->first;
+        bool held = (k == pk) || doorHoldSet().count(k) != 0;
+        double prev = it->second;
+        if (!held && prev <= 0.0) { it = m.erase(it); continue; }   // зомби-запись (фаза 0, напр. из .sav) — снять БЕЗ звука
+        double o = prev + (held ? 0.25 : -0.25) * simDt();   // ⭐b420/b3dc: ±0x20/тик из 0x80 — открытие И закрытие одной скоростью
+        if (o > 1) o = 1;
+        if (!held && prev > 0.0 && o <= 0.0) {               // фаза дошла до 0 → «щелчок» 0x67 (b3f4) + снять запись (b43c)
+            sndEdge = true;
+            it = m.erase(it);
+            continue;
         }
+        it->second = (o < 0) ? 0.0 : o;
+        ++it;
+    }
+    doorHoldSet().clear();                                   // метки живут один тик (враги пере-помечают каждый updateActors)
     return sndEdge;
 }
 
@@ -135,7 +151,7 @@ inline std::vector<WorldFx>& worldFx() { static std::vector<WorldFx> v; return v
 // dist = (|dx|+|dy|+max)/2 (d7c0); потолочные лампы/вентилятор (0x62-64,0x75,0x78) хендлера НЕ имеют.
 inline void rcDecorPush(Camera& c, const Level& lvl) {
     int cx = (int)c.px, cy = (int)c.py;
-    if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return;
+    if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) return;
     uint8_t ct = lvl.cellType(c.floor, cx, cy);
     int thr, r;
     switch (ct) {
@@ -254,12 +270,12 @@ struct WallAnimator {
 
 // Стена для ЛУЧА (стены+двери) — луч останавливается и рисует текстуру.
 inline bool rcSolidRay(const Level& lvl, int floor, int cx, int cy) {
-    if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return true;
+    if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) return true;
     return cellRenderWall(lvl.cellType(floor, cx, cy));
 }
 // Блокирует ДВИЖЕНИЕ (стены, но не двери).
 inline bool rcSolidMove(const Level& lvl, int floor, int cx, int cy) {
-    if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return true;
+    if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) return true;
     return cellBlocks(lvl.cellType(floor, cx, cy));
 }
 
@@ -306,7 +322,7 @@ inline uint8_t rcColumnHitCt(const Level& lvl, const Camera& cam, int x, int W, 
     if (rayY < 0) { stepY = -1; sideY = (cam.py - mapY) * dDistY; } else { stepY = 1; sideY = (mapY + 1.0 - cam.py) * dDistY; }
     for (int g = 0; g < 256; ++g) {
         if (sideX < sideY) { sideX += dDistX; mapX += stepX; } else { sideY += dDistY; mapY += stepY; }
-        if (mapX < 0 || mapY < 0 || mapX >= Level::W || mapY >= Level::H) return 1;
+        if (mapX < 0 || mapY < 0 || mapX >= lvl.W || mapY >= lvl.H) return 1;
         uint8_t ct = lvl.cellType(cam.floor, mapX, mapY);
         if (cellRenderWall(ct)) return ct;
     }
@@ -367,7 +383,7 @@ inline void rcRotate(Camera& c, double a) {
 // Точечная проверка движения с УЧЁТОМ диагоналей (game-true, FUN_e1b2 / таблица e23e).
 inline bool rcBlockedPt(const Level& lvl, int floor, double px, double py) {
     int cx = (int)px, cy = (int)py;
-    if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return true;
+    if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) return true;
     return cellBlockedAt(lvl.cellType(floor, cx, cy), px - cx, py - cy);
 }
 
@@ -466,6 +482,10 @@ inline int bandForSprite(double distCells, int envMode) {
 // клетки от камеры к [−dist,+dist] (box/Чебышёв) → клетки-стены дальше dist НЕ рисуются (за ними фон/тёмный
 // градиент). env: Bright 16 (≈весь уровень), Dim/Haze/Black 5, No-ceiling 12.
 inline int drawDistForEnv(int env) {
+    // ⭐ФОНАРЬ/НОЧНИК [VERIFIED 2026-07-28]: подбор фонаря 111e8 и сеттер этажа 1d5e (фонарь активен) /
+    // ночник 112ba — все пишут #$10 в -$714c ПОВЕРХ env → в темноте с фонарём видно 16 клеток, не 5.
+    // (Регрессия порта: дальность была только по env — фонарь «не светил дальше».)
+    if (flActive() || nvActive()) return 16;
     switch (env) { case 0: return 16; case 3: return 12; default: return 5; }  // 1/2/4 → 5
 }
 inline int& faDrawDist() { static int v = -1; return v; }   // override дальности (cull); <0 = по env (--drawdist)
@@ -490,7 +510,7 @@ inline double& faStairPitchOverride() { static double v = 1e9; return v; }  // C
 inline bool&   faStairOff() { static bool b = false; return b; }            // ДИАГ: отключить спец-обработку лестницы
 inline double stairPitchAdjust(const Level& lvl, int floor, double px, double py) {
     int cx = (int)px, cy = (int)py;
-    if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return 0.0;
+    if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) return 0.0;
     uint8_t ct = lvl.cellType(floor, cx, cy);
     double yf = (py - cy) * 256.0, xf = (px - cx) * 256.0;
     double& g = stairPitchState();
@@ -536,7 +556,7 @@ inline void descentDeepDir(uint8_t ct, int& ddx, int& ddy) {
 // Направление углубления СЕКЦИИ возле (cx,cy): берём слоуп-клетку рядом (сама/сосед). false=не нашли.
 inline bool stairSectionDeepDir(const Level& lvl, int floor, int cx, int cy, int& ddx, int& ddy) {
     auto chk = [&](int x, int y) -> bool {
-        if (x < 0 || y < 0 || x >= Level::W || y >= Level::H) return false;
+        if (x < 0 || y < 0 || x >= lvl.W || y >= lvl.H) return false;
         descentDeepDir(lvl.cellType(floor, x, y), ddx, ddy);
         return (ddx || ddy);
     };
@@ -550,7 +570,7 @@ inline bool stairSectionDeepDir(const Level& lvl, int floor, int cx, int cy, int
 // роняет пол на 1 в свою низкую сторону (по descentLowDir). Лестница часто ЗАМКНУТА стенами (вход = спуск с
 // уровня выше) — поэтому НЕ ищем «обычный пол», а распространяем относительные уровни от любой клетки.
 inline void buildStairHeightMap(const Level& lvl, int floor, std::vector<int>& ht) {
-    const int W = Level::W, H = Level::H;
+    const int W = lvl.W, H = lvl.H;
     const int UNSET = -100000;
     ht.assign((size_t)W * H, 0);
     std::vector<int> level((size_t)W * H, UNSET), q;
@@ -713,7 +733,7 @@ inline bool cellReachable(const Level& lvl, int floor, double px, double py, int
     for (int guard = 0; guard < 256; ++guard) {
         if (tMaxX < tMaxY) { cx += stepX; tMaxX += tDeltaX; } else { cy += stepY; tMaxY += tDeltaY; }
         if (cx == tcx && cy == tcy) return true;                   // дошли до цели раньше стены
-        if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return false;
+        if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) return false;
         if (cellRenderWall(lvl.cellType(floor, cx, cy))) return false;  // непрозрачная стена на пути
     }
     return false;
@@ -891,11 +911,14 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
                                 Put put, WallCloser wallCloser, SX sx, ColH colH) {
     const int ccx = (int)cam.px, ccy = (int)cam.py;
     struct Item { double f, l; DecorDef d; bool square = false; int sprId = -1; uint8_t efr = 0; bool corpse = false; float zlift = 0; uint8_t dir = 0, animSt = 0, variant = 0; bool foam = false; bool burned = false; uint8_t atkPose = 0; bool overlay = false; };  // overlay=огонь поверх стен
-    std::vector<Item> items;
+    // Очередь создаётся на каждом кадре. Сохраняем её ёмкость между кадрами, чтобы при BZT-пачках
+    // статуй не было серий реаллокаций и скачков времени именно во время движения камеры.
+    static thread_local std::vector<Item> items;
+    items.clear();
     for (int y = ccy - drawDist; y <= ccy + drawDist; ++y) {
-        if (y < 0 || y >= Level::H) continue;
+        if (y < 0 || y >= lvl.H) continue;
         for (int x = ccx - drawDist; x <= ccx + drawDist; ++x) {
-            if (x < 0 || x >= Level::W) continue;
+            if (x < 0 || x >= lvl.W) continue;
             uint8_t ct = lvl.cellType(cam.floor, x, y);
             DecorDef dd;
             // ⭐ДЕКОР-ТРУП / BURNT-REMAINS как окружение (ZT celltype 0x2C/0x6C-0x74 = corpse-anim врага, 0x35 = burnt-remains;
@@ -1024,6 +1047,17 @@ inline void drawDecorBillboards(int SW, int SH, const Level& lvl, const Camera& 
                 int fi = it.efr > 3 ? 3 : it.efr;
                 if (!A.revFall[fi].empty()) lst = &A.revFall[fi];
             }
+            else if (it.animSt == 11) {                                              // BZT June special-stagger A (weapon D)
+                if (A.juneStagADirs > 0 && it.dir < (uint8_t)A.juneStagADirs && !A.juneStagAD[it.dir].empty())
+                    lst = &A.juneStagAD[it.dir];
+                else if (!A.juneStagA.empty()) lst = &A.juneStagA;
+            }
+            else if (it.animSt == 12) {                                              // BZT June special-stagger B (weapon B)
+                if (A.juneStagBDirs > 0 && it.dir < (uint8_t)A.juneStagBDirs && !A.juneStagBD[it.dir].empty())
+                    lst = &A.juneStagBD[it.dir];
+                else if (!A.juneStagB.empty()) lst = &A.juneStagB;
+            }
+            else if (it.animSt == 13 && !A.juneCorpse.empty()) lst = &A.juneCorpse; // BZT June resting corpse after CB→CC
             // ⭐СПАЛЁННЫЙ труп → BURNT REMAINS спрайт (ZT 1b8d8, банк 0x1cb96a), НЕ обычный труп/перекраска.
             // burned=true в worldFx ставится ТОЛЬКО у AT_CORPSE (живой AT_ENEMY его не передаёт), поэтому it.corpse
             // (=!hasDeath, костыль сплющивания) тут не нужен — иначе горючие враги С death-анимацией (Imp/FH/Hydaca) не заменялись бы.
@@ -1214,7 +1248,7 @@ void renderFPS(PutFn&& put, int W, int H, const Level& lvl, const Palette& wallP
         while (!hit && guard++ < 256) {
             if (sideX < sideY) { sideX += dDistX; mapX += stepX; side = 0; }
             else               { sideY += dDistY; mapY += stepY; side = 1; }
-            if (mapX < 0 || mapY < 0 || mapX >= Level::W || mapY >= Level::H) { hit = true; break; }
+            if (mapX < 0 || mapY < 0 || mapX >= lvl.W || mapY >= lvl.H) { hit = true; break; }
             if (mapX < camCXd - ddist || mapX > camCXd + ddist ||
                 mapY < camCYd - ddist || mapY > camCYd + ddist) { culled = true; break; }  // за дальностью
             uint8_t ctc = lvl.cellType(cam.floor, mapX, mapY);
@@ -1278,7 +1312,7 @@ void renderFPS(PutFn&& put, int W, int H, const Level& lvl, const Palette& wallP
         } else {
             perp = (side == 0) ? (sideX - dDistX) : (sideY - dDistY);
             if (perp < 1e-4) perp = 1e-4;
-            bool inb = (mapX >= 0 && mapY >= 0 && mapX < Level::W && mapY < Level::H);
+            bool inb = (mapX >= 0 && mapY >= 0 && mapX < lvl.W && mapY < lvl.H);
             uint8_t cell = inb ? lvl.cellId(cam.floor, mapX, mapY) : 0;
             uint8_t ct   = inb ? lvl.cellType(cam.floor, mapX, mapY) : 1;
             int face = (side == 1) ? (rayY > 0 ? 0 : 3) : (rayX > 0 ? 1 : 2);
@@ -1300,7 +1334,7 @@ void renderFPS(PutFn&& put, int W, int H, const Level& lvl, const Palette& wallP
 
         int lineH = (int)(H / perp);
         const bool elevRide = (cam.elevState != 0);
-        const bool hitInb = (mapX >= 0 && mapY >= 0 && mapX < Level::W && mapY < Level::H);
+        const bool hitInb = (mapX >= 0 && mapY >= 0 && mapX < lvl.W && mapY < lvl.H);
         const uint8_t hitCt = hitInb ? lvl.cellType(cam.floor, mapX, mapY) : 1;
         const bool cabinWall = elevRide && rcElevCell(hitCt);  // стена САМОЙ кабины → статична + синий пол/пот
         const uint32_t VOID_BLUE = 0xFF002448u;

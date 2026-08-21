@@ -18,7 +18,12 @@ inline bool applyDestruct(Level& lvl) {
         uint8_t ct = lvl.cellType(r.floor, r.x, r.y);
         if (wallIsSecret(ct)) {                                     // 0x79/7B/7D/7F → перманентно celltype+1 (a6bc)
             int rid = lvl.remapCellId((uint8_t)(ct + 1));           //   разрушенная текстура = cell-ID с celltype+1
-            if (rid >= 0) { lvl.setCell(r.floor, r.x, r.y, (uint8_t)rid); destroyed = true; }  // смена текстуры
+            // ZTU: у celltype 0x7F нет представителя для следующего 0x80.
+            // ROM строит remap-таблицу с нулём для отсутствующего типа, поэтому
+            // ID 0x65/0x79 (ct 0x7F) после выстрела становятся cell-ID 0 — проём.
+            // Не оставлять исходную стену, если Level не нашёл явный ID.
+            lvl.setCell(r.floor, r.x, r.y, (uint8_t)(rid >= 0 ? rid : 0));
+            destroyed = true;
         } else if (wallIsBreakable(ct)) {                           // 0x06/0x83 гориз, 0x07/0x84 верт (b130/b168)
             bool horiz = (ct == 0x06 || ct == 0x83);
             int rid = lvl.remapCellId((uint8_t)(horiz ? 0x2D : 0x2E));  // обломки 0x2D/0x2E (проходимы)

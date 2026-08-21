@@ -34,16 +34,28 @@ inline const char* buildLabel(Build b) {
         case Build::ZT:        return "ZERO TOLERANCE (RELEASE)";
         case Build::ZTU:       return "ZT UNDERGROUND V1.5 (PARTIAL SUPPORT)";   // играбелен, но часть контента/механик в работе
         case Build::ZT_German: return "ZERO TOLERANCE (GERMAN)";
-        case Build::BZT_June:  return "BEYOND ZT PROTO 1995-06-23";
+        case Build::BZT_June:  return "BEYOND ZT PROTO 1995-06-23 (EXPERIMENTAL)";
         case Build::BZT_July:  return "BEYOND ZT PROTO 1995-07-14";
         default:               return "UNKNOWN MEGA DRIVE ROM";
     }
 }
-inline bool buildSupported(Build b) { return b == Build::ZT || b == Build::ZTU; }
+inline bool buildSupported(Build b) { return b == Build::ZT || b == Build::ZTU || b == Build::BZT_June; }
+// Цвет строки ROM во всех реализациях лаунчера. Красным помечаем только запускаемый
+// экспериментальный June; неподдерживаемые German/July и неизвестные ROM остаются серыми.
+enum class TextTone { Default, Green, Yellow, Red };
+inline TextTone buildTextTone(Build b) {
+    switch (b) {
+        case Build::ZT:       return TextTone::Green;
+        case Build::ZTU:      return TextTone::Yellow;
+        case Build::BZT_June: return TextTone::Red;
+        default:              return TextTone::Default;
+    }
+}
 // Статус для колонки лаунчера: ZTU играбелен, но поддержан ЧАСТИЧНО (юзер 2026-07-22).
 inline const char* buildStatus(Build b) {
     if (b == Build::ZT)  return "SUPPORTED";
     if (b == Build::ZTU) return "PARTIALLY SUPPORTED";
+    if (b == Build::BZT_June) return "EXPERIMENTAL";
     return "NOT SUPPORTED YET";
 }
 

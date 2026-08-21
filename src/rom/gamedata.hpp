@@ -16,6 +16,7 @@
 #include "background.hpp"     // Panorama + decode (декодер-слой)
 #include "font8x8.hpp"        // ZtFont/ZtFontBig
 #include "enemy_sprites.hpp"  // спрайты врагов (вынесены из gamedata)
+#include <array>
 #include <vector>
 #include <string>
 #include <cstdint>
@@ -98,11 +99,37 @@ struct GameData {
     bool     hasSega = false;
     WallBank wall;
     WallBank obj;                       // банк графики объектов/декора (0x10E9BE, 66 тайлов 32×32 — тот же формат)
+    // ⭐PER-EPISODE ресурсы (BZT June: у каждого эпизода СВОЙ банк стен/палитра/fc-шаблоны — дескрипторы
+    // @0xB9B96; ZT/ZTU: пусто — общий банк). applyEpisodeAssets(ep) переливает в wall/wallPal/fcTemplates.
+    std::vector<WallBank>             wallEp;
+    std::vector<WallBank>             objEp;      // June: items_imgs эпизода (66 тайлов, формат = ZT obj-банк)
+    std::vector<Palette>              wallPalEp;
+    std::vector<std::vector<uint8_t>> fcTemplatesEp;
+    std::vector<std::vector<uint8_t>> shadeRampsEp;   // June: CLUT-рампы эпизода (дескриптор +0x10)
+    std::vector<std::vector<uint32_t>> hudEp;         // June: кокпит-HUD эпизода (палитра из дескриптора +0x04)
+    std::vector<Palette> heldPalEp;                   // June: палитра held-оружия (линия 1 CRAM эпизода)
+    std::vector<Palette> hudIconPalEp;                // June: палитра иконок инвентаря (линия 3)
+    void applyEpisodeAssets(int ep) {
+        if (ep < 0) return;
+        if (ep < (int)wallEp.size())        wall        = wallEp[ep];
+        if (ep < (int)objEp.size())         obj         = objEp[ep];
+        if (ep < (int)wallPalEp.size())     wallPal     = wallPalEp[ep];
+        if (ep < (int)fcTemplatesEp.size()) fcTemplates = fcTemplatesEp[ep];
+        if (ep < (int)shadeRampsEp.size())  shadeRamps  = shadeRampsEp[ep];
+        if (ep < (int)hudEp.size() && !hudEp[ep].empty()) hud = hudEp[ep];
+        if (ep < (int)heldPalEp.size())    heldPal    = heldPalEp[ep];
+        if (ep < (int)hudIconPalEp.size()) hudIconPal = hudIconPalEp[ep];
+    }
     Panorama bgCity, bgSpace;
     std::vector<uint8_t> shadeRamps;    // копия ROM-региона рамп (база 0x3392, 0x1000 б)
     std::vector<uint8_t> fcTemplates;   // шаблоны пол/потолок: 5 env × 0xA0 б (по env-индексу 0..4)
     std::vector<uint32_t> hud;          // HUD/кокпит 320×224 ARGB (референс-режим); пусто если нет
     std::vector<uint32_t> pauseBg;      // ФОН меню паузы 320×224 ARGB (руки держат карту-PDA, ZT @0x12DD06); пусто если нет
+    std::vector<uint32_t> bztMapBg;     // BZT June: отдельный экран карты 320×224 (панель, ROM 2B9E)
+    std::array<std::array<uint8_t, 16>, 8> bztMapBrick{};   // 8 микротайлов карты: 4×4 px, из ROM 0x164B62
+    std::array<uint8_t, 256> bztMapLut{};                   // June sub_00DC2A: celltype/nibble -> 0..7
+    std::array<uint8_t, 64> bztMapPlayerMark{};             // sprite tile 0x276, 8×8, idx0 transparent
+    std::array<uint8_t, 64> bztMapObjectMark{};             // sprite tile 0x286, 8×8, idx0 transparent
     // ⭐ID-КАРТЫ ОТРЯДА U-RON (пауза-экран Tab, ROM 2acc: таблица 0x2CC8[$FF1030] → блиттер 0x1F72 @(192,128)):
     std::vector<std::vector<uint32_t>> idCards;   // 5 карт 128×96 ARGB (idx0 прозрачен); пусто = не декодированы
     int idcW = 0, idcH = 0;             // размер карты в px (ZT 128×96)
@@ -135,6 +162,7 @@ struct GameData {
     // в 32×32 (16 тайлов 8×8, 4×4 COLUMN-MAJOR), шаг 0x200. Палитра — та же heldPal (0x20D2).
     std::vector<uint8_t> hudIcons;      // банк иконок: hudIconCount × 0x200 б
     int      hudIconCount = 0;
+    Palette  hudIconPal;                // палитра HUD-иконок (ZT = heldPal 0x20D2; June = линия 3 палитры эпизода)
     ZtFont   font;                      // Letters (A-Z 0-9 . - : ?) — нижний-левый HUD-инфо
     ZtFont   fontNum;                   // Numbers (0-9) — HP / счётчик врагов на HUD
     ZtFont   fontAlt;                   // Font2 (0-9 A-Z) — название уровня (пауза)
@@ -152,8 +180,8 @@ struct GameData {
     uint32_t selBg = 0xFF000000u;       // ФОН экрана выбора (backdrop CRAM[0], светло-серый ~218)
     std::vector<uint32_t> selArrow;     // спрайт СТРЕЛКА (24×32, ARGB, палитра 1 жёлтая); ↓ = vflip
     std::vector<uint32_t> selPush;      // спрайт "PUSH START TO SELECT" (32×32, ARGB)
-    // ⭐СТРЕЛКА-КУРСОР МЕНЮ ОПЦИЙ (ROM sub_10B4C8 → спрайт SAT size 0x400 = 2×1 тайла ГОРИЗОНТ., палитра line0 0x10CBDC):
-    //   16×8 ARGB «────►», из ROM 0x10CB7C (0x4AE=лев, 0x4AF=прав). idx0 = прозрачный. Только ZT; иначе optArrowHave=false.
+    // ⭐СТРЕЛКА-КУРСОР МЕНЮ ОПЦИЙ: 16×8 ARGB «────►», два горизонтальных тайла. idx0 = прозрачный.
+    //   Оригинальные данные подключены для ZT и ZTU; у остальных билдов optArrowHave=false.
     uint32_t optArrow[16 * 8] = {};   // 16 шириной × 8 высотой
     bool     optArrowHave = false;
     // ⭐КУРСОР-СКОБКА ЭКРАНА ПАРОЛЯ (ROM 0x581BA: спрайт-тайл 0x243 @ROM 0x12ea86, 8×8, палитра line2 0x1CDAE):

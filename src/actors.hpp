@@ -17,6 +17,7 @@
 #include <vector>
 #include <unordered_set>
 #include <cmath>
+#include <functional>
 
 // Тип поведения (+0x12 think в ZT). Эффекты + враги в одном пуле.
 enum ActorThink {
@@ -51,6 +52,7 @@ struct Actor {
     int     fireCd = 0;        // кулдаун стрельбы врага (timer занят под фазу-таймер ИИ)
     int     fireAnimT = 0;     // таймер анимации стрельбы/удара врага (показывает fire-аним ~кадров)
     int     xformT = 0;        // таймер трансформации (Sgt 0x29 → FH-SF 0x69 по истечении, ZT state6)
+    int     weaponId = -1;     // источник урона для отложенного blast (мина/граната/ракета)
     uint8_t variant = 0;       // визуальная вариация (FH: 0/1 → walk vs walkB; «две вариации при одном cell id»)
     bool    revived = false;    // Boss3 (0x6A): воскрешение ОДИН раз при HP≤0 (ZT state6 0x1a40c → HP=0x3e8)
     uint8_t patrolDir = 0;      // Revenant: текущее направление сеточного патруля (0..7, ZT нав 0x1ac76)
@@ -59,6 +61,12 @@ struct Actor {
     int     frameT = 0;        // таймер анимации ходьбы (растёт при движении)
     int     walkAcc = 0;       // ⭐ROM $3c: ДИСТАНС-аккумулятор анимации ходьбы (+= октаг.скорость/тик, ед. 256/кл)
     uint8_t atkPose = 0;       // 0=основная боевая аним (fire), 1=2-я поза (fire2: прыжок/выстрел/дальний/удар/бросок) — ставится в момент атаки
+    uint8_t juneFlags = 0;     // BZT June +0x50: роль RedRobo / переключатель траектории остальных
+    uint8_t juneLead = 0;      // BZT June +0x51: коэффициент упреждения Man/RedMan
+    uint16_t juneAngle = 0;    // BZT June +0x54: постоянный угол орбиты Purple
+    uint8_t juneHitState = 0;  // BZT June state 2/5/6: обычный / flamethrower / rocket stagger
+    int     juneHitTimer = 0;  // фиксированное окно special-stagger
+    uint8_t juneCorpsePose = 0;// 0=death, 1=последний кадр stagger A, 2=stagger B
     uint8_t tile = 0;          // тайл объект-банка   +0x3e
     uint8_t srcType = 0;       // исходный celltype врага
     int     drop = -1;         // ТРУП: оброненное оружие (id 1..14), подбирается при шаге на труп; −1 = нет
@@ -172,9 +180,9 @@ static const uint8_t A_SPARK_SEQ[3] = {63, 64, 65};  // искра пули: в�
 static const uint8_t A_FIRE_TILE  = 0;   // пламя/огонь (объект-банк 0)
 
 // ── СПАВН эффектов ──
-inline void spawnBullet(double x, double y, int f, double dx, double dy, double sp, uint8_t tile, int life) {
+inline void spawnBullet(double x, double y, int f, double dx, double dy, double sp, uint8_t tile, int life, int weaponId = -1) {
     Actor& a = allocActor(); a.think = AT_BULLET; a.x = x; a.y = y; a.vx = dx * sp * simDt(); a.vy = dy * sp * simDt();
-    a.floor = f; a.tile = tile; a.timer = life;
+    a.floor = f; a.tile = tile; a.timer = life; a.weaponId = weaponId;
 }
 inline uint32_t enemyRng();  // fwd-декл (тело ниже) — для разброса частиц огнемёта
 // ⭐ОГНЕМЁТ (ZT draw 0x1282e + think 0x142c6): КАЖДЫЙ кадр спавнит частицу-пламя. Velocity = view-dir/4 (0.25 кл/кадр)
@@ -212,7 +220,7 @@ inline void spawnFoam(double x, double y, int f, double dx, double dy) {
 }
 inline void spawnMine(double x, double y, int f) {
     Actor& a = allocActor(); a.think = AT_MINE; a.x = x; a.y = y; a.floor = f; a.tile = 8;  // мина (объект-банк 8)
-    a.timer = 21;   // АРМИНГ (ZT 0x12bfe: ставит actor+$1f=0x14 → первый think через ~21 кадр) — НЕ детонирует сразу на ставившем
+    a.timer = 21; a.weaponId = 2;   // АРМИНГ (ZT 0x12bfe: ставит actor+$1f=0x14 → первый think через ~21 кадр) — НЕ детонирует сразу на ставившем
 }
 // Граната (think 0x13adc): бросается с дугой (z вверх + гравитация), горизонт. скорость, фитиль $34=50.
 // enemyBallistic (ZT 1b40a/19dba): dx/dy = ПОЛНЫЙ вектор к игроку (кл); vel = вектор/16 (дальше игрок → сильнее навес =
@@ -229,13 +237,14 @@ inline void spawnGrenade(double x, double y, int f, double dx, double dy, int ow
     a.z = 0.35; a.vz = 0.028;               // из руки, невысокая дуга
     a.timer = 50; a.tile = 16;              // фитиль 50 тиков ($34); ЛЕТЯЩАЯ граната = декор-тайл 16 (ZT draw 0x13f3e bank 0x1109be)
     a.state = owner;                        // 0=граната игрока (детонир. у врага), 1=граната врага (детонир. у игрока)
+    a.weaponId = owner == 0 ? 7 : -1;
 }
 // ⭐Граната С АВТОНАВЕДЕНИЕМ (ZT 11e0a-11e3c): vel = вектор к упреждённой цели / фитиль; фитиль = dist/64+8 ROM-тиков
 // (баллистика «ложится на цель» расчётом фитиля, proximity-взрывателя у гранаты НЕТ).
 inline void spawnGrenadeAimed(double x, double y, int f, double vx, double vy, int fuse) {
     Actor& a = allocActor(); a.think = AT_GRENADE; a.floor = f; a.x = x; a.y = y;
     a.vx = vx; a.vy = vy; a.z = 0.35; a.vz = 0.028;
-    a.timer = fuse; a.tile = 16; a.state = 0;
+    a.timer = fuse; a.tile = 16; a.state = 0; a.weaponId = 7;
 }
 inline void spawnSparkA(double x, double y, int f) {
     Actor& a = allocActor(); a.think = AT_SPARK; a.x = x; a.y = y; a.floor = f; a.tile = A_SPARK_SEQ[0];
@@ -268,11 +277,13 @@ inline int bloodParticleCount(int romDmg) {
 //   hit-gib (одиночный, count по урону, receive зовёт 0x157ca 1× при убойном ≥0x338): Sgt 0x29 (0x1b824), FH 0x2A (0x187c8),
 //   Imp 0x2B (0x18b12), Dog 0x68 (0x1999a), FH-SF 0x69 (0x1a154).
 inline bool enemyBleeds(uint8_t ct) {
+    if (juneEnemies()) return false;
     return ct==0x29 || ct==0x2A || ct==0x2B || ct==0x68 || ct==0x69;   // Sgt, FH, Imp, Dog, FH-SF
 }
 // БОССЫ: receive на убойном ударе (HP из ≥0 в <0) — ДВОЙНОЙ 0x157ca с d0=0x400 → фонтан (~8-10 частиц), БЕЗ гейта ≥0x338:
 //   Boss1 0x67 (0x1947e→0x194da/e2), Boss2 0x6B (0x18f9e→0x18ffa/02), Boss3 0x6A (0x1a84a→0x1a8a6/ae). НЕ hit-gib (тут death-only).
 inline bool enemyDeathGush(uint8_t ct) {
+    if (juneEnemies()) return false;
     return ct==0x67 || ct==0x6A || ct==0x6B;   // Boss1, Boss2, Boss3
 }
 inline void spawnBlood(double x, double y, int f, double dirX, double dirY, int count) {
@@ -303,6 +314,11 @@ inline void spawnBlood(double x, double y, int f, double dirX, double dirY, int 
 //   • Imp/Hydaca/Dog/боссы — БЕЗ дропа (death только штампует труп cmd 0x12).
 // Возврат: id оружия 1..14, или −2 = «RNG laser/grenade», или −1 = нет дропа. Пикап ВИДИМ на полу у трупа.
 inline int enemyWeaponDrop(uint8_t ct) {
+    if (juneEnemies()) {
+        if (ct == 0x29) return 8;                                  // RedRobo corpse handler: item 8
+        if (enemyGfxSlot(ct) >= 1) return 12;                       // Purple/Man/RedMan/GrenMan: item 0xC
+        return -1;
+    }
     switch (ct) {
         case 0x2A: return 8;    // Former Human → ПИСТОЛЕТ (всегда)
         case 0x66: return 10;   // Revenant → LASER AIMED GUN (всегда)
@@ -317,12 +333,13 @@ inline int enemyWeaponDrop(uint8_t ct) {
 // (напольный объект-спавн cmd 0x13→1c03a = ТОЛЬКО 2P-link, ветка a3≠игрок @18774). Подбор — НАСТУПАНИЕМ:
 // каждый кадр труп меряет дистанцию до игрока, при <0x60 (≈0.375 кл) и есть место → оружие в инвентарь +
 // «COLLECTED» (jsr 11084); полный инвентарь (187a0=rts) → оружие ОСТАЁТСЯ в трупе (не теряется). См. corpsePickup.
-inline void spawnCorpse(double x, double y, int f, uint8_t ct, double kvx = 0, double kvy = 0, uint8_t variant = 0, int drop = -1, bool burned = false) {
+inline void spawnCorpse(double x, double y, int f, uint8_t ct, double kvx = 0, double kvy = 0, uint8_t variant = 0,
+                        int drop = -1, bool burned = false, uint8_t junePose = 0) {
     Actor& a = allocActor(); a.think = AT_CORPSE; a.x = x; a.y = y; a.floor = f; a.srcType = ct; a.variant = variant;
     a.vx = kvx; a.vy = kvy; a.timer = 14;   // труп отлетает от смертельного удара и скользит ~14 кадров (трейс: 0.25-0.4 кл/кадр, затух.)
-    a.drop = drop; a.burned = burned;       // сожжён огнём → обугленный труп
-    a.frameT = 0; a.state = 0;              // frameT = тик анимации трупа (FH/Hydaca дёргаются); state = фаза $35 (простреленный кадр)
-    snd::playSfx(snd::enemyDeathSfx(ct));   // ЗВУК смерти — УНИКАЛЕН по типу врага (enemy_ai.asm)
+    a.drop = drop; a.burned = burned; a.juneCorpsePose = junePose; // сожжён огнём → обугленный труп
+    a.frameT = 0; a.state = 0;              // June corpse: CB=d2 1; after a hit CC=d2 2
+    snd::playSfx(juneEnemies() ? 0x2d : snd::enemyDeathSfx(ct)); // BZT все пять death-функций играют 0x2D
 }
 // Подбор оброненного оружия при шаге на труп: ищет труп под игроком с drop≥0, возвращает id (и снимает drop). cb добавляет в инвентарь.
 template <typename AddFn>
@@ -338,6 +355,8 @@ inline void corpsePickup(const Camera& cam, AddFn add) {
 // HP +0x12 (÷100 для играбельного масштаба): Sgt/FH/Revenant/dog 400→4, Imp 800→8, Hydaca 200→2,
 // FH-SF 600→6, боссы 3000/8000/6000 → 30/80/60. (Враги-celltype: 0x29-0x2B, 0x65-0x6B.)
 inline int enemyHp(uint8_t ct) {
+    // ⭐June [VERIFIED 92DC: HP актёра = деф+0x12 = 600, GrenMan 1200; шкала порта = /100 как ZT]
+    if (juneEnemies()) return (ct == 0x08) ? 12 : 6;
     switch (ct) {
         case 0x2B: return 8;    // Imp
         case 0x65: return 2;    // Hydaca
@@ -424,8 +443,8 @@ inline int actorStanceBits(const Actor& a, double px, double py) {
     if (a.think == AT_CORPSE) return 0x08;                 // ТРУП: только присед (death andi #$ff2f → остаётся 0x08)
     if (a.think == AT_MINE)   return 0x08;                 // ⭐МИНА (спавн 12c36: flags|=0x8): прострелить можно ТОЛЬКО из приседа
     if (a.think != AT_ENEMY)  return 0xc8;                 // прочее (граната/ракета flags 0xC8: любая стойка) — не фильтруем
-    if (a.srcType == 0x68)    return 0x48;                 // Pink Dog (objdef 0x5c): стоя+присед, НЕТ прыжка → перепрыгивается
-    if (a.srcType == 0x65) {                               // Hydaca: поза по Z (пол↔потолок), маски think 14d4c/14cf6/14ca6
+    if (!juneEnemies() && a.srcType == 0x68) return 0x48;   // Pink Dog (objdef 0x5c): стоя+присед, НЕТ прыжка → перепрыгивается
+    if (!juneEnemies() && a.srcType == 0x65) {              // Hydaca: поза по Z (пол↔потолок), маски think 14d4c/14cf6/14ca6
         if (std::fabs(a.vz) > 0.0001) return 0xc8;         // ПАДЕНИЕ (state2, 14ca6 ori #$C8) → любая стойка
         if (a.z < 0.25) return 0x48;                       // ПОЛ (14d56: andi ~0x80 | 0x40) → стоя+присед, НЕ прыжок
         if (a.z > 0.75) {                                  // ПОТОЛОК (14cf6: andi ~0x8 | 0x40) → стоя+прыжок, НЕ присед;
@@ -446,7 +465,7 @@ inline int coneTargetEnemy(const Level& lvl, int floor, double px, double py, do
     auto& A = actors();
     for (int i = 0; i < (int)A.size(); ++i) {
         const Actor& a = A[i];
-        bool liveEnemy = (a.think == AT_ENEMY && a.hp > 0);
+        bool liveEnemy = (a.think == AT_ENEMY && (juneEnemies() ? a.hp >= 0 : a.hp > 0));
         bool corpse    = (a.think == AT_CORPSE);           // ТРУП тоже цель конуса (поражаем из приседа) — ROM 167b0
         // ⭐ВЗРЫВЧАТКА тоже цель конуса (ROM 167b0 берёт ЛЮБОГО актёра с flags&маска): выстрел детонирует (receive 13ad2)
         bool explosive = (a.think == AT_MINE || a.think == AT_BULLET || a.think == AT_GRENADE);
@@ -498,7 +517,7 @@ inline int aimWallScale(const Level& lvl, int floor, double px, double py, doubl
     double x = px, y = py;
     for (int i = 0; i < 600; ++i) {                          // 31 кл / 0.06 ≈ 517 шагов (+запас), как traceMiss
         double nx = x + dirX * 0.06, ny = y + dirY * 0.06; int cx = (int)nx, cy = (int)ny;
-        if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return 0;          // край карты → без предела
+        if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) return 0;          // край карты → без предела
         if (cellBlockedAt(lvl.cellType(floor, cx, cy), nx - cx, ny - cy) &&
             !bulletSkyCellId(lvl, lvl.cellId(floor, cx, cy), high)) {                // sky-стены НЕ в прицел-буфере (ce2c)
             long dx = std::lround((nx - px) * 256.0), dy = std::lround((ny - py) * 256.0);
@@ -625,7 +644,7 @@ inline bool enemyLOS(const Level& lvl, int floor, double ex, double ey, double p
     for (double t = 0.2; t < d; t += 0.2) {
         double wx = ex + dx * t, wy = ey + dy * t;
         int cx = (int)wx, cy = (int)wy;
-        if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return false;
+        if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) return false;
         uint8_t ct = lvl.cellType(floor, cx, cy);
         // ДИАГОНАЛЬ (0x02-0x05) = ТОНКАЯ ГИПОТЕНУЗА для зрения (ROM enemy-LOS 0166e8: полуплоскость по субкоордам
         // 16794/1677e/1678a/16772) — обзор проходит сквозь ПУСТУЮ половину клетки. Раньше cellBlocks квадратил →
@@ -652,26 +671,35 @@ inline void spawnEnemyShot(double x, double y, int f, double dx, double dy, int 
 // на «чужой» клетке). false = ПРОВАЛ alloc (пул полон, ROM 13466) — вызывающий ОСТАВЛЯЕТ маркер (ретрай).
 inline bool spawnOneEnemy(const Level& lvl, int floor, int x, int y, uint8_t ctOv = 0) {
     uint8_t ct = ctOv ? ctOv : lvl.cellType(floor, x, y);
+    { int gs = enemyGfxSlot(ct); if (gs < 0 || !g_enemyAnim[gs].ok) return false; }  // билд без декод. спрайтов (June) — не спавним
     Actor* ap = allocActorPtr(); if (!ap) return false;
     Actor& a = *ap; a.think = AT_ENEMY; a.floor = floor;
     a.x = x + 0.5; a.y = y + 0.5; a.hp = enemyHp(ct); a.srcType = ct; a.tile = enemyTileForCt(ct);
     a.homeX = a.x; a.homeY = a.y;                                          // дом = точка спавна
     a.state = 0; a.timer = 0; a.fireCd = 20 + ((x * 7 + y * 13) % 40);
     // Sgt (0x29): таймер трансформации в FH-SF (ZT state6 0x1b51a — морф человека в инопланетянина по истечении времени).
-    a.xformT = (ct == 0x29) ? ticks(50 + ((x * 11 + y * 17) % 32)) : 0;    // ⭐ZT $41=0x32+rnd&0x1f=50-81 тик (~3.3-5.4с @15fps); ×enemyTimerScale (настройка)
-    a.variant = (ct == 0x2A) ? (uint8_t)((x * 5 + y * 3) & 1) : 0;         // только FH: 2 визуальные вариации (Hydaca драйвит variant по z)
-    if (ct == 0x65) { bool onCeil = ((x * 5 + y * 3) & 1); a.z = onCeil ? 1.0 : 0.0; a.variant = onCeil ? 1 : 0; }  // Hydaca: ПОЛ/ПОТОЛОК 50/50 (ZT init $34=rnd&1)
-    { int as = snd::enemyAppearSfx(ct); if (as >= 0) snd::playSfx(as); }  // ЗВУК ПОЯВЛЕНИЯ врага (подтверждён на слух в оригинале)
+    if (juneEnemies()) {
+        // BZT 92DC: $38=CD, $39=20. CD снимается первым enemy-think;
+        // двадцатка — начальное окно движения к позиции игрока, не пауза материализации.
+        a.state = 90; a.timer = ticks(20);
+    } else {
+        a.xformT = (ct == 0x29) ? ticks(50 + ((x * 11 + y * 17) % 32)) : 0;
+        a.variant = (ct == 0x2A) ? (uint8_t)((x * 5 + y * 3) & 1) : 0;
+        if (ct == 0x65) { bool onCeil = ((x * 5 + y * 3) & 1); a.z = onCeil ? 1.0 : 0.0; a.variant = onCeil ? 1 : 0; }
+    }
+    { int as = juneEnemies() ? 0x2c : snd::enemyAppearSfx(ct); if (as >= 0) snd::playSfx(as); } // BZT objdef+0x25=0x2C у всех
     return true;
 }
 // Спавн врага ЗАДАННОГО типа в точке (для консоли). ct — celltype врага (0x29..0x6b).
 inline void spawnEnemyByType(int floor, double x, double y, uint8_t ct) {
     Actor& a = allocActor(); a.think = AT_ENEMY; a.floor = floor;
     a.x = x; a.y = y; a.hp = enemyHp(ct); a.srcType = ct; a.tile = enemyTileForCt(ct);
-    a.homeX = x; a.homeY = y; a.state = 0; a.timer = 0; a.fireCd = 20;
-    a.xformT = (ct == 0x29) ? 300 : 0;
-    if (ct == 0x65) { bool onCeil = (((int)x * 5 + (int)y * 3) & 1); a.z = onCeil ? 1.0 : 0.0; a.variant = onCeil ? 1 : 0; }  // пол/потолок 50/50
-    { int as = snd::enemyAppearSfx(ct); if (as >= 0) snd::playSfx(as); }  // ЗВУК ПОЯВЛЕНИЯ (objdef+0x25)
+    a.homeX = x; a.homeY = y; a.state = juneEnemies() ? 90 : 0; a.timer = juneEnemies() ? ticks(20) : 0; a.fireCd = 20;
+    if (!juneEnemies()) {
+        a.xformT = (ct == 0x29) ? 300 : 0;
+        if (ct == 0x65) { bool onCeil = (((int)x * 5 + (int)y * 3) & 1); a.z = onCeil ? 1.0 : 0.0; a.variant = onCeil ? 1 : 0; }
+    }
+    { int as = juneEnemies() ? 0x2c : snd::enemyAppearSfx(ct); if (as >= 0) snd::playSfx(as); } // BZT objdef+0x25=0x2C у всех
 }
 // ПРОКСИ-СПАВН (ZT 0x15d18: скан 11×11 ±5 кл вокруг игрока — враги ПОЯВЛЯЮТСЯ когда подходишь, не все при загрузке!).
 // Маркеры этажа собираются в pending; updateEnemySpawns каждый кадр спавнит те, что в радиусе. Это убирает «враги
@@ -689,18 +717,18 @@ inline int pendingOnFloor(int floor) {
 }
 inline void collectEnemyMarkers(const Level& lvl, int floor) {        // ПЕРВЫЙ визит этажа: собрать маркеры (append, НЕ спавнить)
     auto& p = pendingSpawns();
-    for (int y = 0; y < Level::H; ++y)
-        for (int x = 0; x < Level::W; ++x)
+    for (int y = 0; y < lvl.H; ++y)
+        for (int x = 0; x < lvl.W; ++x)
             if (cellIcon(lvl.cellType(floor, x, y)) == 9) p.push_back({x, y, floor, lvl.cellType(floor, x, y)});
 }
 inline void clearFloorState() { pendingSpawns().clear(); }            // полный сброс (смена уровня/эпизода)
 // КАРТА-ОГОНЬ: клетки celltype 0x18 (Flame) → вечный AT_FIRE (хазард). Вызывать при загрузке/смене этажа.
 inline std::unordered_set<int>& fireExtinguished() { static std::unordered_set<int> s; return s; }  // потушенные клетки (floor*1024+y*32+x)
 inline void spawnMapFires(const Level& lvl, int floor) {
-    for (int y = 0; y < Level::H; ++y)
-        for (int x = 0; x < Level::W; ++x)
+    for (int y = 0; y < lvl.H; ++y)
+        for (int x = 0; x < lvl.W; ++x)
             if (lvl.cellType(floor, x, y) == 0x18) {
-                if (fireExtinguished().count(floor * 1024 + y * 32 + x)) continue;   // потушено игроком — не возрождать
+                if (fireExtinguished().count(cellKey(floor, x, y))) continue;   // потушено игроком — не возрождать
                 // ⭐СТАТИК-МИР, не пул (ROM: огонь 0x18 = грид-клетка с анимацией, актёром не является):
                 // вечные огни копятся со всех посещённых этажей и забивали пул (стирание врагов при переполнении)
                 bool dup = false;
@@ -725,7 +753,7 @@ inline int& episodeEndT() { static int t = 0; return t; }
 inline void updatePlayerStepOnFire(const Camera& cam) {
     PlayerState& p = player();
     int cx = (int)cam.px, cy = (int)cam.py;
-    int key = cam.floor * 1024 + cy * 32 + cx;
+    int key = cellKey(cam.floor, cx, cy);
     if (key == p.lastCellKey) return;                    // клетка не сменилась → step-on не триггерится (ZT e88e)
     p.lastCellKey = key;
     for (int pass = 0; pass < 2; ++pass)                 // карта-огни живут в СТАТИК-мире (грид-клетки ROM), пул — на всякий
@@ -752,6 +780,12 @@ inline int& pwProgressFloor() { static int f = 0; return f; }
 // ⭐ДАЛЬНОСТЬ ОБЗОРА/АКТИВАЦИИ по освещению (ROM -$714c, сеттеры 1d66/1d46): Bright=0x10=16 клеток,
 // No-ceiling=0xC=12, Dim/Haze/Black=5; ФОНАРЬ или НОЧНИК форсят 16 (1d5e/11286) — свет ВЫДАЁТ игрока:
 // в темноте враги активируются с 5 клеток, со включённым фонарём — с 16 («враги реагируют на фонарик»).
+// ⭐June 145BE: перехват = игрок + его скорость; прошлотиковая поза игрока (обновляет updateActors)
+inline double& juneppx() { static double v = 0; return v; }
+inline double& juneppy() { static double v = 0; return v; }
+// RedMan (BZT 15EF8) крадёт четверть заряда случайного занятого слота. Inventory объявлен
+// в weapons.hpp, поэтому actors не знает его тип и вызывает установленный main'ом узкий callback.
+inline std::function<bool()>& juneDrainInventoryFn() { static std::function<bool()> fn; return fn; }
 inline double lightRange(int env) {
     if (nvActive() || flActive()) return 16.0;
     if (env == 0) return 16.0;                       // Bright
@@ -781,22 +815,30 @@ inline bool enemyOpensDoors(uint8_t ct) {
     return ct == 0x29 || ct == 0x67 || ct == 0x69 || ct == 0x6A || ct == 0x6B;
 }
 inline void openDoorsAtEnemies(const Level& lvl, int floor) {
+    // ⭐ROM b3ae-b3d4: живой актёр с бит4 в дверной клетке = «кто-то в клетке» → b35c держит/открывает
+    // дверь (+0x20/тик). Фазу двигает ЕДИНАЯ точка rcUpdateDoors (иначе двойной счёт со встречным
+    // закрытием); тут — только пометка удержания + звук начала открытия (AI-сайты 18d32/191ce: 0x67 d740).
     auto& m = doorMap();
     for (auto& a : actors()) {
-        if (!a.active || a.think != AT_ENEMY || a.floor != floor) continue;
+        if (!a.active || a.think != AT_ENEMY || a.floor != floor) continue;   // AT_CORPSE НЕ держит (смерть чистит бит4, andi #$ff2f)
         int cx = (int)a.x, cy = (int)a.y;
-        if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) continue;
+        if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) continue;
         if (!cellIsDoor(lvl.cellType(floor, cx, cy))) continue;
         int k = doorKey(floor, cx, cy);
+        doorHoldSet().insert(k);                         // пометка «актёр в клетке» (живёт 1 тик, чистит rcUpdateDoors)
         double prev = (m.count(k) ? m[k] : 0.0);
-        double o = prev + 0.20; if (o > 1) o = 1; m[k] = o;
-        if (prev <= 0.0) snd::playSfx(0x67);   // ⭐ЗВУК ДВЕРИ 0x67 при НАЧАЛЕ открытия врагом (ZT b1c4-путь; было беззвучно)
+        if (prev <= 0.0) {
+            // ⭐враг СОЗДАЁТ запись сам (ROM b1c4: стартовая фаза 0x20) — иначе prev вечно 0 и звук
+            // 0x67 играл КАЖДЫЙ тик, пока враг стоит в двери («зацикленный звук двери» — юзер).
+            m[k] = 0.25;
+            snd::playSfx(0x67);   // ⭐ЗВУК ДВЕРИ 0x67 один раз при НАЧАЛЕ открытия врагом (ZT AI-сайты, d740 = только этаж игрока)
+        }
     }
 }
 // Спавн ВСЕХ врагов сразу (для дампа/скриншота — не геймплей).
 inline void spawnEnemiesFromLevel(const Level& lvl, int floor) {
-    for (int y = 0; y < Level::H; ++y)
-        for (int x = 0; x < Level::W; ++x)
+    for (int y = 0; y < lvl.H; ++y)
+        for (int x = 0; x < lvl.W; ++x)
             if (cellIcon(lvl.cellType(floor, x, y)) == 9) spawnOneEnemy(lvl, floor, x, y);
 }
 
@@ -812,8 +854,8 @@ inline std::vector<AlarmCam>& alarmCams() { static std::vector<AlarmCam> v; retu
 inline void collectAlarmCams(const Level& lvl, int floor) {           // ПЕРВЫЙ визит этажа: собрать камеры 0x26 (append)
     auto& v = alarmCams();
     for (auto& c : v) if (c.floor == floor) return;                   // этаж уже собран (состояние камер персистентно)
-    for (int y = 0; y < Level::H; ++y)
-        for (int x = 0; x < Level::W; ++x)
+    for (int y = 0; y < lvl.H; ++y)
+        for (int x = 0; x < lvl.W; ++x)
             if (lvl.cellType(floor, x, y) == 0x26) v.push_back({x, y, floor, 0, 0, false});
 }
 // ЖИВАЯ камера в клетке (для хитскана/взрыва) → индекс или −1.
@@ -839,7 +881,7 @@ inline void triggerAlarm(const Level& lvl, int floor, int cx, int cy, double px,
     for (int dy = -5; dy <= 5; ++dy)                                  // 15c74: скан 11×11 (±5)
         for (int dx = -5; dx <= 5; ++dx) {
             int x = cx + dx, y = cy + dy;
-            if (x < 0 || y < 0 || x >= Level::W || y >= Level::H) continue;
+            if (x < 0 || y < 0 || x >= lvl.W || y >= lvl.H) continue;
             uint8_t ct = lvl.cellType(floor, x, y);
             if (ct == 0x06 || ct == 0x07 || ct == 0x83 || ct == 0x84) // двери 06/07 (b130/b168) + стены 83/84
                 requestDestruct(floor, x, y);                         // → 0x2D/0x2E → пусто НАВСЕГДА (applyDestruct)
@@ -914,7 +956,9 @@ inline void pushCameraBillboards(int floor) {
 // v=unit(от источника)·(урон>>3), вычитает HP (может уйти В МИНУС). СМЕРТЬ НЕ мгновенная — труп появляется в think
 // ТОЛЬКО когда нокбэк-скорость ЗАТУХАЕТ ниже 0x0a И HP<0 (sub_01887a $188b2: tst $36; bmi death). Поэтому ПОКА
 // СТРЕЛЯЕШЬ — каждый выстрел освежает скорость → враг ДЕРЖИТСЯ в стаггере; перестал → скорость села → труп.
-inline void hitEnemy(Actor& a, int dmg, double fromX, double fromY, int romDmg = -1) {
+inline void hitEnemy(Actor& a, int dmg, double fromX, double fromY, int romDmg = -1, int weaponId = -1) {
+    // BZT June hHit: states 2/5/6 не принимают повторный hit до завершения реакции.
+    if (juneEnemies() && a.think == AT_ENEMY && a.juneHitState != 0) return;
     if (romDmg < 0) romDmg = dmg * 100;                                   // реконструкция ROM-урона (порт-урон = ROM/100)
     a.hp -= dmg;
     double dx = a.x - fromX, dy = a.y - fromY, d = std::hypot(dx, dy);    // отлёт ОТ источника
@@ -932,13 +976,13 @@ inline void hitEnemy(Actor& a, int dmg, double fromX, double fromY, int romDmg =
         int n = bloodParticleCount(0x400);
         spawnBlood(a.x, a.y, a.floor, dx, dy, n); spawnBlood(a.x, a.y, a.floor, dx, dy, n);
     }
-    if (a.hp <= 0 && a.think == AT_ENEMY && a.srcType == 0x6A && !a.revived) {  // BOSS3: первая «смерть» → ПРИТВОРЯЕТСЯ МЁРТВЫМ
+    if (!juneEnemies() && a.hp <= 0 && a.think == AT_ENEMY && a.srcType == 0x6A && !a.revived) {  // BOSS3: первая «смерть» → ПРИТВОРЯЕТСЯ МЁРТВЫМ
         a.state = 99; a.timer = ticks(25); a.vx = a.vy = 0; a.hitT = 0; a.fireAnimT = 0;  // ZT 0x1a3aa: state6, лежит 25 тиков → воскресает ×enemyTimerScale
         return;
     }
     // ⭐HYDACA (ZT hHit 0x1575c): попадание СБИВАЕТ в state2 (z-vel=0 → ПАДЕНИЕ гравитацией), НЕ обычный xy-стаггер.
     // На ПОЛУ ($24=−24, z≈0) → z-vel=+8 = ПОДПРЫГ вверх. Иначе (потолок/висит) → падает вниз. Горизонт гасится (ZT asr).
-    if (a.think == AT_ENEMY && a.srcType == 0x65) {
+    if (!juneEnemies() && a.think == AT_ENEMY && a.srcType == 0x65) {
         a.state = 1;                                              // активна, БАЛЛИСТИКА (не climb=state2)
         if (a.z <= 0.05) a.vz = 8.0 / 48.0;                       // на ПОЛУ → ПОДПРЫГ вверх (ZT 0x1575c: z-vel=+8; шкала 48 units)
         else if (a.vz >= 0.0) a.vz = -0.0001;                     // на ПОТОЛКЕ/висит → начать ПАДАТЬ из покоя (ZT z-vel=0, гравитация разгонит)
@@ -947,11 +991,17 @@ inline void hitEnemy(Actor& a, int dmg, double fromX, double fromY, int romDmg =
     }
     // REVENANT (ZT hHit→стаггер state A→recover 1abd8→re-engage 1abe0): подстреленный ВСТУПАЕТ В БОЙ (даже издалека),
     // НО пак-алерт (1ab6c) НЕ зовёт → соседей-патрульных не будит (можно снять одного снайпингом, группа спит).
-    if (a.think == AT_ENEMY && a.srcType == 0x66 && a.state < 8) a.state = 1;  // → revEngage в combat-блоке
+    if (!juneEnemies() && a.think == AT_ENEMY && a.srcType == 0x66 && a.state < 8) a.state = 1;  // → revEngage в combat-блоке
     // НОКБЭК ZT: v = (вектор от источника)·(урон>>3). Порт-урон = ROM/100 → v ≈ dmg·0.049 кл/кадр; затух. ÷2/кадр.
     double k = dmg * 0.049; if (k > 0.55) k = 0.55;
     if (d > 0.01) { a.vx = dx / d * k; a.vy = dy / d * k; } else { a.vx = a.vy = 0; }
     if (a.hitT <= 0) a.hitT = 1;                                          // ВХОД в стаггер (выход — по затуханию v, не таймеру)
+    if (juneEnemies() && a.think == AT_ENEMY) {
+        a.fireAnimT = 0;
+        if (weaponId == 13) { a.juneHitState = 5; a.juneHitTimer = ticks(8); }      // weapon D: stagger A
+        else if (weaponId == 11) { a.juneHitState = 6; a.juneHitTimer = ticks(6); } // weapon B: stagger B
+        else { a.juneHitState = 2; a.juneHitTimer = 0; }                            // обычный knockback/hit pose
+    }
     // (НЕТ импакт-искры по врагу: искра 0x12ad4 — только промах в СТЕНУ; по врагу = стаггер-аним/кровь)
 }
 
@@ -969,6 +1019,17 @@ inline const uint8_t WALK_PAT[8][32] = {
     {1,1,1,1,1,1,2,2,2,2,2,3,3,3,3,3,4,4,4,4,4,4,5,5,5,5,5,6,6,6,6,6},
     {1,1,1,1,1,2,2,2,2,3,3,3,3,3,4,4,4,4,5,5,5,5,5,6,6,6,6,7,7,7,7,7},
     {1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7,8,8,8,8}};
+// BZT June использует тот же 8x32 паттерн по адресу 0x19E9E. Храним отдельно,
+// чтобы не связывать June-проверку с совпадением данных разных ROM.
+inline const uint8_t JUNE_WALK_PAT[8][32] = {
+    {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1},
+    {1,1,1,1,2,2,2,2,1,1,1,1,2,2,2,2,1,1,1,1,2,2,2,2,1,1,1,1,2,2,2,2},
+    {1,1,1,1,2,2,2,3,3,3,3,1,1,1,2,2,2,2,3,3,3,1,1,1,1,2,2,2,3,3,3,3},
+    {1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4},
+    {1,1,1,2,2,2,3,3,3,4,4,4,5,5,5,5,1,1,1,2,2,2,3,3,3,3,4,4,4,5,5,5},
+    {1,1,1,1,1,1,2,2,2,2,2,3,3,3,3,3,4,4,4,4,4,4,5,5,5,5,5,6,6,6,6,6},
+    {1,1,1,1,1,2,2,2,2,3,3,3,3,3,4,4,4,4,5,5,5,5,5,6,6,6,6,7,7,7,7,7},
+    {1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7,8,8,8,8}};
 // Суб-кадр ходьбы по ROM-модели: nf = ВСЕ суб-кадры (0=стоячий + 1..N ходьба). Вызывать 1×/тик (аккумулирует).
 inline uint8_t walkFrame(Actor& a, int nf) {
     if (nf <= 1) return 0;
@@ -976,7 +1037,8 @@ inline uint8_t walkFrame(Actor& a, int nf) {
     if (spd < 4) return 0;                                      // стоит → стоячая поза (ROM 1bb82 bcs)
     a.walkAcc += spd;
     int n = nf - 1; if (n > 8) n = 8;                           // ходячих суб-кадров (LUT покрывает 1..8)
-    return WALK_PAT[n - 1][(a.walkAcc >> 3) & 31];              // значения 1..n
+    const uint8_t (*pat)[32] = juneEnemies() ? JUNE_WALK_PAT : WALK_PAT;
+    return pat[n - 1][(a.walkAcc >> 3) & 31];                   // значения 1..n
 }
 
 // ВЫСТРЕЛ В ТРУП (ZT corpse-hHit 0x18832 и клоны): отлёт ОТ игрока по ОРУЖИЮ + $35++ → у трупов с кадром-по-$35
@@ -1005,7 +1067,7 @@ inline bool damageRay(const Level& lvl, int floor, double px, double py, double 
                 double dd = gameDist(a.x - px, a.y - py);              // дистанция (октаг. d7c0) → дист-урон оружия
                 int raw = playerWeaponRawDamage(weaponId, dd);         // ROM-урон (для гейта крови ≥0x338)
                 int dmg = raw > 0 ? (raw / 100 < 1 ? 1 : raw / 100) : 0;
-                hitEnemy(a, dmg, px, py, raw);                         // урон + отлёт + кровь(по raw) + труп/искра
+                hitEnemy(a, dmg, px, py, raw, weaponId);               // урон + отлёт + кровь(по raw) + труп/искра
                 return true;
             }
         }
@@ -1018,7 +1080,7 @@ inline bool damageRay(const Level& lvl, int floor, double px, double py, double 
         }
         double nx = x + dx * 0.06, ny = y + dy * 0.06;
         int cx = (int)nx, cy = (int)ny;
-        if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) break;
+        if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) break;
         int ci = liveAlarmCamAt(floor, cx, cy);                                   // КАМЕРА-ТРЕВОГА в клетке луча → СБИТЬ (1 хит), тревога не сработает
         if (ci >= 0) { destroyAlarmCam(ci); hx = cx + 0.5; hy = cy + 0.5; return true; }
         if (cellBlockedAt(lvl.cellType(floor, cx, cy), nx - cx, ny - cy)) {        // ДИАГОНАЛЬ учитывается (полуплоскость)
@@ -1040,7 +1102,7 @@ inline bool traceCameraHit(const Level& lvl, int floor, double px, double py, do
     double x = px, y = py;
     for (int i = 0; i < 600; ++i) {                              // до 1-й стены (как traceMiss, ~31 кл)
         double nx = x + dx * 0.06, ny = y + dy * 0.06; int cx = (int)nx, cy = (int)ny;
-        if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return false;
+        if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) return false;
         int ci = liveAlarmCamAt(floor, cx, cy);                  // ЖИВАЯ камера в клетке луча → сбить
         if (ci >= 0) { destroyAlarmCam(ci); return true; }
         if (cellBlockedAt(lvl.cellType(floor, cx, cy), nx - cx, ny - cy)) return false;  // стена раньше камеры → мимо
@@ -1062,21 +1124,21 @@ inline int damageEnemiesAt(int floor, double x, double y, double r, int dmg) {
 // Взрыв гранаты/ракеты/мины: спавн объекта-взрыва. ⭐ROM-ТАЙМИНГ (13dcc→14196): урон-рассылка (blast 16294)
 // происходит НЕ сразу, а на 2-м ТИКЕ жизни взрыва ($1e==2) → цепная детонация распространяется с задержкой
 // +2 тика на звено (как в игре). state=1 = «blast ещё не сработал» (AT_EXPLOSION think зовёт blastAt).
-inline void explodeAt(const Level& lvl, double x, double y, int f, const Camera& cam, double z = 0.5) {  // z = высота очага (0 пол / 0.5 глаз)
+inline void explodeAt(const Level& lvl, double x, double y, int f, const Camera& cam, double z = 0.5, int weaponId = -1) {  // z = высота очага (0 пол / 0.5 глаз)
     (void)lvl; (void)cam;                                        // урон — отложенно в blastAt (тик 2)
     Actor& e = spawnExplosionA(x, y, f, z);
-    e.state = 1;                                                 // pending blast
+    e.state = 1; e.weaponId = weaponId;                          // pending blast
     snd::ev(snd::SFX_EXPLOSION);                                 // звук взрыва (13dcc: 0x8A сразу при спавне)
 }
 // ДЕТОНАЦИЯ АКТЁРА-ВЗРЫВЧАТКИ (ROM receive 13ad2 → 13dcc: актёр «становится взрывом»): снять + спавн pending-взрыва.
 inline void detonateActor(const Level& lvl, Actor& a, const Camera& cam) {
     double z = (a.think == AT_MINE) ? 0.0 : a.z;
     a.active = false;
-    explodeAt(lvl, a.x, a.y, a.floor, cam, z);
+    explodeAt(lvl, a.x, a.y, a.floor, cam, z, a.weaponId);
 }
 // BLAST-рассылка (ZT 16294, зовётся think'ом взрыва на 2-м тике): радиус 4 кл, урон = ДИСТАНЦИЯ-FALLOFF
 // (0x400−dist врагу, 16−dist·4 игроку) → у центра убивает, на 4 кл — 0. Нокбэк = через hitEnemy (стаггер-отлёт).
-inline void blastAt(const Level& lvl, double x, double y, int f, const Camera& cam) {
+inline void blastAt(const Level& lvl, double x, double y, int f, const Camera& cam, int weaponId = -1) {
     // ЗT 9e1e: взрыв «ПРОЯВЛЯЕТ» латентных врагов у очага (спавн pending-маркеров в радиусе, БЕЗ LOS-гейта) —
     // чтобы дремлющий враг, ещё не видевший игрока и потому не инстанцированный, попал под урон ниже.
     { auto& p = pendingSpawns();
@@ -1091,7 +1153,7 @@ inline void blastAt(const Level& lvl, double x, double y, int f, const Camera& c
         double dd = gameDist(a.x - x, a.y - y);                 // октаг. дистанция от центра взрыва
         // LOS-гейт (ZT 166e8): взрыв НЕ бьёт сквозь стены. Фильтра по AI-состоянию НЕТ → дремлющий враг тоже гибнет.
         if (dd < 4.0 && enemyLOS(lvl, f, x, y, a.x, a.y)) {
-            int raw = (int)(1024.0 - dd * 256.0); int dmg = raw / 100; if (dmg < 1) dmg = 1; hitEnemy(a, dmg, x, y, raw);
+            int raw = (int)(1024.0 - dd * 256.0); int dmg = raw / 100; if (dmg < 1) dmg = 1; hitEnemy(a, dmg, x, y, raw, weaponId);
         }
         // ⚠ НЕТ wake-агро на взрыв: в ZT (16294) звукового агро/алерта не существует (проверено дизасмом). Враги
         //   агрятся только по дистанции+LOS штатным AI; «проявление» латентных = грид-reveal выше, не бег на шум.

@@ -20,6 +20,22 @@ static const int ENEMY_ANIM_IDX[10][4] = {   // {walk, fire, hit, death(=corpse)
     {0, 2,  5,  9}, // Boss3: fire=a2 (контакт-УДАР «руки вверх», ZT state2/3 draw 1a786; a1=дальний state1) hit=a5 corpse=a9
     {0, 5,  1,  4}  // Boss2: fire=a5 hit=a1 corpse=a4(64×32; corpse-draw 18f50 — было a2=death-стаггер)
 };
+// ⭐JUNE-ИНДЕКСЫ АНИМАЦИЙ [VERIFIED 2026-07-28, draw-селекторы 140D6/14AC6/15254/15AA8/1648C → 19CF8]:
+// {walk, fire, hit-pose state2, stagger A state5, stagger B state6, death}. Схема June: walk=0 (кадры по LUT@19E9E от walkAcc),
+// fire = пирамида кадров 1-2-3-2-1 (тики $39 9..1), стаггер A (оружие 0xD, 4 кадра) / B (0xB, 5 кадров),
+// death: CB→f1, CC→f2; затем static-corpse a3/a4/a2. Труп наследует позу стаггера (C8→A/посл., C9→B/посл.). Слоты: 0 RedRobo
+// (stagB=6), 1 Purple (fire=2, hit=7→stagA=6, death=5, stagB=3), 2-4 Man/RedMan/GrenMan (hit=6→stagA=4=stagB, death=3).
+static const int JUNE_ANIM_IDX[5][6] = {
+    {0, 1, 2, 5, 6, 4},   // RedRobo
+    {0, 2, 7, 6, 3, 5},   // Purple
+    {0, 1, 6, 4, 4, 3},   // Man
+    {0, 1, 6, 4, 4, 3},   // RedMan
+    {0, 1, 6, 4, 4, 3},   // GrenMan
+};
+// Финальная неподвижная поза обычного трупа после двух кадров перехода выше.
+// Селекторы corpse-draw: 1424C / 14C3C / 153CC / 15B20 / 16604.
+static const int JUNE_CORPSE_IDX[5] = {3, 4, 2, 2, 2};
+
 // ⭐2-я БОЕВАЯ поза по слоту (−1 = нет; 2026-07-15). ROM даёт врагу ДВЕ боевые анимации (fire=основная в ENEMY_ANIM_IDX):
 //   Sgt a4=бросок гранаты (1b600 state5), Boss1 a2=выстрел-вспышка (19402 $35∈4/5/6), Dog a2=прыжок-укус (198c4 $35<6||dist<1кл),
 //   FH-SF a11=замах гранаты (19f5c state5), Boss3 a4=дальняя атака (01a7d0 state1; fire=a2 ближний), Boss2 a6=удар (018f44; fire=a5 aim).
@@ -35,6 +51,10 @@ static const int ENEMY_CLIMB_ANIM[10] = { -1, -1, -1, 1, -1, -1, -1, -1, -1, -1 
 static const unsigned ENEMY_ALT_GFX[10] = { 0, 0x1C258A, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 void SpriteClut::load(const Rom& rom, size_t base) {
+    if (base == 0) {                                   // билд без вскрытого CLUT (June) → identity (без шейда)
+        for (int b = 0; b < 12; ++b) for (int i = 0; i < 256; ++i) band[b][i] = (uint8_t)i;
+        ok = true; return;
+    }
     if (base + 12 * 0x100 > rom.size()) return;
     for (int b = 0; b < 12; ++b)
         for (int i = 0; i < 256; ++i) band[b][i] = rom.u8(base + (size_t)b * 0x100 + i);
@@ -42,8 +62,11 @@ void SpriteClut::load(const Rom& rom, size_t base) {
 }
 
 // Декод одного кадра: tileBase=(a1+2)+u16(a1+2); animCount=u16(a1); animBlock=(a1+2)+u16(a1+4+anim*2);
-// dirCount=u16(animBlock); dirBlock=animBlock+u16(animBlock+2+dir*2); frameCount=u16(dirBlock)(0→1);
+// dirCount=u16(animBlock); dirBlock=animBlock+u16(animBlock+2+dir*2).
+// In BZT the first word in dirBlock is the maximum frame index, not a frame count:
+// renderer 19E4C accepts d2 <= value, so records are 0..N (N+1 total).
 // frame=dirBlock+2+f*0x26: +4 W(тайлов) +5 H, +0x06 attr[W*H stride4 bit0=hflip], +0x16 tileIdx[stride4].
+static bool g_bztSpriteFmt = false;   // формат кадра BZT (см. decodeEnemySprites)
 static EnemySprite decodeEnemySprite(const Rom& rom, size_t a1, const Palette& pal, int anim, int dir, int frame) {
     EnemySprite s;
     if (!a1 || a1 + 6 >= rom.size()) return s;
@@ -55,9 +78,12 @@ static EnemySprite decodeEnemySprite(const Rom& rom, size_t a1, const Palette& p
     int dirCount = rom.u16(animBlock); if (dirCount < 1 || dirCount > 32) return s;
     if (dir >= dirCount) dir = 0;
     size_t dirBlock = animBlock + rom.u16(animBlock + 2 + (size_t)dir * 2);
-    int frameCount = rom.u16(dirBlock); if (frameCount == 0) frameCount = 1; if (frameCount > 64) return s;
+    int frameCount = rom.u16(dirBlock);
+    frameCount = g_bztSpriteFmt ? frameCount + 1 : (frameCount == 0 ? 1 : frameCount);
+    if (frameCount > 64) return s;
     if (frame >= frameCount) frame = 0;
-    size_t fr = dirBlock + 2 + (size_t)frame * 0x26;
+    const size_t FRSZ = g_bztSpriteFmt ? 0x36 : 0x26;      // BZT: кадр 0x36 (тайлы словами)
+    size_t fr = dirBlock + 2 + (size_t)frame * FRSZ;
     int W = rom.u8(fr + 4), H = rom.u8(fr + 5);
     if (W < 1 || W > 8 || H < 1 || H > 8) return s;
     s.drawW = rom.u8(fr + 2); s.drawH = rom.u8(fr + 3);    // on-screen scale: W=drawW·scale>>5, H=drawH·scale>>4
@@ -66,7 +92,8 @@ static EnemySprite decodeEnemySprite(const Rom& rom, size_t a1, const Palette& p
     s.idx.assign((size_t)s.w * s.h, 0);            // сырые пал.индексы (для CLUT-шейда при рендере)
     for (int r = 0; r < H; ++r)
         for (int c = 0; c < W; ++c) {
-            uint8_t idx  = rom.u8(fr + 0x16 + (size_t)r * 4 + c);
+            uint16_t idx = g_bztSpriteFmt ? rom.u16(fr + 0x16 + (size_t)r * 8 + (size_t)c * 2)
+                                          : rom.u8(fr + 0x16 + (size_t)r * 4 + c);
             bool   flip  = rom.u8(fr + 0x06 + (size_t)r * 4 + c) & 1;
             size_t ta = tileBase + (size_t)idx * 512;
             if (ta + 512 > rom.size()) continue;
@@ -83,7 +110,9 @@ static EnemySprite decodeEnemySprite(const Rom& rom, size_t a1, const Palette& p
     s.ok = true; return s;
 }
 
-void decodeEnemySprites(const Rom& rom, const Palette& pal, const size_t* gfxOverride, size_t altFH, size_t clutBase) {
+void decodeEnemySprites(const Rom& rom, const Palette& pal, const size_t* gfxOverride, size_t altFH, size_t clutBase,
+                        bool bztFmt) {
+    g_bztSpriteFmt = bztFmt;
     g_spriteClut().load(rom, clutBase);             // CLUT спрайтов (шейд при рендере)
     static const size_t GFX_ZT[10] = { 0x1B7B38, 0x16EC58, 0x1A7828, 0x1ACC72, 0x18D078,
                                        0x183B94, 0x1784F2, 0x17BA80, 0x193F00, 0x19D50C };
@@ -95,14 +124,20 @@ void decodeEnemySprites(const Rom& rom, const Palette& pal, const size_t* gfxOve
         int dirc = rom.u16(animBlock); if (dirc < 1) dirc = 1;
         if (dir >= dirc) return;
         size_t dirBlock = animBlock + rom.u16(animBlock + 2 + (size_t)dir * 2);
-        int fc = rom.u16(dirBlock); if (fc == 0) fc = 1; if (fc > 12) fc = 12;
+        int fc = rom.u16(dirBlock);
+        fc = g_bztSpriteFmt ? fc + 1 : (fc == 0 ? 1 : fc);
+        if (fc > 13) fc = 13;
         for (int f = 0; f < fc; ++f) { EnemySprite s = decodeEnemySprite(rom, a1, pal, anim, dir, f);
             if (s.ok) out.push_back(std::move(s)); }
     };
     for (int i = 0; i < 10; ++i) {
         EnemyAnimSet& A = g_enemyAnim[i]; A = EnemyAnimSet{};
         size_t a1 = GFX[i];
-        int wA = ENEMY_ANIM_IDX[i][0], fA = ENEMY_ANIM_IDX[i][1], hA = ENEMY_ANIM_IDX[i][2], dA = ENEMY_ANIM_IDX[i][3];
+        const bool juneIdx = g_bztSpriteFmt && i < 5;    // ⭐June: свои anim-индексы (слоты 0-4), ZT-спецблоки не декодим
+        int wA = juneIdx ? JUNE_ANIM_IDX[i][0] : ENEMY_ANIM_IDX[i][0],
+            fA = juneIdx ? JUNE_ANIM_IDX[i][1] : ENEMY_ANIM_IDX[i][1],
+            hA = juneIdx ? JUNE_ANIM_IDX[i][2] : ENEMY_ANIM_IDX[i][2],
+            dA = juneIdx ? JUNE_ANIM_IDX[i][5] : ENEMY_ANIM_IDX[i][3];
         // ХОДЬБА = anim wA по ВСЕМ направлениям (повороты). dir0=фронт.
         size_t animBlock = (a1 + 2) + rom.u16(a1 + 4 + (size_t)wA * 2);
         int dirs = rom.u16(animBlock); if (dirs < 1) dirs = 1; if (dirs > 6) dirs = 6;
@@ -121,33 +156,39 @@ void decodeEnemySprites(const Rom& rom, const Palette& pal, const size_t* gfxOve
         };
         decDirs(fA, A.fireD, A.fireDirs);
         decDirs(hA, A.hitD, A.hitDirs);
+        if (juneIdx) {
+            int sa = JUNE_ANIM_IDX[i][3], sb = JUNE_ANIM_IDX[i][4];
+            decAnim(a1, sa, 0, A.juneStagA); decDirs(sa, A.juneStagAD, A.juneStagADirs);
+            decAnim(a1, sb, 0, A.juneStagB); decDirs(sb, A.juneStagBD, A.juneStagBDirs);
+            decAnim(a1, JUNE_CORPSE_IDX[i], 0, A.juneCorpse);
+        }
         decAnim(a1, dA, 0, A.death);                                   // смерть
-        if (ENEMY_ANIM_IDX2[i] >= 0) decAnim(a1, ENEMY_ANIM_IDX2[i], 0, A.fire2);   // 2-я боевая поза (прыжок/выстрел/дальний/удар/бросок)
+        if (!g_bztSpriteFmt && ENEMY_ANIM_IDX2[i] >= 0) decAnim(a1, ENEMY_ANIM_IDX2[i], 0, A.fire2);   // 2-я боевая поза (ZT)
         // 2-я вариация ходьбы (FH anim9): per-actor выбор по variant.
-        int vA = ENEMY_VARIANT_WALK[i];
+        int vA = g_bztSpriteFmt ? -1 : ENEMY_VARIANT_WALK[i];
         if (vA >= 0 && vA < rom.u16(a1)) {
             size_t vBlock = (a1 + 2) + rom.u16(a1 + 4 + (size_t)vA * 2);
             int vdirs = rom.u16(vBlock); if (vdirs < 1) vdirs = 1; if (vdirs > 6) vdirs = 6;
             for (int d = 0; d < vdirs; ++d) decAnim(a1, vA, d, A.walkB[d]);
             if (!A.walkB[0].empty()) { A.walkBDirs = vdirs; A.hasVariant = true; }
         }
-        decAnim(a1, ENEMY_CLIMB_ANIM[i], 0, A.climb);                  // Hydaca: вертикальный спрайт лазанья
+        if (!g_bztSpriteFmt) decAnim(a1, ENEMY_CLIMB_ANIM[i], 0, A.climb);   // Hydaca (ZT): вертикальный спрайт лазанья
         // DIRECTIONAL climb (Hydaca): 6 вертик. поз лазанья по ракурсу — ZT climb states 3-A → a1/a2/a3/a4/a6/a7.
-        if (i == 3) {                                                  // только Hydaca
+        if (!g_bztSpriteFmt && i == 3) {                                                  // только Hydaca
             static const int CLIMB6[6] = { 1, 2, 3, 4, 6, 7 };
             for (int d = 0; d < 6; ++d) decAnim(a1, CLIMB6[d], 0, A.climbDir[d]);
             if (!A.climbDir[0].empty()) A.climbDirs = 6;
             decAnim(a1, 8,  0, A.fallUp);                               // a8  = падение вверх/срыв (ZT draw state2 $2e>0)
             decAnim(a1, 10, 0, A.fallDead);                             // a10 = падение мёртвой (ZT draw state2 HP<0)
         }
-        if (i == 0) decAnim(a1, 6, 0, A.morph);                         // Sgt: a6 = МОРФ (ZT 1b628, 5 ступеней по $35)
-        if (i == 4) {                                                   // Revenant: СМЕРТЕЛЬНЫЙ стаггер = падение (ZT draw 1adfe, HP<0)
+        if (!g_bztSpriteFmt && i == 0) decAnim(a1, 6, 0, A.morph);      // Sgt (ZT): a6 = МОРФ (в June морфа нет)
+        if (!g_bztSpriteFmt && i == 4) {                                                   // Revenant: СМЕРТЕЛЬНЫЙ стаггер = падение (ZT draw 1adfe, HP<0)
             decAnim(a1, 8, 0, A.revFall[0]);                            //   $35 10..9 → a8 (подбит)
             decAnim(a1, 4, 0, A.revFall[1]);                            //   $35 8..7  → a4
             decAnim(a1, 6, 0, A.revFall[2]);                            //   $35 6..5  → a6
             decAnim(a1, 5, 0, A.revFall[3]);                            //   $35 4..0  → a5 (лёг; после — звук 0x27 + кадр 7)
         }
-        if (i == 8) {                                                   // Boss3: притворство мёртвым (ZT 1a752/1a7dc)
+        if (!g_bztSpriteFmt && i == 8) {                                // Boss3 (ZT): притворство мёртвым (1a752/1a7dc)
             decAnim(a1, 10, 0, A.pretendLie);                           // a10 = лежит смирно ($35<5)
             decAnim(a1, 7,  0, A.pretendJerkA);                         // a7  = дёрг (15/16)
             decAnim(a1, 8,  0, A.pretendJerkB);                         // a8  = дёрг-альт (1/16)

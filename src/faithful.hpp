@@ -232,7 +232,14 @@ inline void faDrawSeg(uint32_t* nat, int NW, int NH, double* zc,
         if (D0 < 1) { zc[ix] = iv; continue; }
         // БАНД CLUT: ROM грузит -$7176 (0x3392) фиксированно, БЕЗ дистанц.смещения (grep: 2 CLUT-скейлера,
         // оба band 0). faWallBand0()=стены всегда band 0 (как ROM, меньше дизера вдаль). OFF=дистанц.банды (было).
-        int band = doShade ? (faWallBand0() ? 0 : bandForHeight(D0)) : 0;
+        bool shadeCol = doShade;
+        int band = 0;
+        if (doShade) {
+            if (faJuneBands()) { int jb = juneBandForHeight(D0); if (jb < 0) shadeCol = false; else band = jb; }
+            else band = faWallBand0() ? 0 : bandForHeight(D0);
+        }
+        // ⭐ФОНАРЬ [cf36/d138]: конус 16 колонн вокруг центра → таблица скейлеров 0x4436 (без CLUT) = затенение ВЫКЛ.
+        if (flActive() && ix >= NW / 2 - NW / 16 && ix < NW / 2 + NW / 16) shadeCol = false;
         // CLUT-ДИЗЕР (верт.полосы) — ТОЛЬКО дальние стены (D0 ≤ faWallDitherD0, дефолт 0x28=40). БЛИЗКИЕ (D0 больше)
         // = СЫРАЯ (диагональ, без дизера, бит-точно). Порог откалиброван по MAME (свип к стене: оригинал сырой до
         // D0≈46, дизер от D0≈39), НЕ 0x50 (то — ce74-скейлер, не переключатель дизера). См. tuning.hpp.
@@ -277,13 +284,14 @@ inline void faDrawSeg(uint32_t* nat, int NW, int NH, double* zc,
                    : (int)(D0 * cam.pitch * faStairUni() / 64.0);
         // БЕЗ кламп-сжатия! Игра (D202: D3=(D0·pitch+проф)>>6) НЕ ограничивает сам сдвиг — она ОБРЕЗАЕТ колонну
         // по экрану (рисует только видимую часть, остальное за кадром). Кламп сжимал стену в полоску = баг.
-        int top = (int)yc - D0 / 2 + pshift;  // ГЕОМЕТРИЯ стены БЕЗ скоса (скос — только в текстуре, ty ниже)
+        const int Dh = D0 * faWallHMul();     // ⭐June: экранная высота колонны = 2×D0 (ZT: D0) [c812]
+        int top = (int)yc - Dh / 2 + pshift;  // ГЕОМЕТРИЯ стены БЕЗ скоса (скос — только в текстуре, ty ниже)
         // ОТЛОЖЕННЫЙ СЕГМЕНТ ШАХТЫ (D5CE): на колонку рисуем ПАРУ полос — потолок [0,top) + пол [top+D0,NH),
         // источник = синий idx1 (floor-seg) или ГРАДИЕНТ-маркер (wall-seg, FC «продолжается» сквозь стену).
         // Середина [top,top+D0) — НЕ трогаем (там настоящая стена кабины). Узкий x-диапазон клетки ограничивает.
         if (deferFC) {
             uint32_t src = (solidIdx >= 0) ? FA_ELEV_BLUE : 0x00000001u;  // синий idx1 (area-пол) / FA_GRAD (кабина-градиент)
-            int botStart = top + D0;
+            int botStart = top + Dh;
             for (int y = 0;        y < top && y < NH; ++y) if (y >= 0) nat[y * NW + ix] = src;  // потолок
             for (int y = botStart; y < NH;            ++y) if (y >= 0) nat[y * NW + ix] = src;  // пол
             // НЕ ставим zc[ix]: сегменты шахты не должны перекрывать друг друга (иначе ближний градиент-сег
@@ -295,42 +303,42 @@ inline void faDrawSeg(uint32_t* nat, int NW, int NH, double* zc,
         // Синий над/под: ШАХТА лифта (shaftWall) ИЛИ скошенная ПРОФИЛЬ-грань лестницы (§9.2, путь d0c4→d11a=0xd074).
         if (shaftWall || profileFace) {
             uint32_t blue = FA_ELEV_BLUE;                                  // idx1 синий (пол/потолок лифта/проём лестницы)
-            int botStart = top + D0;
+            int botStart = top + Dh;
             for (int y = 0;        y < top && y < NH; ++y) if (y >= 0) nat[y * NW + ix] = blue;  // потолок-задник
             for (int y = botStart; y < NH;            ++y) if (y >= 0) nat[y * NW + ix] = blue;  // пол-задник
         }
         // СВЕРХВЫСОКАЯ КОЛОННА (ROM cfb2/ce74, D0>0x50 ≈ ближе ~0.8 клетки): вместо цикла на всю D0 — ровно NH
         // строк из ЦЕНТРА наружу с Bresenham-шагом текселя (d3−=0x40; при <0 след.тексель, d3+=D0); верхний
         // тайл идёт вверх (тексели 31..0), нижний вниз (32..63). Точное ROM-округление, без лишних итераций.
-        if (D0 > 0x50 && solidIdx < 0 && !gradSeg && pshift == 0) {   // ТОЛЬКО без питча: при прыжке/приседе (pshift≠0)
+        if (Dh > 0x50 && solidIdx < 0 && !gradSeg && pshift == 0) {   // ТОЛЬКО без питча: при прыжке/приседе (pshift≠0)
             // центр из NH строк сместился бы и ОБРЕЗАЛ колонну сверху — тогда падаем в общий цикл ниже (тянет корректно).
             int cy0 = (int)yc;                                // центр колонны (питча нет)
-            int upTex = 31, loTex = 32, d3 = D0;
+            int upTex = 31, loTex = 32, d3 = Dh;
             for (int n = 0; n < NH / 2; ++n) {
                 int yu = cy0 - (n + 1), yd = cy0 + n;          // строка вверх (верх.тексель) / вниз (ниж.тексель)
                 if (yu >= 0 && yu < NH) {
                     int ty = upTex + texVShift; if (ty < 0) ty = 0; else if (ty > 63) ty = 63;
-                    faWallStrip(nat, yu * NW + ix, mt, ty * 128, tmx, wallPal, ramps, band, doShade, elevRide, clutDither);
+                    faWallStrip(nat, yu * NW + ix, mt, ty * 128, tmx, wallPal, ramps, band, shadeCol, elevRide, clutDither);
                 }
                 if (yd >= 0 && yd < NH) {
                     int ty = loTex + texVShift; if (ty < 0) ty = 0; else if (ty > 63) ty = 63;
-                    faWallStrip(nat, yd * NW + ix, mt, ty * 128, tmx, wallPal, ramps, band, doShade, elevRide, clutDither);
+                    faWallStrip(nat, yd * NW + ix, mt, ty * 128, tmx, wallPal, ramps, band, shadeCol, elevRide, clutDither);
                 }
                 d3 -= 0x40;
-                if (d3 < 0) { if (upTex > 0) --upTex; if (loTex < 63) ++loTex; d3 += D0; }
+                if (d3 < 0) { if (upTex > 0) --upTex; if (loTex < 63) ++loTex; d3 += Dh; }
             }
             zc[ix] = iv;
             continue;
         }
-        for (int i = 0; i < D0; ++i) {
+        for (int i = 0; i < Dh; ++i) {
             int y = top + i;
             if (y < 0 || y >= NH) continue;
             if (gradSeg)       { nat[y * NW + ix] = 0x00000001u; continue; }                 // градиент-сег (FA_GRAD→фон/пол-потолок в блите)
             if (solidIdx >= 0) { nat[y * NW + ix] = FA_ELEV_BLUE; continue; }  // синий сегмент idx1 (пол лифта/лестницы)
-            int ty = (int)((i + 0.5) * 64.0 / D0) + texVShift;             // +скос: тексель-строка сдвинута (диагональ)
+            int ty = (int)((i + 0.5) * 64.0 / Dh) + texVShift;             // +скос: тексель-строка сдвинута (диагональ)
             if (ty < 0) ty = 0; else if (ty > 63) ty = 63;                 // клампим в 64-строчный источник
             // ПОЛОСА: 2 текселя (tmx&~1,+1) + полная CLUT; окно (тексель-0) прозрачно посубпиксельно; elevRide=маркер кабины.
-            faWallStrip(nat, y * NW + ix, mt, ty * 128, tmx, wallPal, ramps, band, doShade, elevRide, clutDither);
+            faWallStrip(nat, y * NW + ix, mt, ty * 128, tmx, wallPal, ramps, band, shadeCol, elevRide, clutDither);
         }
         zc[ix] = iv;
     }
@@ -374,11 +382,11 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
     ramps.build(meta.shadeRampData, envMode);
     static FloorCeil fc;                // слой пол/потолок ZT (ROM-шаблон по env)
     fc.build(meta.fcTemplateData, wallPal, envMode);
-    // ⭐ФОНАРЬ: конус света в ПОЛ/ПОТОЛОК (ROM d3xx: рампа 0x4436 в 16 колоннах вокруг центра) —
-    // аппроксимация: в конусных колоннах пол/потолок берётся из env-0 (Bright) шаблона (как стены band=0).
-    static FloorCeil fcLit;
-    const bool flCone = flActive() && envMode != 0;
-    if (flCone) fcLit.build(meta.fcTemplateData, wallPal, 0);
+    // ⭐ФОНАРЬ НЕ ТРОГАЕТ ПОЛ/ПОТОЛОК [VERIFIED 2026-07-28, сеттер 1d46/1d5e]: при активном фонаре ROM
+    // делает ОБЫЧНЫЙ env-набор (`bsr 1d66` — тёмный fc-шаблон -$7152 остаётся!) и лишь ставит -$714c=16.
+    // Конус — только на СТЕНАХ (подмена таблицы скейлеров cf36/d138). Прежний fcLit-конус (пол/потолок из
+    // env0-шаблона в 16 колоннах) был НЕ-ROM аппроксимацией → с дальностью 16 давал яркую вертикальную
+    // ПОЛОСУ через весь экран (юзер). УДАЛЁН.
     // КАРТА ВЫСОТ ПОЛА ЛЕСТНИЦЫ (кэш по этажу): пол клеток-спуска опущен → наклонный/смещённый вниз пол.
     static std::vector<int> stairHt; static int stairHtFloor = -1; static const Level* stairHtLvl = nullptr;
     if (stairHtFloor != cam.floor || stairHtLvl != &lvl) {
@@ -412,7 +420,7 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
     // КАМЕРА В ЛЕСТНИЧНОЙ СЕКЦИИ? Профиль-скос/питч/синий-бэкдроп лестницы рисуем ТОЛЬКО когда игрок ВНУТРИ
     // секции (стоит на клетке-полу 0x12-0x17). Иначе стены-лестницы (0x0c-0x11), видимые издалека через уровень,
     // рисовались бы скошенными + с синим бэкдропом (баг: «синий всегда виден», стены тонут). Вне секции — обычные стены.
-    const uint8_t camCt = (camCX >= 0 && camCY >= 0 && camCX < Level::W && camCY < Level::H)
+    const uint8_t camCt = (camCX >= 0 && camCY >= 0 && camCX < lvl.W && camCY < lvl.H)
                           ? lvl.cellType(cam.floor, camCX, camCY) : 0;
     const bool camOnStair = isStairFloorCT(camCt) || isStairProfileCT(camCt);
     // КАМЕРА ВНУТРИ ШАХТЫ ЛИФТА (ROM-рендер лифта). Синий пол/потолок/межэтажье + неподвижная шахта
@@ -429,15 +437,15 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
     auto dD = [&](double wx, double wy) {
         return haveDescent ? ((wx - cam.px) * (double)ddx + (wy - cam.py) * (double)ddy) : 0.0;
     };
-    for (int cy = 0; cy < Level::H && !faNoWalls() && !faRayDDA(); ++cy) {   // faNoWalls: пропуск стен; faRayDDA: DDA-путь ниже
+    for (int cy = 0; cy < lvl.H && !faNoWalls() && !faRayDDA(); ++cy) {   // faNoWalls: пропуск стен; faRayDDA: DDA-путь ниже
         if (cy < camCY - drawDist || cy > camCY + drawDist) continue;
-        for (int cx = 0; cx < Level::W; ++cx) {
+        for (int cx = 0; cx < lvl.W; ++cx) {
             if (cx < camCX - drawDist || cx > camCX + drawDist) continue;
             uint8_t ct = lvl.cellType(cam.floor, cx, cy);
             if (!cellRenderWall(ct)) continue;
             uint8_t cell = lvl.cellId(cam.floor, cx, cy);
             auto openN = [&](int nx, int ny) {
-                if (nx < 0 || ny < 0 || nx >= Level::W || ny >= Level::H) return false;
+                if (nx < 0 || ny < 0 || nx >= lvl.W || ny >= lvl.H) return false;
                 uint8_t nct = lvl.cellType(cam.floor, nx, ny);
                 // дверь занимает лишь центр клетки → её бока открыты: соседняя стена ДОЛЖНА
                 // рисовать грань в сторону двери (иначе текстура стены у двери пропадает).
@@ -563,12 +571,20 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
             if (fxZQuant() && D0 >= 1) iv = D0 / faFocalV();
             if (iv <= zc[ix]) return;
             if (D0 < 1) { zc[ix] = iv; return; }
-            int band = doShade ? (faWallBand0() ? 0 : bandForHeight(D0)) : 0;
-            // ⭐ФОНАРЬ (ROM 13182: конус $FF6196+прицел·4 шириной 0x20 = 16 колонн; CLUT-рампа 0x4436 в
-            // конусе = яркая): при активном фонаре (без ночника) колонны вокруг центра НЕ затемняются.
-            if (flActive() && ix >= NW / 2 - 8 && ix < NW / 2 + 8) band = 0;
+            bool shadeCol = doShade;
+        int band = 0;
+        if (doShade) {
+            if (faJuneBands()) { int jb = juneBandForHeight(D0); if (jb < 0) shadeCol = false; else band = jb; }
+            else band = faWallBand0() ? 0 : bandForHeight(D0);
+        }
+            // ⭐ФОНАРЬ [VERIFIED 2026-07-28, cf36/d138]: конус = границы -$6f96..-$6f92 (13182:
+            // $FF6196+прицел·4, ширина 0x20 = 16 z-колонн из 128) подменяют ТАБЛИЦУ СКЕЙЛЕРОВ -$7156
+            // на 0x4436 (env0 Bright = блоки БЕЗ CLUT) → в конусе затенение ВЫКЛ (сырая палитра),
+            // не «band 0» (band 0 при faWallBand0 и так дефолт → прежний код был no-op, конус пропал).
+            if (flActive() && ix >= NW / 2 - NW / 16 && ix < NW / 2 + NW / 16) shadeCol = false;
             bool clutD = faWallDither() && (D0 <= faWallDitherD0());
-            int top = (int)yc2 - D0 / 2 + pshift;
+            const int Dh = D0 * faWallHMul();                        // ⭐June: высота колонны 2×D0 [c812]
+            int top = (int)yc2 - Dh / 2 + pshift;
             if (blueBk) {                                             // синий пол/потолок-задник (§9.2): над/под колонной
                 // ⭐ROM d28e (сдвинутая/высокая колонна): синий НЕ с обеих сторон всегда.
                 //   d278: сруб ПОЛНОСТЬЮ за экраном (D0/2±pshift ≤ −0x28) → ВСЯ колонка = полоса (синий), текстуры нет;
@@ -578,33 +594,33 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
                 // До фикса порт лил синий с обеих сторон всегда → «синяя полоса вверх и вниз» на профиль-стенах
                 // (центральная ячейка лестницы) и просвет уровня в поездке лифта. Тумблер faBlueD28E (дефолт ON).
                 const int HALF = NH / 2;                              // 0x28 в ROM-единицах (вид 0x50 строк)
-                bool fullOff = faBlueD28E() && (D0 / 2 - pshift <= -HALF || D0 / 2 + pshift <= -HALF);
+                bool fullOff = faBlueD28E() && (Dh / 2 - pshift <= -HALF || Dh / 2 + pshift <= -HALF);
                 if (fullOff) {
                     for (int y = 0; y < NH; ++y) nat[(size_t)y * NW + ix] = FA_ELEV_BLUE;
                     zc[ix] = iv; return;                              // сруб не рисуем (он за экраном)
                 }
                 bool topBlue = !faBlueD28E() || (pshift > -HALF);     // d3b6: сильный сдвиг ВВЕРХ → верх не льём
                 bool botBlue = !faBlueD28E() || (pshift <  HALF);     // d35c: сильный сдвиг ВНИЗ → низ не льём
-                int botStart = top + D0;
+                int botStart = top + Dh;
                 if (topBlue) for (int y = 0;        y < top && y < NH; ++y) if (y >= 0) nat[(size_t)y * NW + ix] = FA_ELEV_BLUE;
                 if (botBlue) for (int y = botStart; y < NH;            ++y) if (y >= 0) nat[(size_t)y * NW + ix] = FA_ELEV_BLUE;
             }
             // СВЕРХВЫСОКАЯ КОЛОННА (ROM cfb2/ce74, D0>0x50): NH строк из центра с Bresenham-шагом текселя (как
             // бокс-обход). Только без питча/бэкдропа (иначе центр смещён → падаем в общий цикл).
-            if (D0 > 0x50 && pshift == 0 && !blueBk) {
-                int cy0 = (int)yc2, upTex = 31, loTex = 32, d3 = D0;
+            if (Dh > 0x50 && pshift == 0 && !blueBk) {
+                int cy0 = (int)yc2, upTex = 31, loTex = 32, d3 = Dh;
                 for (int n = 0; n < NH / 2; ++n) {
                     int yu = cy0 - (n + 1), yd = cy0 + n;
-                    if (yu >= 0 && yu < NH) faWallStrip(nat.data(), yu * NW + ix, mt, upTex * 128, tmx, wallPal, ramps, band, doShade, elevRide, clutD);
-                    if (yd >= 0 && yd < NH) faWallStrip(nat.data(), yd * NW + ix, mt, loTex * 128, tmx, wallPal, ramps, band, doShade, elevRide, clutD);
-                    d3 -= 0x40; if (d3 < 0) { if (upTex > 0) --upTex; if (loTex < 63) ++loTex; d3 += D0; }
+                    if (yu >= 0 && yu < NH) faWallStrip(nat.data(), yu * NW + ix, mt, upTex * 128, tmx, wallPal, ramps, band, shadeCol, elevRide, clutD);
+                    if (yd >= 0 && yd < NH) faWallStrip(nat.data(), yd * NW + ix, mt, loTex * 128, tmx, wallPal, ramps, band, shadeCol, elevRide, clutD);
+                    d3 -= 0x40; if (d3 < 0) { if (upTex > 0) --upTex; if (loTex < 63) ++loTex; d3 += Dh; }
                 }
                 zc[ix] = iv; return;
             }
-            for (int i = 0; i < D0; ++i) {
+            for (int i = 0; i < Dh; ++i) {
                 int y = top + i; if (y < 0 || y >= NH) continue;
-                int ty = (int)((i + 0.5) * 64.0 / D0); if (ty > 63) ty = 63;
-                faWallStrip(nat.data(), y * NW + ix, mt, ty * 128, tmx, wallPal, ramps, band, doShade, elevRide, clutD);
+                int ty = (int)((i + 0.5) * 64.0 / Dh); if (ty > 63) ty = 63;
+                faWallStrip(nat.data(), y * NW + ix, mt, ty * 128, tmx, wallPal, ramps, band, shadeCol, elevRide, clutD);
             }
             zc[ix] = iv;
         };
@@ -725,7 +741,7 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
         // КЛАССИФИКАЦИЯ вошедшей клетки: диагональ / дверь / стена / транзит-сегмент / прозрачная.
         // true = луч остановлен (грань нарисована), false = продолжаем марш.
         auto processCell = [&](int ix, int mX, int mY, int side, double tCross, double rdx, double rdy) -> bool {
-            if (mX < 0 || mY < 0 || mX >= Level::W || mY >= Level::H) return true;
+            if (mX < 0 || mY < 0 || mX >= lvl.W || mY >= lvl.H) return true;
             uint8_t ct = lvl.cellType(cam.floor, mX, mY);
             if (ct >= 2 && ct <= 5)  return emitDiag(ix, mX, mY, side, tCross, rdx, rdy);
             if (cellRendersDoor(ct)) return emitDoor(ix, mX, mY, rdx, rdy);   // обычн.двери + ФЕЙК-двери 0x83/0x84 (дверной рендер створок)
@@ -776,7 +792,7 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
             double sY = (rdy > 0 ? (mapY + 1 - cam.py) : (cam.py - mapY)) * dDY;
             const double CE = 1e-6;                                       // угловой эпсилон (луч через угол клетки)
             auto plainWall = [&](int cx, int cy) {                        // сплошная ОСЕВАЯ стена (не диаг/не дверь) для supercover-пробы
-                if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return false;
+                if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) return false;
                 uint8_t c = lvl.cellType(cam.floor, cx, cy);
                 return cellBlocks(c) && !(c >= 2 && c <= 5) && !cellIsDoor(c);
             };
@@ -784,7 +800,7 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
             // СВОЮ клетку → её гипотенуза не рисовалась → «видно нутро». Спец-обработка первой клетки (ROM bc90):
             // рисуем гипотенузу клетки камеры, если луч идёт в сплошную сторону (пересечение впереди, t>0).
             {
-                uint8_t cc = (camCX >= 0 && camCY >= 0 && camCX < Level::W && camCY < Level::H)
+                uint8_t cc = (camCX >= 0 && camCY >= 0 && camCX < lvl.W && camCY < lvl.H)
                              ? lvl.cellType(cam.floor, camCX, camCY) : 0;
                 if (cc >= 2 && cc <= 5 && emitDiag(ix, camCX, camCY, 1, 0.0, rdx, rdy)) continue;
             }
@@ -828,11 +844,11 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
     // иначе край не «дотягивается»). Проходит сквозь прозрачные клетки (транзит-пол, пусто), стоп на стене.
     // reachedTransit[cy*W+cx]=1 → клетка достигнута. Заменяет пер-клеточный LOS (клиппился об углы стен).
     static std::vector<uint8_t> reachedTransit;
-    reachedTransit.assign((size_t)Level::W * Level::H, 0);
+    reachedTransit.assign((size_t)lvl.W * lvl.H, 0);
     {
         const int ccx = (int)cam.px, ccy = (int)cam.py;
-        if (ccx >= 0 && ccy >= 0 && ccx < Level::W && ccy < Level::H)
-            reachedTransit[(size_t)ccy * Level::W + ccx] = 1;         // клетка камеры
+        if (ccx >= 0 && ccy >= 0 && ccx < lvl.W && ccy < lvl.H)
+            reachedTransit[(size_t)ccy * lvl.W + ccx] = 1;         // клетка камеры
         const int NR = NW * 2;                                        // 2× плотность (меньше промахов по углам/периферии)
         const int maxSteps = drawDist * 2 + 2;
         for (int ir = 0; ir <= NR; ++ir) {
@@ -849,11 +865,11 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
             // Дверь: ЗАКРЫТАЯ блокирует (лифт/лестницу за ней не видно — норма), ОТКРЫТАЯ (анимация при подходе)
             // пропускает → плавное появление через растущий проём (z-тест по щели).
             auto tryMark = [&](int mx, int my) -> bool {
-                if (mx < 0 || my < 0 || mx >= Level::W || my >= Level::H) return true;
+                if (mx < 0 || my < 0 || mx >= lvl.W || my >= lvl.H) return true;
                 uint8_t mct = lvl.cellType(cam.floor, mx, my);
                 if (cellBlocks(mct)) return true;
                 if (cellIsDoor(mct) && doorOpen(cam.floor, mx, my) < 1e-3) return true;
-                reachedTransit[(size_t)my * Level::W + mx] = 1;
+                reachedTransit[(size_t)my * lvl.W + mx] = 1;
                 return false;
             };
             for (int s = 0; s < maxSteps; ++s) {
@@ -872,16 +888,16 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
             }
         }
     }
-    auto isReached = [&](int cx, int cy) { return reachedTransit[(size_t)cy * Level::W + cx] != 0; };
+    auto isReached = [&](int cx, int cy) { return reachedTransit[(size_t)cy * lvl.W + cx] != 0; };
     if (std::getenv("RDBG")) {   // дебаг: сетка достижимости вокруг камеры (R=достигнута, #=стена, .=нет)
         int ccx = (int)cam.px, ccy = (int)cam.py;
         std::fprintf(stderr, "REACH cam(%d,%d) dir(%.2f,%.2f):\n", ccx, ccy, cam.dirX, cam.dirY);
         for (int yy = ccy - 7; yy <= ccy + 7; ++yy) {
             std::fprintf(stderr, "y%3d ", yy);
             for (int xx = ccx - 7; xx <= ccx + 7; ++xx) {
-                if (xx < 0 || yy < 0 || xx >= Level::W || yy >= Level::H) { std::fprintf(stderr, "  ."); continue; }
+                if (xx < 0 || yy < 0 || xx >= lvl.W || yy >= lvl.H) { std::fprintf(stderr, "  ."); continue; }
                 uint8_t ct = lvl.cellType(cam.floor, xx, yy);
-                char r = reachedTransit[(size_t)yy * Level::W + xx] ? 'R' : (cellBlocks(ct) ? '#' : '.');
+                char r = reachedTransit[(size_t)yy * lvl.W + xx] ? 'R' : (cellBlocks(ct) ? '#' : '.');
                 std::fprintf(stderr, "%c%02X", r, ct);
             }
             std::fprintf(stderr, "\n");
@@ -894,9 +910,9 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
     // Рисуем ребро клетки, ОБРАЩЁННОЕ К КАМЕРЕ (заднее отсекается frustum/near-клипом). z-тест против стен (overdraw).
     if (faElevZT() && !faNoWalls() && !faRayDDA()) {                  // (только бокс-обход; в DDA — пер-колоночно в марше)
         for (int cy = camCY - drawDist; cy <= camCY + drawDist; ++cy) {
-            if (cy < 0 || cy >= Level::H) continue;
+            if (cy < 0 || cy >= lvl.H) continue;
             for (int cx = camCX - drawDist; cx <= camCX + drawDist; ++cx) {
-                if (cx < 0 || cx >= Level::W) continue;
+                if (cx < 0 || cx >= lvl.W) continue;
                 uint8_t ct = lvl.cellType(cam.floor, cx, cy);
                 if (!rcElevCell(ct) || ct == 0x30) continue;          // 0x30 (шахта) уже нарисована в обходе стен
                 if (!isReached(cx, cy)) continue;                     // достижимость лучом (не за стеной)
@@ -921,9 +937,9 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
     // это давало резкое появление. Достижимость → плавное появление по мере приближения, без торчания сквозь карту.
     if (faElevZT() && faStairSteps() && !faNoWalls() && !faStairOff() && !faRayDDA()) {   // (только бокс-обход; в DDA — в марше)
         for (int cy = camCY - drawDist; cy <= camCY + drawDist; ++cy) {
-            if (cy < 0 || cy >= Level::H) continue;
+            if (cy < 0 || cy >= lvl.H) continue;
             for (int cx = camCX - drawDist; cx <= camCX + drawDist; ++cx) {
-                if (cx < 0 || cx >= Level::W) continue;
+                if (cx < 0 || cx >= lvl.W) continue;
                 uint8_t ct = lvl.cellType(cam.floor, cx, cy);
                 int ex0, ey0, ex1, ey1;
                 int type = shaftSeg(ct, cx, cy, camCX, camCY, ex0, ey0, ex1, ey1);  // 0=нет, 1=синий, 2=градиент
@@ -986,8 +1002,7 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
         int r  = ny * 80 / NH;                         if (r > 79) r = 79;
         // ROM-точный путь: градиент НЕ статичен — пересэмплирован по питчу (D4A6, $FF6226).
         if (faTransitZT()) r = fcRowD4A6(r, (int)cam.pitch);
-        if (flCone && gx >= 112 && gx < 144)                       // ⭐конус фонаря в пол/потолок (те же 16 колонн, что стены)
-            return floorCeilColorExact(wallPal, fcLit, gx, r);
+        // (фонарь пол/потолок НЕ освещает — 1d5e: env-шаблон остаётся тёмным; конус только на стенах)
         return floorCeilColorExact(wallPal, fc, gx, r);
     };
     // FLOOR-CASTING: пиксель пола (ny>hor) → forward-дистанция → мировая клетка. Клетки лестницы (пол ОПУЩЕН
@@ -1000,7 +1015,7 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
     // camInShaft (весь void синий) ТОЛЬКО для ЛИФТА — у лестницы синий идёт от БЭКДРОПА за стенами (shaftWall),
     // а не из заливки всего объёма (это и был «барьер»).
     // В ШАХТЕ (весь void синий) ТОЛЬКО ЛИФТ. Лестница — синий ПОЛ через флор-каст (ниже), не вся пустота.
-    const bool camInShaft = (camCX >= 0 && camCY >= 0 && camCX < Level::W && camCY < Level::H) &&
+    const bool camInShaft = (camCX >= 0 && camCY >= 0 && camCX < lvl.W && camCY < lvl.H) &&
                             rcElevCell(camCt);
     auto shaftFloorBlue = [&](int x_, int sy) -> bool {
         if (camInShaft) return true;                                 // в шахте лифта → весь void синий
@@ -1013,7 +1028,7 @@ void renderFaithful(PutFn&& put, int W, int H, const Level& lvl, const Palette& 
         double lat = f * (nx - cxN) / cxN;
         int wcx = (int)(cam.px + cam.dirX * f - cam.dirY * lat);     // perp = (-dirY, dirX)
         int wcy = (int)(cam.py + cam.dirY * f + cam.dirX * lat);
-        if (wcx < 0 || wcy < 0 || wcx >= Level::W || wcy >= Level::H) return false;
+        if (wcx < 0 || wcy < 0 || wcx >= lvl.W || wcy >= lvl.H) return false;
         uint8_t ct = lvl.cellType(cam.floor, wcx, wcy);
         if (rcElevCell(ct)) return true;                            // лифт: пол/потолок-void синий
         // ЛЕСТНИЦА: синий ПОЛ спуска (только низ, dn>0) там, где под полом клетка-лестница (флор-каст legacy).

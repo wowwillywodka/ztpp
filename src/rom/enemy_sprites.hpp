@@ -4,6 +4,7 @@
 #pragma once
 #include "rom.hpp"
 #include "gfx.hpp"
+#include "../tuning.hpp"   // juneEnemies() (June-ветка enemyGfxSlot)
 #include <vector>
 #include <cstdint>
 #include <cmath>
@@ -24,6 +25,10 @@ struct EnemyAnimSet {
     std::vector<EnemySprite> fire, hit, death;   // стрельба/удар, стаггер, смерть (dir0 — фолбэк)
     std::vector<EnemySprite> fireD[6], hitD[6];  // ⭐directional огонь/стаггер (ROM 1ba04 крутит ВИДЫ у ЛЮБОГО кадра)
     int fireDirs = 0, hitDirs = 0;
+    std::vector<EnemySprite> juneStagA, juneStagB;       // BZT weapon D / weapon B special-stagger
+    std::vector<EnemySprite> juneStagAD[6], juneStagBD[6];
+    int juneStagADirs = 0, juneStagBDirs = 0;
+    std::vector<EnemySprite> juneCorpse;                 // BZT: final static corpse pose, after CB→CC death transition
     std::vector<EnemySprite> fire2;               // 2-я БОЕВАЯ поза (Dog прыжок/Boss1 выстрел/Boss3 дальний/Boss2 удар/Sgt·FH-SF бросок); пусто=нет
     std::vector<EnemySprite> climb;               // Hydaca: ВЕРТИКАЛЬНЫЙ спрайт лазанья по стене (32×64) = a1 (падение вниз)
     std::vector<EnemySprite> climbDir[6];         // Hydaca: 6 directional вертик. поз лазанья
@@ -68,6 +73,15 @@ inline int enemyDirIndex(double vx, double vy, double rx, double ry, int dirCoun
 }
 // celltype → слот (порядок: Sgt/FH/Imp/Hydaca/Revenant/Boss1/dog/FH-SF/Boss3/Boss2).
 inline int enemyGfxSlot(uint8_t ct) {
+    // ⭐June [VERIFIED рендер-таблица @0x8A20]: 5 типов; Man покрывает ct 09/27/66/68/69/6A.
+    if (juneEnemies()) {
+        switch (ct) { case 0x29: return 0;                                   // RedRobo
+            case 0x2A: return 1;                                             // Purple
+            case 0x09: case 0x27: case 0x66: case 0x68: case 0x69: case 0x6A: return 2;   // Man
+            case 0x65: return 3;                                             // RedMan
+            case 0x08: return 4;                                             // GrenMan
+            default: return -1; }
+    }
     switch (ct) { case 0x29: return 0; case 0x2A: return 1; case 0x2B: return 2; case 0x65: return 3;
         case 0x66: return 4; case 0x67: return 5; case 0x68: return 6; case 0x69: return 7;
         case 0x6A: return 8; case 0x6B: return 9; default: return -1; }
@@ -93,5 +107,7 @@ inline SpriteClut& g_spriteClut() { static SpriteClut c; return c; }
 
 // Наполнить g_enemyAnim/g_enemyAnimVar2/g_enemyWalk + CLUT спрайтов из ROM (дерево 0x1B7B38…, пал 0x20F2).
 // gfx — 10 банков спрайтов по слотам (nullptr = ZT-дефолт); altFH — альт-банк FH (0 = нет); clutBase — CLUT спрайтов.
+// bztFmt: формат кадра BZT (June/July) — стрид 0x36, тайлы СЛОВАМИ @+0x16+row*8+col*2 (ZT: 0x26, байты, row*4+col).
 void decodeEnemySprites(const Rom& rom, const Palette& pal,
-                        const size_t* gfx = nullptr, size_t altFH = 0x1C258A, size_t clutBase = 0x10d1be);
+                        const size_t* gfx = nullptr, size_t altFH = 0x1C258A, size_t clutBase = 0x10d1be,
+                        bool bztFmt = false);

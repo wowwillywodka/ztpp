@@ -42,15 +42,22 @@ void populate(GtkCtx* c) {
     gtk_list_store_clear(c->store);
     for (const launcher::Entry& e : *c->entries) {
         char sizebuf[32]; std::snprintf(sizebuf, sizeof(sizebuf), "%.1f MB", (double)e.size / (1024.0 * 1024.0));
+        const char* fg = e.supported ? nullptr : "#888888";
+        switch (launcher::buildTextTone(e.build)) {
+            case launcher::TextTone::Green:  fg = "#33B84D"; break;
+            case launcher::TextTone::Yellow: fg = "#D9A91C"; break;
+            case launcher::TextTone::Red:    fg = "#E64038"; break;
+            default: break;
+        }
         GtkTreeIter it;
         gtk_list_store_append(c->store, &it);
         gtk_list_store_set(c->store, &it,
             COL_FILE,   e.file.c_str(),
             COL_BUILD,  launcher::buildLabel(e.build),
             COL_SIZE,   sizebuf,
-            COL_STATUS, (e.build == Build::ZTU) ? "Partially supported" : (e.supported ? "Supported" : "Not supported yet"),
-            COL_FG,     e.supported ? nullptr : "#888888",
-            COL_FGSET,  e.supported ? FALSE : TRUE,
+            COL_STATUS, launcher::buildStatus(e.build),
+            COL_FG,     fg,
+            COL_FGSET,  fg ? TRUE : FALSE,
             -1);
     }
 }

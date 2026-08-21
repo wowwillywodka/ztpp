@@ -200,6 +200,7 @@ bool playSfxForce(int id, int armVbl);                         // форс-са�
 void playElevatorHum();                                        // → sound.cpp (лифт: 0x6f одной длинной нотой)
 void playSfxNote(int id, int note);                            // → sound.cpp (Sound Test: явная нота)
 void stopAllSfx();                                             // → sound.cpp
+double takeAudioLockWaitMs();                                  // → sound.cpp: худшее ожидание аудио-лока за кадр (перф-диаг статтеров), сбрасывает
 
 // ── ЗАГРУЗКА: таблица DAC-сэмплов + банк FM-патчей + секвенции + SFX-таблица + чип/аудио ──
 // GEMS-банки per-build: ZT samp 0x5E51C / patch 0x5A804 / seq 0x5B0CC / SFX 0xC5EB4;

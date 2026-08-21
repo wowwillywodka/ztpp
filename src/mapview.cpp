@@ -52,10 +52,10 @@ static void drawCellId(FB& fb, int dx, int dy, int size, uint8_t cid) {
 void renderMap(FB& fb, const Level& lvl, const Palette& wallPal, const WallBank& wall,
                       int floor, int mode, bool grid) {
     fb.clear(0xFF0A0A0Eu);
-    const int cellpx = FBW / Level::W; // 20
+    const int cellpx = FBW / lvl.W; // 20
     uint8_t tile[32 * 32];
-    for (int y = 0; y < Level::H; ++y) {
-        for (int x = 0; x < Level::W; ++x) {
+    for (int y = 0; y < lvl.H; ++y) {
+        for (int x = 0; x < lvl.W; ++x) {
             int dx = x * cellpx, dy = y * cellpx;
             uint8_t cell = lvl.cellId(floor, x, y);
             uint8_t ct   = lvl.cellType(floor, x, y);
@@ -87,15 +87,108 @@ void renderMap(FB& fb, const Level& lvl, const Palette& wallPal, const WallBank&
 // ── ПЛОСКАЯ ПОЛНАЯ КАРТА (меню настроек «full map»): только автокарта этажа + позиция, без хедера ──
 void drawFullMap(FB& fb, const GameData& gd, int ep, int floor, const Camera& cam) {
     renderMap(fb, gd.levels[ep], gd.wallPal, gd.wall, floor, 0, true);
-    const int cellpx = FBW / Level::W;
+    const int cellpx = FBW / gd.levels[ep].W;
     int px = (int)(cam.px * cellpx), py = (int)(cam.py * cellpx);
     for (int dy = -3; dy <= 3; ++dy) for (int dx = -3; dx <= 3; ++dx)
         if (dx*dx + dy*dy <= 10) fb.put(px + dx, py + dy, 0xFF40FF40u);
     for (int i = 0; i < 12; ++i) fb.put(px + (int)(cam.dirX*i), py + (int)(cam.dirY*i), 0xFFFFFF00u);
 }
 
+static void putNative(FB& fb, int vpX, int vpY, double sc, int nx, int ny, uint32_t col) {
+    int x0 = vpX + (int)(nx * sc), y0 = vpY + (int)(ny * sc);
+    int x1 = vpX + (int)((nx + 1) * sc), y1 = vpY + (int)((ny + 1) * sc);
+    if (x1 <= x0) x1 = x0 + 1;
+    if (y1 <= y0) y1 = y0 + 1;
+    for (int y = y0; y < y1; ++y) for (int x = x0; x < x1; ++x) fb.put(x, y, col);
+}
+
+static void blitJuneMapSprite(FB& fb, const std::array<uint8_t, 64>& spr, const Palette& pal,
+                              int vpX, int vpY, double sc, int nx, int ny) {
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 8; ++c) {
+            uint8_t idx = spr[(size_t)r * 8 + c] & 15;
+            if (!idx) continue;
+            putNative(fb, vpX, vpY, sc, nx + c, ny + r, pal.c[idx]);
+        }
+}
+
+static void drawBztJunePauseMap(FB& fb, const GameData& gd, int ep, int floor, const Camera& cam) {
+    const Level& lvl = gd.levels[ep];
+    if (lvl.floors <= 0) return;
+    int fl = floor; if (fl < 0) fl = 0; if (fl >= lvl.floors) fl = lvl.floors - 1;
+
+    fb.clear(0xFF000000u);
+    double sc = (double)FBW / 320.0; { double sy = (double)FBH / 224.0; if (sy < sc) sc = sy; }
+    int vpW = (int)(320 * sc), vpH = (int)(224 * sc), vpX = (FBW - vpW) / 2, vpY = (FBH - vpH) / 2;
+    if (!gd.bztMapBg.empty()) {
+        for (int y = 0; y < vpH; ++y) {
+            int ny = (int)(y / sc); if (ny > 223) ny = 223;
+            const uint32_t* src = &gd.bztMapBg[(size_t)ny * 320];
+            for (int x = 0; x < vpW; ++x) {
+                int nx = (int)(x / sc); if (nx > 319) nx = 319;
+                fb.put(vpX + x, vpY + y, src[nx]);
+            }
+        }
+    }
+
+    const int fw = lvl.fw[fl], fh = lvl.fh[fl];
+    int sx = bztPauseMapBaseX(lvl, fl, cam.px) + bztPauseMapScrollX();
+    int sy = bztPauseMapBaseY(lvl, fl, cam.py) + bztPauseMapScrollY();
+    if (fw <= 32) sx = 0; else { if (sx < 0) sx = 0; if (sx > fw - 32) sx = fw - 32; }
+    if (fh <= 32) sy = 0; else { if (sy < 0) sy = 0; if (sy > fh - 32) sy = fh - 32; }
+
+    auto nib = [&](int x, int y) -> uint8_t {
+        if (x < 0 || y < 0 || x >= fw || y >= fh) return 0;
+        uint8_t ct = lvl.cellType(fl, x, y);
+        uint8_t v = gd.bztMapLut[(size_t)ct];
+        return (v < 8) ? v : 0;
+    };
+
+    static constexpr int MAP_X = 96;  // nametable fill starts at VRAM 0xC198: col 12, row 3.
+    static constexpr int MAP_Y = 24;
+    const Palette& mapPal = gd.hudIconPal; // map attrs are 0xE341+ (priority + palette line 3).
+    const Palette& textPal = gd.pauseTextPal; // title printer uses 0x42xx attrs after CRAM load @0x54222.
+    for (int ty = 0; ty < 16; ++ty)
+        for (int tx = 0; tx < 16; ++tx) {
+            uint8_t ids[4] = {
+                nib(sx + tx * 2,     sy + ty * 2),
+                nib(sx + tx * 2 + 1, sy + ty * 2),
+                nib(sx + tx * 2,     sy + ty * 2 + 1),
+                nib(sx + tx * 2 + 1, sy + ty * 2 + 1),
+            };
+            for (int q = 0; q < 4; ++q) {
+                const auto& br = gd.bztMapBrick[(size_t)ids[q]];
+                int ox = MAP_X + tx * 8 + (q & 1) * 4;
+                int oy = MAP_Y + ty * 8 + (q >= 2 ? 4 : 0);
+                for (int r = 0; r < 4; ++r)
+                    for (int c = 0; c < 4; ++c) {
+                        uint8_t idx = br[(size_t)r * 4 + c] & 15;
+                        if (!idx) continue;
+                        putNative(fb, vpX, vpY, sc, ox + c, oy + r, mapPal.c[idx]);
+                    }
+            }
+        }
+
+    int mx = MAP_X + (int)((cam.px - sx) * 4.0) - 4;
+    int my = MAP_Y + (int)((cam.py - sy) * 4.0) - 4;
+    if (mx > MAP_X - 8 && mx < MAP_X + 128 && my > MAP_Y - 8 && my < MAP_Y + 128)
+        blitJuneMapSprite(fb, gd.bztMapPlayerMark, mapPal, vpX, vpY, sc, mx, my);
+
+    int gi = ep * 16 + fl;
+    if (gi < 0) gi = 0;
+    if (!gd.levelNames.empty() && gi >= (int)gd.levelNames.size()) gi = (int)gd.levelNames.size() - 1;
+    std::string nm = (!gd.levelNames.empty() && gi >= 0) ? gd.levelNames[gi] : "";
+    if (!nm.empty()) drawTextFontC(fb, vpX + (int)(160 * sc), vpY + (int)(189 * sc), nm.c_str(),
+                                   textPal.c[1], sc > 1.5 ? 2 : 1, gd.fontAlt.have ? &gd.fontAlt : nullptr);
+}
+
 // ── МЕНЮ ПАУЗЫ (Tab) — как в оригинале: автокарта этажа на бумаге-PDA + СПИСОК ЭТАЖЕЙ с паролями.
 void drawPauseMap(FB& fb, const GameData& gd, int ep, int floor, const Camera& cam, const std::vector<std::string>* lines) {
+    if (gd.build == Build::BZT_June && !gd.bztMapBg.empty()) {
+        (void)lines;
+        drawBztJunePauseMap(fb, gd, ep, floor, cam);
+        return;
+    }
     // МЕНЮ ПАУЗЫ как в ОРИГИНАЛЕ: фон = руки держат карту-PDA (ROM @0x12DD06, gd.pauseBg 320×224),
     // на поверхность карты рисуется blueprint этажа + позиция игрока + список этажей/паролей сверху.
     const Level& lvl = gd.levels[ep];
@@ -116,7 +209,7 @@ void drawPauseMap(FB& fb, const GameData& gd, int ep, int floor, const Camera& c
         // ⭐ФОН idx0 = ПРОЗРАЧЕН (пол показывает БУМАГУ pauseBg сквозь себя, как VDP: idx0 = прозрачный; НЕ пурпур!).
         const int nx0=96, ny0=80, cellN=4; double px=sc; if(px<1)px=1;   // 1 px кирпичика = sc экранных
         auto fbx=[&](double gx){ return vpX+(int)((nx0+gx*cellN)*sc); }; auto fby=[&](double gy){ return vpY+(int)((ny0+gy*cellN)*sc); };
-        for (int cy=0;cy<Level::H;++cy) for (int cx=0;cx<Level::W;++cx) {
+        for (int cy=0;cy<lvl.H;++cy) for (int cx=0;cx<lvl.W;++cx) {
             uint8_t ic = mapres::ICON[lvl.cellType(floor,cx,cy) & 0xFF];  // celltype → иконка-idx
             if (ic >= (uint8_t)mapres::NBRICK) ic = 0;
             const uint8_t* br = mapres::BRICK[ic];                        // 4×4 кирпичик
@@ -159,12 +252,12 @@ void drawPauseMap(FB& fb, const GameData& gd, int ep, int floor, const Camera& c
                 } else drawTextBigC(fb, vpX + (int)(160*sc), vpY + (int)((8 + li*16)*sc), s.c_str(), 0, psc, false, gd.pauseTextPal.c.data());
             }
         }
-        // НИЗ: короткое имя уровня шрифтом Font2 — цвет = idx1 CRAM line3 паузы (0x0444 → #575757,
-        // VERIFIED MAME pause_cram; был порт-выдуманный 0x303038)
+        // НИЗ: короткое имя уровня шрифтом Font2 — цвет = idx1 палитры экранного текста
+        // (ZT: 0x0444 → #575757; June: своя палитра Font_grph/options @0x54222).
         (void)us;
         int gi=ep*16+floor; if(gi<0)gi=0; if(!gd.levelNames.empty()&&gi>=(int)gd.levelNames.size())gi=(int)gd.levelNames.size()-1;
         std::string nm = (!gd.levelNames.empty()&&gi>=0)?gd.levelNames[gi]:"";
-        if (!nm.empty()) drawTextFontC(fb, FBW/2, vpY+(int)(212*sc), nm.c_str(), 0xFF575757u,   // ⭐212: карта до 208 — не наезжает
+        if (!nm.empty()) drawTextFontC(fb, FBW/2, vpY+(int)(212*sc), nm.c_str(), gd.pauseTextPal.c[1],   // ⭐212: карта до 208 — не наезжает
                                        sc > 1.5 ? 2 : 1, gd.fontAlt.have ? &gd.fontAlt : nullptr);
     }
 }
@@ -184,9 +277,9 @@ void renderAtlas(FB& fb, const WallBank& wall, const Palette& wallPal) {
 // ===== Миникарта поверх FPS-вида =====
 void drawMinimap(FB& fb, const Level& lvl, const Camera& cam) {
     const int s = 5, ox = 8, oy = 8;
-    fb.rect(ox - 2, oy - 2, Level::W * s + 4, Level::H * s + 4, 0xFF000000u);
-    for (int y = 0; y < Level::H; ++y)
-        for (int x = 0; x < Level::W; ++x) {
+    fb.rect(ox - 2, oy - 2, lvl.W * s + 4, lvl.H * s + 4, 0xFF000000u);
+    for (int y = 0; y < lvl.H; ++y)
+        for (int x = 0; x < lvl.W; ++x) {
             uint8_t ct = lvl.cellType(cam.floor, x, y);
             uint32_t c = cellBlocks(ct) ? 0xFF707080u
                        : (cellIsDoor(ct) ? 0xFF6A8CD0u : 0xFF222A33u);
@@ -205,13 +298,13 @@ void drawMinimapRect(uint32_t* buf, int bw, int bh, int rx, int ry, int rw, int 
     auto put = [&](int x, int y, uint32_t c) {
         if (x >= 0 && x < bw && y >= 0 && y < bh) buf[(size_t)y * bw + x] = c;
     };
-    int s = std::min(rw / Level::W, rh / Level::H); if (s < 1) s = 1;
-    int mw = Level::W * s, mh = Level::H * s;
+    int s = std::min(rw / lvl.W, rh / lvl.H); if (s < 1) s = 1;
+    int mw = lvl.W * s, mh = lvl.H * s;
     int ox = rx + (rw - mw) / 2, oy = ry + (rh - mh) / 2;
     for (int y = ry; y < ry + rh; ++y)                       // тёмная подложка на всю область радара
         for (int x = rx; x < rx + rw; ++x) put(x, y, 0xFF000000u);
-    for (int y = 0; y < Level::H; ++y)
-        for (int x = 0; x < Level::W; ++x) {
+    for (int y = 0; y < lvl.H; ++y)
+        for (int x = 0; x < lvl.W; ++x) {
             uint8_t ct = lvl.cellType(cam.floor, x, y);
             uint32_t c = cellBlocks(ct) ? 0xFF707080u
                        : (cellIsDoor(ct) ? 0xFF6A8CD0u : 0xFF222A33u);
@@ -270,12 +363,12 @@ void drawGameMap(uint32_t* buf, int bw, int bh, int rx, int ry, int rw, int rh,
     for (int y = ry; y < ry + rh; ++y) for (int x = rx; x < rx + rw; ++x) put(x, y, radarres::PAL[15]);  // фон = чёрный
     int pcx = (int)cam.px, pcy = (int)cam.py;                        // клетка игрока
     int ox = pcx - N / 2, oy = pcy - N / 2;                          // окно центрировано на игроке…
-    if (ox < 0) ox = 0; if (ox > Level::W - N) ox = Level::W - N;    // …с кламом к границам карты (как ZT: центр 5..27)
-    if (oy < 0) oy = 0; if (oy > Level::H - N) oy = Level::H - N;
+    if (ox < 0) ox = 0; if (ox > lvl.W - N) ox = lvl.W - N;    // …с кламом к границам карты (как ZT: центр 5..27)
+    if (oy < 0) oy = 0; if (oy > lvl.H - N) oy = lvl.H - N;
     for (int gy = 0; gy < N; ++gy)
         for (int gx = 0; gx < N; ++gx) {
             int mx = ox + gx, my = oy + gy;
-            if (mx < 0 || my < 0 || mx >= Level::W || my >= Level::H) continue;
+            if (mx < 0 || my < 0 || mx >= lvl.W || my >= lvl.H) continue;
             uint8_t ct = lvl.cellType(cam.floor, mx, my);
             int px0 = rx + gx * s, py0 = ry + gy * s;
             if (mapShowIds()) {                                      // ДЕВ-РЕЖИМ: значок клетки + cell ID тонким шрифтом

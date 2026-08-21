@@ -88,10 +88,10 @@ void populateList(WinCtx* ctx) {
         ListView_InsertItem(ctx->list, &it);
         std::wstring wbuild = widen(launcher::buildLabel(e.build));
         wchar_t wsize[32]; std::swprintf(wsize, 32, L"%.1f MB", (double)e.size / (1024.0 * 1024.0));
-        const wchar_t* wstat = (e.build == Build::ZTU) ? L"Partially supported" : (e.supported ? L"Supported" : L"Not supported yet");
+        std::wstring wstat = widen(launcher::buildStatus(e.build));
         ListView_SetItemText(ctx->list, i, 1, (LPWSTR)wbuild.c_str());
         ListView_SetItemText(ctx->list, i, 2, (LPWSTR)wsize);
-        ListView_SetItemText(ctx->list, i, 3, (LPWSTR)wstat);
+        ListView_SetItemText(ctx->list, i, 3, (LPWSTR)wstat.c_str());
     }
 }
 
@@ -180,6 +180,23 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_NOTIFY: {
             NMHDR* nh = (NMHDR*)lp;
             if (nh->idFrom == ID_LIST) {
+                if (nh->code == NM_CUSTOMDRAW) {
+                    NMLVCUSTOMDRAW* cd = (NMLVCUSTOMDRAW*)lp;
+                    if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                    if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT && ctx) {
+                        size_t i = (size_t)cd->nmcd.dwItemSpec;
+                        if (i < ctx->entries->size()) {
+                            const launcher::Entry& e = (*ctx->entries)[i];
+                            switch (launcher::buildTextTone(e.build)) {
+                                case launcher::TextTone::Green:  cd->clrText = RGB(51, 184, 77);  break;
+                                case launcher::TextTone::Yellow: cd->clrText = RGB(217, 169, 28); break;
+                                case launcher::TextTone::Red:    cd->clrText = RGB(230, 64, 56);  break;
+                                default: if (!e.supported) cd->clrText = RGB(136, 136, 136); break;
+                            }
+                        }
+                        return CDRF_NEWFONT;
+                    }
+                }
                 if (nh->code == LVN_ITEMCHANGED) { updateDetails(ctx); return 0; }
                 if (nh->code == NM_DBLCLK)       { doPlay(hwnd, ctx); return 0; }
             }

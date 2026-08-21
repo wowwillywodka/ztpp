@@ -67,6 +67,7 @@ struct BuildAddrs {
     size_t fontNumBank = 0;     int fontNumCount = 0;      // шрифт Numbers (8×8; ZT 0x16E618, 10 цифр) — HP/враги
     size_t fontAltBank = 0;     int fontAltCount = 0;      // шрифт Font2 (8×8; ZT 0x12EAA6, 36: 0-9 A-Z) — назв.уровня
     size_t fontBigBank = 0, fontBigTable = 0, fontBigPal = 0; int fontBigCount = 0;  // Font_grph 8×16 (ZT 0x125116, табл 0x1DD3A, пал жёлтая 0xCD47A)
+    size_t optArrowGfx = 0, optArrowPal = 0;  // курсор OPTIONS: два 8×8 тайла (64 Б) и CRAM-палитра
     size_t animTableOff = 0x5914;       // смещение таблицы анимаций стен от ZMAP (ZT 0x5914, BZT 0x1914)
     // ── Per-build адреса, ранее зашитые в код (ZT-дефолты). ZTU-значения: известные из реверса
     //    (ztu-underground) + байт-поиск ИДЕНТИЧНЫХ таблиц ZT→ZTU (уникальные совпадения = verified).
@@ -112,6 +113,7 @@ static BuildAddrs addrsForBuild(Build b) {
             a.fontNumBank = 0x16E618; a.fontNumCount = 10;          // Numbers: 0-9
             a.fontAltBank = 0x12EAA6; a.fontAltCount = 36;          // Font2: 0-9(0-9) A-Z(10-35)
             a.fontBigBank = 0x125116; a.fontBigTable = 0x1DD3A; a.fontBigCount = 150; a.fontBigPal = 0xCD47A;  // Font_grph 8×16 (char→верх|низ; пал жёлтая)
+            a.optArrowGfx = 0x10CB7C; a.optArrowPal = 0x10CBDC;    // курсор OPTIONS: два горизонтальных тайла, палитра line0
             a.animTableOff = 0x5914;       // таблица анимаций стен сразу после env (sig+0x5904+16)
             a.fighterBase = 0xC6B36; a.portraitTable = 0xC634E;
             a.hasTitle = true;
@@ -143,6 +145,8 @@ static BuildAddrs addrsForBuild(Build b) {
             a.fontAltBank = 0x10A24E;     a.fontAltCount = 36;
             a.fontBigBank = 0x1008BE; a.fontBigTable = 0x1E702; a.fontBigCount = 150;
             a.fontBigPal = 0x9E2B6;      // жёлтая палитра Font_grph (байт-в-байт с ZT 0xCD47A)
+            // sub_0DC224: DMA 64 Б в VRAM для курсора OPTIONS; графика и палитра идентичны ZT.
+            a.optArrowGfx = 0xDDF04; a.optArrowPal = 0xDDF64;
             a.pauseTextPalAddr = 0x1D77A;                    // байт-в-байт с ZT 0x1CDAE
             a.angLUTAddr = 0x81E6; a.spriteClutAddr = 0xDEB66;
             // Спрайты врагов по слотам (0Sgt 1FH 2Imp 3Hydaca 4Reven 5Boss1 6Dog 7FH-SF 8Boss3 9Boss2):
@@ -165,8 +169,47 @@ static BuildAddrs addrsForBuild(Build b) {
             a.logoNt[1] = 0x261FE; a.logoPal[1] = 0x2440A;   // эмблема разработчика
             a.wired = true; break;
         }
-        case Build::BZT_June:           // TODO: прото-адреса + форматы
-        case Build::BZT_July:
+        case Build::BZT_June: {         // ⭐BZT June [VERIFIED 2026-07-24, findings «BZT June: СТРУКТУРА ДВИЖКА»]
+            // Таблица ZMAP движка @0xB9498 = РОВНО 3 заголовка (=sig−0x86); банки/палитры/fc — per-episode
+            // из дескрипторов @0xB9B96 (читаются в loadGameDataFromRom, тут — эп.1 как дефолт).
+            a.sig = {0xAAE2C, 0xAF4F2, 0xB44BA};
+            a.animTableOff = 0x1914;                 // BZT: анимтаблица @sig+0x1914
+            a.wallBank = 0xC883E; a.wallTiles = 255; // эп.1 (перекрывается per-episode ниже)
+            a.wallPal = 0xB9CBE;                     // линия 0 палитро-блока эп.1 (0x100/эпизод)
+            a.shadeRampBase = 0;                     // CLUT-затенение June не вскрыто → identity-рампы
+            a.fcTemplateBase = 0xBC3D2;              // fc-шаблоны эп.1 (дескриптор +0x10; per-episode ниже)
+            a.objBank = 0; a.objTiles = 0;           // декор June = items_imgs эпизода (позже)
+            a.nvPalAddr = 0xB9C3E;                   // альт-палитра эп.1 (гипотеза: ночник-аналог)
+            a.pauseTextPalAddr = 0x54222;             // Font_grph/options text palette (xrefs 1AEC/335E/53E28)
+            a.angLUTAddr = 0x78EA;                   // ⭐LUT углов June [VERIFIED байт-поиском: контент = ZT 0x8124
+                                                     //  бит-в-бит, уникальное совпадение; веер лучей = +0x1000 = 0x88EA
+                                                     //  (сигнатура -64/0/64 ✓); AI June тоже читает 0x78EA].
+                                                     //  ⚠Был ZT-адрес 0x8124 → мусор в квантовании угла: «странные
+                                                     //  повороты/движение» (юзер-репорт 2026-07-24).
+            a.spriteClutAddr = 0;                    // CLUT June не вскрыт → identity (см. SpriteClut::load)
+            a.enemyAltFH = 0;
+            // ⭐ВРАГИ June [VERIFIED 2026-07-28: рендер-хендлеры клеток @0x8A20 → 9278/928C/92A0/92B4/92C8
+            // грузят ДЕФ в -$5644 → общий 92DC (дист<0x800 → спавн, иначе статуя-биллборд)]. Маппинг карты:
+            // ct 0x29→A256 RedRobo, 0x2A→A27C Purple, {0x09,0x27,0x66,0x68,0x69,0x6A}→A2A2 Man,
+            // 0x65→A2C8 RedMan, 0x08→A2EE GrenMan; 0x0A/0x2B/0x67/0x6B → пусто (8C3E). HP = деф+0x12
+            // (600, GrenMan 1200) → $3a актёра; +0x10=0xDC — ФЛАГИ (бит4!). Слоты порта (enemyGfxSlot,
+            // June-ветка): 0 RedRobo / 1 Purple / 2 Man / 3 RedMan / 4 GrenMan.
+            { static const size_t G[10] = { 0x16F9BA, 0x1A86E0, 0x1C73A2, 0x1E473C, 0x201AD6,
+                                            0x16F9BA, 0x16F9BA, 0x16F9BA, 0x16F9BA, 0x16F9BA };
+              for (int i = 0; i < 10; ++i) a.enemyGfx[i] = G[i]; }
+            a.hudIconBank = 0x16AF02; a.hudIconCount = 14;   // ⭐иконки инвентаря June [VERIFIED @0x1071A]: 14×0x200, линия 3
+            a.hudDigitFont = 0x16CB02;                       // цифры боезапаса June: 10×6 слов (0x78 б), findings раунд 8
+            a.fontLettersBank = 0x16F4BA; a.fontLettersCount = 40;  // Letters: A-Z(0-25) 0-9(26-35) .-:?
+            a.fontNumBank = 0x16F37A;     a.fontNumCount = 10;      // Numbers: 0-9, HP/счётчик врагов
+            a.fontAltBank = 0x164DE2;     a.fontAltCount = 36;      // Font2: 0-9(0-9) A-Z(10-35)
+            a.fontBigBank = 0x1544DA; a.fontBigTable = 0x551E8; a.fontBigCount = 150;
+            a.fontBigPal = 0x54222;                       // палитра Font_grph June, реально грузится в CRAM экранными сайтами
+            a.hasPanorama = true;                    // панорамы Plan_A per-episode (0xBD6FE…)
+            a.hasTitle = false;
+            a.sndSamp = a.sndPatch = a.sndSeq = a.sndSfx = 0;   // GEMS June не вскрыт; PCM в June нет
+            a.wired = true; break;
+        }
+        case Build::BZT_July:           // TODO: прото-адреса + форматы (структура = June, свои адреса)
         default: break;                 // не заведено → fallback на ZT-раскладку (warn)
     }
     return a;
@@ -245,9 +288,70 @@ static std::vector<uint32_t> decodeTileScreen(const Rom& rom, size_t tilesAddr, 
         }
     return out;
 }
+
+// BZT June map screen (sub_002B9E): tiles 0x167F62 -> VRAM tile 0x141,
+// nametable 0x16A5C2 -> Plane B @0xE000, palette line 0 @0x16AE82.
+static std::vector<uint32_t> decodeJuneMapScreen(const Rom& rom) {
+    static constexpr size_t TILES = 0x167F62;
+    static constexpr size_t NT    = 0x16A5C2;
+    static constexpr size_t PAL   = 0x16AE82;
+    static constexpr int TILE_BASE = 0x141;
+    std::vector<uint32_t> out((size_t)HUD_W * HUD_H, 0xFF000000u);
+    uint32_t pal[16]; for (int i = 0; i < 16; ++i) pal[i] = cramToArgb(rom.u16(PAL + (size_t)i * 2));
+    for (int ty = 0; ty < 28; ++ty)
+        for (int tx = 0; tx < 40; ++tx) {
+            uint16_t e = (uint16_t)(rom.u16(NT + (size_t)(ty * 40 + tx) * 2) + TILE_BASE);
+            int tile = (e & 0x7FF) - TILE_BASE; if (tile < 0) continue;
+            bool hf = (e & 0x800) != 0, vf = (e & 0x1000) != 0;
+            size_t toff = TILES + (size_t)tile * 32; if (toff + 32 > rom.size()) continue;
+            for (int r = 0; r < 8; ++r) {
+                int sr = vf ? (7 - r) : r;
+                uint8_t row[8];
+                for (int c = 0; c < 4; ++c) {
+                    uint8_t b = rom.u8(toff + (size_t)sr * 4 + c);
+                    row[c * 2] = b >> 4; row[c * 2 + 1] = b & 0x0F;
+                }
+                if (hf) for (int k = 0; k < 4; ++k) { uint8_t t = row[k]; row[k] = row[7 - k]; row[7 - k] = t; }
+                uint32_t* dst = &out[(size_t)(ty * 8 + r) * HUD_W + tx * 8];
+                for (int c = 0; c < 8; ++c) dst[c] = pal[row[c]];
+            }
+        }
+    return out;
+}
+
+static void decodeJuneMapAssets(GameData& gd, const Rom& rom) {
+    gd.bztMapBg = decodeJuneMapScreen(rom);
+    for (int i = 0; i < 256; ++i) gd.bztMapLut[(size_t)i] = rom.u8(0xDC30 + (size_t)i);
+    for (int i = 0; i < 8; ++i) {
+        size_t p = rom.u32(0x3B38 + (size_t)i * 4);
+        for (int r = 0; r < 4; ++r) {
+            uint16_t w = rom.u16(p + (size_t)r * 4);      // sub_003000 samples every +4 bytes
+            gd.bztMapBrick[(size_t)i][(size_t)r * 4 + 0] = (uint8_t)((w >> 12) & 0xF);
+            gd.bztMapBrick[(size_t)i][(size_t)r * 4 + 1] = (uint8_t)((w >>  8) & 0xF);
+            gd.bztMapBrick[(size_t)i][(size_t)r * 4 + 2] = (uint8_t)((w >>  4) & 0xF);
+            gd.bztMapBrick[(size_t)i][(size_t)r * 4 + 3] = (uint8_t)( w        & 0xF);
+        }
+    }
+    auto decodeTile8 = [&](int tile, std::array<uint8_t, 64>& out) {
+        static constexpr size_t MAP_TILES = 0x164B62;
+        static constexpr int VRAM_BASE_TILE = 0x274;      // command 0x4E800001 == tile 0x274
+        int rel = tile - VRAM_BASE_TILE; if (rel < 0) return;
+        size_t off = MAP_TILES + (size_t)rel * 32; if (off + 32 > rom.size()) return;
+        for (int r = 0; r < 8; ++r)
+            for (int c = 0; c < 4; ++c) {
+                uint8_t b = rom.u8(off + (size_t)r * 4 + c);
+                out[(size_t)r * 8 + c * 2]     = b >> 4;
+                out[(size_t)r * 8 + c * 2 + 1] = b & 0x0F;
+            }
+    };
+    decodeTile8(0x276, gd.bztMapPlayerMark);
+    decodeTile8(0x286, gd.bztMapObjectMark);
+}
+
 static void decodeHud(GameData& gd, const Rom& rom, const BuildAddrs& a) {
     gd.hud = decodeScreen320(rom, a.hudGfx, a.hudTm, a.hudPal, a.hudLineAdd);
     gd.pauseBg = decodeScreen320(rom, a.pauseGfx, a.pauseTm, a.pausePal, a.pauseLineAdd);  // фон меню паузы (руки+карта-PDA)
+    if (gd.build == Build::BZT_June) decodeJuneMapAssets(gd, rom);
 }
 
 // ── Декод шрифтов ZT (1-бит маска по «не-фон»; фон = самый частый ниббл глифа) ──
@@ -325,7 +429,10 @@ bool loadGameDataFromRom(GameData& gd, const Rom& rom) {
 
     gd.levels.clear(); gd.levels.resize(a.sig.size());
     for (size_t i = 0; i < a.sig.size(); ++i) {
-        loadLevelFromRom(gd.levels[i], rom, a.sig[i], a.animTableOff);
+        if (gd.build == Build::BZT_June)
+            loadLevelFromRomJune(gd.levels[i], rom, a.sig[i] - 0x86);   // заголовок эпизода = sig−0x86
+        else
+            loadLevelFromRom(gd.levels[i], rom, a.sig[i], a.animTableOff);
         gd.levels[i].area = (int)i;    // ROM -$58e4 = (levelByte>>4)&3 = эпизод (набор «небесных» cellID 13c36)
     }
     gd.profile.episodes = (int)gd.levels.size();
@@ -533,6 +640,7 @@ bool loadGameDataFromRom(GameData& gd, const Rom& rom) {
         gd.hudIconCount = a.hudIconCount;
         gd.hudIcons.assign((size_t)a.hudIconCount * 0x200, 0);
         for (size_t i = 0; i < gd.hudIcons.size(); ++i) gd.hudIcons[i] = rom.u8(a.hudIconBank + i);
+        gd.hudIconPal = gd.heldPal;                     // ZT/ZTU: иконки той же палитрой held (0x20D2)
     }
     if (a.hudDigitFont) for (int i = 0; i < 0x78; ++i) gd.digitFont[i] = rom.u8(a.hudDigitFont + i);  // шрифт цифр боезапаса
 
@@ -544,7 +652,10 @@ bool loadGameDataFromRom(GameData& gd, const Rom& rom) {
         gd.fontBig = decodeZtFontBig(rom, a.fontBigBank, a.fontBigTable, a.fontBigCount, a.fontBigPal);
 
     gd.shadeRamps.assign(0x1000, 0);
-    for (size_t i = 0; i < 0x1000; ++i) gd.shadeRamps[i] = rom.u8(a.shadeRampBase + i);
+    if (a.shadeRampBase)
+        for (size_t i = 0; i < 0x1000; ++i) gd.shadeRamps[i] = rom.u8(a.shadeRampBase + i);
+    else
+        for (size_t i = 0; i < 0x1000; ++i) gd.shadeRamps[i] = (uint8_t)(((i & 0xF0) | (i & 0x0F)));  // identity CLUT (затенение выкл)
 
     // Шаблоны пол/потолок (ОТДЕЛЬНЫЙ СЛОЙ, не скейлер). Сеттер 0x1d66 ставит указатель -0x7152 по env:
     //   env0 Bright=base+0x140, env1 Dim=base+0x00, env2 Haze=base+0xA0, env3 NoCeil=base+0x1E0,
@@ -558,13 +669,120 @@ bool loadGameDataFromRom(GameData& gd, const Rom& rom) {
                 gd.fcTemplates[(size_t)e * 0xA0 + i] = rom.u8(a.fcTemplateBase + envOff[e] + i);
     }
 
+    // ⭐BZT June: PER-EPISODE ресурсы из дескрипторов @0xB9B96 (14 лонгов × 0x38/эпизод) [VERIFIED]:
+    // +0x04 палитра (линия 0 блока 0x100), +0x10 CLUT-рампы 0x1000 (раскладка = ZT 0x3392: 8×0x100 + haze),
+    // +0x14..0x24 пять fc-шаблонов по 0xA0 (env-варианты), +0x28 банк стен. Порядок env пяти указателей
+    // пока ГИПОТЕЗА (0..4 подряд) — сверить визуально. Ключи клеток → стрид 128 (этажи до 80 клеток).
+    if (gd.build == Build::BZT_June) {
+        cellKeyStride() = 128;
+        const size_t DESC = 0xB9B96;
+        const int eps = (int)a.sig.size();
+        gd.wallEp.resize(eps); gd.objEp.resize(eps); gd.wallPalEp.resize(eps); gd.fcTemplatesEp.resize(eps);
+        gd.shadeRampsEp.resize(eps);
+        for (int e = 0; e < eps; ++e) {
+            const size_t d = DESC + (size_t)e * 0x38;
+            const size_t pal = rom.u32(d + 0x04), ramps = rom.u32(d + 0x10), bank = rom.u32(d + 0x28);
+            const size_t items = rom.u32(d + 0x34);            // items_imgs: 66 тайлов 0x200 (= ZT obj-банк;
+            gd.objEp[e].count = 66;                            //  эп.1: 0xC043E..0xC883E ровно 66×0x200 ✓)
+            gd.objEp[e].data.assign((size_t)66 * 512, 0);
+            for (size_t i = 0; i < gd.objEp[e].data.size(); ++i) gd.objEp[e].data[i] = rom.u8(items + i);
+            gd.wallEp[e].count = 255;
+            gd.wallEp[e].data.assign((size_t)255 * 512, 0);
+            for (size_t i = 0; i < gd.wallEp[e].data.size(); ++i) gd.wallEp[e].data[i] = rom.u8(bank + i);
+            gd.wallPalEp[e] = readPalette(rom, pal);
+            gd.fcTemplatesEp[e].assign(5 * 0xA0, 0);
+            // ⭐env→указатель градиента [VERIFIED 1D36]: env0→+0x1C(idx2), env1→+0x14(idx0),
+            // env2→+0x18(idx1), env3→+0x20(idx3), env4→+0x24(idx4) — ТА ЖЕ перестановка, что ZT envOff.
+            static const int envPtr[5] = { 2, 0, 1, 3, 4 };
+            for (int env = 0; env < 5; ++env) {
+                const size_t src = rom.u32(d + 0x14 + (size_t)envPtr[env] * 4);
+                for (size_t i = 0; i < 0xA0; ++i) gd.fcTemplatesEp[e][(size_t)env * 0xA0 + i] = rom.u8(src + i);
+            }
+            // ⭐env ЭТАЖА = light[] из дескриптора +0x00 [VERIFIED B226: $5436[floor] → SET ENV 1D12];
+            // байты @sig+0x1904 движок ПРОПУСКАЕТ (B94A4: adda #0x10 без копии). Семантика = ZT 0-4.
+            { const size_t light = rom.u32(d + 0x00);
+              for (int f = 0; f < gd.levels[e].floors; ++f) {
+                  uint8_t env = rom.u8(light + (size_t)f);
+                  gd.levels[e].envT[f] = (env <= 4) ? env : 0;
+              } }
+            gd.shadeRampsEp[e].assign(0x1000, 0);          // CLUT-рампы эпизода [VERIFIED 1D36: блок +0x10 =
+            for (size_t i = 0; i < 0x1000; ++i)            //  8 банд + haze @+0x800 — раскладка ZT 0x3392]
+                gd.shadeRampsEp[e][i] = rom.u8(ramps + i);
+            // ⭐КОКПИТ-HUD June [VERIFIED 2892, 2026-07-28]: тайлы 0x165562 (VRAM с базы 0x301) +
+            // неймтейбл 0x1673C2 (40×28 → VRAM C000), палитра эпизода = дескриптор +0x04 (полный CRAM
+            // 64 цвета; +0x08 = вариант 2). Поверх — НИЖНЯЯ ПАНЕЛЬ режима 0 из таблиц @0x2B66/0x2B7A:
+            // тайлы 0x15579A (база 0x3F4) + неймтейбл 0x156C7A (16×12 тайлов @ колонка 24, строка 16 —
+            // прав.нижн. панель 128×96, там радар E21C). Режимы 1-4 (-$6fac) — прочие панели, позже.
+            {
+                // [VERIFIED 1c470/1c3d2]: слова неймтейбла = ЧИСТЫЕ индексы от 0 (без флипов), при записи
+                // в VRAM добавляется база d3 (0xE301/0xE3F4) → палитро-ЛИНИЯ 3 фикс; тайлы грузятся с базы.
+                gd.hudEp.resize(eps);
+                std::vector<uint32_t>& out = gd.hudEp[e];
+                out.assign((size_t)HUD_W * HUD_H, 0xFF000000u);
+                uint32_t p16[16];
+                for (int i = 0; i < 16; ++i) p16[i] = cramToArgb(rom.u16(pal + (size_t)(48 + i) * 2));  // линия 3
+                auto blit = [&](size_t gfx, size_t tm, int tw, int th, int dx, int dy) {
+                    for (int ty = 0; ty < th; ++ty)
+                        for (int tx = 0; tx < tw; ++tx) {
+                            int idx = rom.u16(tm + (size_t)(ty * tw + tx) * 2);
+                            size_t toff = gfx + (size_t)idx * 32;
+                            if (toff + 32 > rom.size()) continue;
+                            for (int r = 0; r < 8; ++r) {
+                                uint32_t* dst = &out[(size_t)((dy + ty) * 8 + r) * HUD_W + (dx + tx) * 8];
+                                for (int c = 0; c < 4; ++c) {
+                                    uint8_t b = rom.u8(toff + (size_t)r * 4 + c);
+                                    dst[c * 2] = p16[b >> 4]; dst[c * 2 + 1] = p16[b & 0xF];
+                                }
+                            }
+                        }
+                };
+                blit(0x165562, 0x1673C2, 40, 28, 0, 0);            // базовый кокпит (вьюпорт-дыра — тайл 0?)
+                blit(0x15579A, 0x156C7A, 16, 12, 24, 16);          // нижняя-правая панель (режим 0: радар)
+            }
+            // ⭐ПАЛИТРЫ HUD June per-episode: held = ЛИНИЯ 1 CRAM эпизода (спрайты held: attr>>13=линия 1,
+            // 118E0/1208E), иконки инвентаря = ЛИНИЯ 3 (спрайты 103CE: attr 0xE49F).
+            gd.heldPalEp.resize(eps); gd.hudIconPalEp.resize(eps);
+            gd.heldPalEp[e]    = readPalette(rom, pal + 0x20);
+            gd.hudIconPalEp[e] = readPalette(rom, pal + 0x60);
+            if (e == 0) {   // эпизод 0 = стартовые gd.wall/wallPal/fcTemplates/рампы
+                gd.wallPal = gd.wallPalEp[0];
+                gd.fcTemplates = gd.fcTemplatesEp[0];
+                gd.shadeRamps = gd.shadeRampsEp[0];
+                if (!gd.hudEp[0].empty()) gd.hud = gd.hudEp[0];
+                gd.heldPal = gd.heldPalEp[0]; gd.hudIconPal = gd.hudIconPalEp[0];
+            }
+        }
+        // ⭐HELD-ГРАФИКА June [VERIFIED 117BC/0x1182E, 2026-07-28]: таблица 15 лонгов id→ROM-адрес,
+        // DMA → VRAM 0x9DE0 (тайл 0x4EF), блок ствола 0x150 слов = 672 б = 21 тайл (покой 3×4 + фазы);
+        // КУЛАКИ (0x16D9DA) — 3 куска 0x100/0xC0/0x90 слов, покой = спрайт 4×4 (32×32, табл. 1208E).
+        // Блоки НЕ подряд (кулак-блок 0x4A0) → нарезаем 15×672 ПО АДРЕСАМ таблицы (id=блок).
+        {
+            const size_t HELD_BLOCK = 672, TBL = 0x1182E;
+            gd.heldBlocks = 15;
+            gd.heldGfx.assign((size_t)15 * HELD_BLOCK, 0);
+            for (int id = 0; id < 15; ++id) {
+                size_t ptr = rom.u32(TBL + (size_t)id * 4);
+                for (size_t i = 0; i < HELD_BLOCK; ++i) gd.heldGfx[(size_t)id * HELD_BLOCK + i] = rom.u8(ptr + i);
+                gd.heldBlockForId[id] = (uint8_t)id;
+            }
+            gd.fistAction = std::vector<uint8_t>(gd.heldGfx.begin(), gd.heldGfx.begin() + HELD_BLOCK);  // фазы удара June — TODO (пока idle)
+        }
+        gd.wall = gd.wallEp[0]; gd.obj = gd.objEp[0];
+        gd.levelNames.clear();          // таблицы имён у June не найдено — генерим «EPISODE E LEVEL N»
+        for (int e = 0; e < 3; ++e) for (int f = 0; f < 16; ++f) {
+            char buf[24]; std::snprintf(buf, sizeof buf, "EPISODE %d LEVEL %d", e + 1, f + 1);
+            gd.levelNames.push_back(buf);
+        }
+    }
+
     setActiveCellTable(cellTableForBuild((int)gd.build));   // классификация клеток по билду (ZTU = US-семантика)
     loadZAngLUT(rom, a.angLUTAddr);                         // LUT углов (cos/sin ×256) — для fixed-point рендера стен
     loadZFanLUT(rom, a.angLUTAddr + 0x1000);                // веер лучей $9124 (блок: углы 0x800 + наклоны 0x800 + веер; сигнатура-валидация внутри)
     if (gd.build == Build::ZT || gd.build == Build::ZT_German)
         decodeEnemySprites(rom, gd.wallPal);               // реальные спрайты врагов (дерево 0x1B7B38… пал 0x20F2)
-    else if (a.enemyGfx[0])                                // ZTU: свои банки по слотам + свой CLUT, альт-банка FH нет
-        decodeEnemySprites(rom, gd.wallPal, a.enemyGfx, a.enemyAltFH, a.spriteClutAddr);
+    else if (a.enemyGfx[0])                                // ZTU/June: свои банки по слотам (June: формат кадра BZT)
+        decodeEnemySprites(rom, gd.wallPal, a.enemyGfx, a.enemyAltFH, a.spriteClutAddr,
+                           gd.build == Build::BZT_June || gd.build == Build::BZT_July);
 
     // ⭐КАРТОЧКИ БОЙЦОВ (экран выбора): 5 × 0x13E ASCII-блоков (рендер ZT sub_0c6934). Формат общий:
     // ZT @0xC6B36, ZTU @0x974D6 (тот же отряд U-RON, стрид/поля идентичны — verified дампом 2026-07-19).
@@ -754,17 +972,17 @@ bool loadGameDataFromRom(GameData& gd, const Rom& rom) {
             buildSpr((size_t)(0xC76F2 + D), 4, 4, gd.selPush);    // "PUSH START TO SELECT" 32×32
         }
 
-        // ⭐СТРЕЛКА-КУРСОР МЕНЮ ОПЦИЙ (ROM sub_10B4C8: спрайт tile 0x4AE верх / 0x4AF низ, палитра line0 0x10CBDC).
-        //   Тайлы лежат линейно @0x10CB7C (2 тайла по 32 Б). Адреса ZT-релизные → декодируем только для ZT.
-        if (gd.build == Build::ZT) {
+        // ⭐СТРЕЛКА-КУРСОР МЕНЮ ОПЦИЙ: 2 тайла 8×8, горизонтально. В ZTU sub_0DC224 грузит
+        //   идентичные ZT-данные из своих адресов; адреса держим в BuildAddrs, чтобы не взять мусор в других билдах.
+        if (a.optArrowGfx && a.optArrowPal && a.optArrowGfx + 64 <= rom.size() && a.optArrowPal + 32 <= rom.size()) {
             uint32_t ap[16];
-            for (int i = 0; i < 16; ++i) { uint16_t c = rom.u16((size_t)0x10CBDC + i * 2);
+            for (int i = 0; i < 16; ++i) { uint16_t c = rom.u16(a.optArrowPal + i * 2);
                 int r = ((c >> 1) & 7) * 255 / 7, g = ((c >> 5) & 7) * 255 / 7, b = ((c >> 9) & 7) * 255 / 7;
                 ap[i] = (i == 0) ? 0u : (0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b); }
             // ⭐Спрайт 16×8 = 2 тайла ГОРИЗОНТАЛЬНО (SAT size d1=0x400 → w=2,h=1): 0x4AE=левая половина, 0x4AF=правая.
             //   Стрелка «────►» вправо; хранение 16 шириной × 8 высотой.
             for (int half = 0; half < 2; ++half) {               // half0 = левый тайл, half1 = правый
-                size_t data = (size_t)0x10CB7C + (size_t)half * 32; if (data + 32 > rom.size()) continue;
+                size_t data = a.optArrowGfx + (size_t)half * 32;
                 for (int r = 0; r < 8; ++r)
                     for (int c = 0; c < 4; ++c) {
                         uint8_t b = rom.u8(data + (size_t)r * 4 + c);

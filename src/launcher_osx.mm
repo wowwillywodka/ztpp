@@ -206,18 +206,22 @@ namespace { enum { LR_RUNNING = -1, LR_QUIT = 0, LR_PLAY = 1 }; }
     if ([cid isEqualToString:@"file"])   return [NSString stringWithUTF8String:e.file.c_str()];
     if ([cid isEqualToString:@"build"])  return [NSString stringWithUTF8String:launcher::buildLabel(e.build)];
     if ([cid isEqualToString:@"size"])   return [NSString stringWithFormat:@"%.1f MB", (double)e.size / (1024.0 * 1024.0)];
-    if ([cid isEqualToString:@"status"]) {
-        if (e.build == Build::ZTU) return @"Partially supported";
-        return e.supported ? @"Supported" : @"Not supported yet";
-    }
+    if ([cid isEqualToString:@"status"]) return [NSString stringWithUTF8String:launcher::buildStatus(e.build)];
     return @"";
 }
-// Неподдерживаемые билды — серым (как NOT SUPPORTED YET в SDL-фолбэке).
+// Цвет всей строки по семейству ROM: ZT зелёный, ZTU жёлтый, BZT красный.
 - (void)tableView:(NSTableView*)t willDisplayCell:(id)cell forTableColumn:(NSTableColumn*)col row:(NSInteger)row {
     if (![cell isKindOfClass:[NSTextFieldCell class]]) return;
     if (!_entries || row < 0 || row >= (NSInteger)_entries->size()) return;
-    BOOL sup = (*_entries)[(size_t)row].supported;
-    [(NSTextFieldCell*)cell setTextColor:(sup ? [NSColor controlTextColor] : [NSColor disabledControlTextColor])];
+    const launcher::Entry& e = (*_entries)[(size_t)row];
+    NSColor* color = e.supported ? [NSColor controlTextColor] : [NSColor disabledControlTextColor];
+    switch (launcher::buildTextTone(e.build)) {
+        case launcher::TextTone::Green:  color = [NSColor colorWithCalibratedRed:0.20 green:0.72 blue:0.30 alpha:1.0]; break;
+        case launcher::TextTone::Yellow: color = [NSColor colorWithCalibratedRed:0.90 green:0.70 blue:0.12 alpha:1.0]; break;
+        case launcher::TextTone::Red:    color = [NSColor colorWithCalibratedRed:0.90 green:0.25 blue:0.22 alpha:1.0]; break;
+        default: break;
+    }
+    [(NSTextFieldCell*)cell setTextColor:color];
 }
 - (void)tableViewSelectionDidChange:(NSNotification*)n { [self refreshDetail]; }
 

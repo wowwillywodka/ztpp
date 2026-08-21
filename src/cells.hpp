@@ -39,8 +39,17 @@ struct CellClassTable {
             {84,8},{85,8},{86,8},{87,8},{88,8},{89,8},{90,8},{91,8},
             {92,16},{93,16},{94,16},{95,16},{96,16},{97,16},{98,16},{99,16},{100,16},
             {101,10},{102,10},{103,10},{104,10},{105,10},{106,10},{107,10},
-            {108,16},{117,16},{118,16},{119,9},{120,16},
-            {121,15},{122,11},{123,15},{124,11},{125,11},{126,11},{127,15},
+            // ⭐ТРУПЫ-ЦЕЛЛТАЙПЫ 0x6C-0x74 [VERIFIED 2026-07-28, дескрипторы @0xAB0C +0x19]: FH/Imp/Hydaca/
+            // Revenant/Boss1/Dog/FH-SF/Boss3/Boss2. В таблице была дыра 109-116 (дефолт=СТЕНА) — в ZT-картах
+            // они не встречались, а ZTU кладёт их в карту (cellID 0xD2-0xDA, напр. D4=труп Hydaca) →
+            // рисовался блок-стена поверх трупа (юзер). Проходимы, рендер = corpse-биллборд (decorCorpseSlot).
+            {108,16},{109,16},{110,16},{111,16},{112,16},{113,16},{114,16},{115,16},{116,16},
+            {117,16},{118,16},{119,9},{120,16},
+            // 0x79..0x80 = простреливаемые/секретные стены. 3D-диспетчер ROM
+            // ($923a -> $9458) рисует всё семейство стеной; прежняя разметка
+            // 0x79/7B/7F как decor пропускала луч сквозь них и брала не тот путь
+            // метатекстуры. После попадания типы переходят в 0x7A/7C/7E/80.
+            {121,1},{122,1},{123,1},{124,1},{125,1},{126,1},{127,1},{128,1},
             {129,8},{130,12},{131,15},{132,15},  // 0x83(гориз)/0x84(верт) = ФЕЙК-ДВЕРИ (CELL_DEFS «Fake horiz/vert door»): рисуются (icon14 sht_wall, тайл 33)
             //   + БЛОКИРУЮТ (collision) + камера-тревога 0x26 УБИРАЕТ (b130 гориз/b168 верт, requestDestruct→пусто). Пуля/граната НЕ ломают.
             //   ⚠ztextractor CELL_DEFS даёт maptype16→icon15(decor)=НЕВЕРНО (не блокировали); порт → icon14 (game-true). Пример: cellId 0xA7→0x84 (e2f5), 0xA8→0x83 (e2f6).
@@ -48,6 +57,43 @@ struct CellClassTable {
         for (const auto& p : ov) maptype[p.ct] = p.mt;
     }
 };
+// ⭐BZT June: таблица по ИГРОВОЙ семантике [VERIFIED LUT коллизии @0xDC30 + загрузчик 0xB94A4,
+// findings «BZT June: СТРУКТУРА ДВИЖКА» 2026-07-24]. Отличия от ZT: враги = ct {8,9,A,27,29-2C,65-6B}
+// (в ZT 8-B = окружение); старт = 0x77 (как ZT); 0x79/7A/7C/7E/80 = СТЕНЫ (0x7B/7D/7F секретки);
+// дефолт НЕИЗВЕСТНОГО ct = 0 (проход) — по LUT всё неперечисленное проходимо (в ZT дефолт = стена).
+// Двери 6/7 и лифты/лестницы (0x12-0x17, 0x31-0x34, 0x50-0x5B) — ZT-аналогия, НЕ верифицированы.
+struct JuneCellTable : CellClassTable {
+    JuneCellTable() {
+        for (int i = 0; i < 256; ++i) maptype[i] = 0;                       // дефолт: проходимо (LUT DC30)
+        maptype[1] = 1;                                                     // стена
+        for (int i = 2; i <= 5; ++i) maptype[i] = (uint8_t)i;               // углы
+        maptype[6] = 6; maptype[7] = 7;                                     // двери [ANALOGY]
+        for (int i = 0x0C; i <= 0x11; ++i) maptype[i] = 14;                 // лестничные стены
+        for (int i = 0x12; i <= 0x17; ++i) maptype[i] = 8;                  // ступени/переходы
+        maptype[0x18] = 8;                                                  // пламя (step-on 12cd8)
+        for (int i = 0x19; i <= 0x26; ++i) maptype[i] = 13;                 // предметы (веса позже)
+        static const uint8_t wp[] = {0x1A,0x1F,0x20,0x22,0x23,0x24,0x25,0x26};  // оружейные идексы BZT
+        for (uint8_t w : wp) maptype[w] = 12;
+        // ⭐ВРАГИ June [VERIFIED 2026-07-28 рендер-таблица @0x8A20]: RedRobo 0x29, Purple 0x2A,
+        // Man {0x09,0x27,0x66,0x68,0x69,0x6A}, RedMan 0x65, GrenMan 0x08. 0x0A/0x2B/0x2C/0x67/0x6B
+        // ведут в 8C3E (пусто) — НЕ враги (прежний список был гипотезой и спавнил мусор).
+        static const uint8_t en[] = {0x08,0x09,0x27,0x29,0x2A,0x65,0x66,0x68,0x69,0x6A};
+        for (uint8_t e : en) maptype[e] = 10;
+        maptype[0x2F] = 8;                                                  // блокер
+        maptype[0x30] = 14;                                                 // лифт-стены
+        for (int i = 0x31; i <= 0x34; ++i) maptype[i] = 8;                  // лифт [ANALOGY]
+        for (int i = 0x50; i <= 0x5B; ++i) maptype[i] = 8;                  // лифт-грани [ANALOGY]
+        for (int i = 0x38; i <= 0x3B; ++i) maptype[i] = 14;                 // стены (LUT=1)
+        for (int i = 0x40; i <= 0x43; ++i) maptype[i] = 14;
+        for (int i = 0x48; i <= 0x4B; ++i) maptype[i] = 14;
+        maptype[0x77] = 9;                                                  // старт игрока (как ZT)
+        maptype[0x79] = 1; maptype[0x7A] = 1; maptype[0x7C] = 1; maptype[0x7E] = 1; maptype[0x80] = 1;
+        maptype[0x7B] = 15; maptype[0x7D] = 15; maptype[0x7F] = 15;         // секрет-стены (отстрел)
+        maptype[0x83] = 14; maptype[0x84] = 14;                             // разрушаемые
+        maptype[0x81] = 8; maptype[0x82] = 8; maptype[0x85] = 8;            // цель/выход
+    }
+};
+
 // ── Build-выбираемая таблица классификации (мульти-билд) ──
 // По умолчанию — ZT. loadGameDataFromRom ставит таблицу по билду через setActiveCellTable.
 // (Нем. билд меняет врагов на Alien, прото отличаются — их таблицы добавятся позже.)
@@ -58,7 +104,12 @@ inline const CellClassTable& cellTable() {
     return activeCellTablePtr() ? *activeCellTablePtr() : ztCellTable();
 }
 // Таблица классификации по индексу билда (Build enum в gamedata.hpp): сейчас все → ZT.
-inline const CellClassTable* cellTableForBuild(int /*build*/) { return &ztCellTable(); }
+inline const CellClassTable& juneCellTable() { static JuneCellTable t; return t; }
+// build = (int)Build: 0 ZT, 1 ZTU, 2 BZT_June, 3 BZT_July, 4 ZT_German.
+inline const CellClassTable* cellTableForBuild(int build) {
+    if (build == 2) return &juneCellTable();
+    return &ztCellTable();
+}
 
 inline int  cellIcon(uint8_t ct)  { return MAPTYPE_ICON[cellTable().maptype[ct]]; }
 inline bool iconWall(int ic)      { return ic==1||ic==2||ic==3||ic==4||ic==5||ic==12||ic==14; }
@@ -78,9 +129,18 @@ inline bool doorIsHoriz(uint8_t ct)    { return cellIcon(ct) == 6 || ct == 0x83;
 
 // ── СОСТОЯНИЕ ДВЕРЕЙ (0=закрыта..1=открыта) — здесь, чтобы видели и actors (LOS/спавн), и raycaster (рендер). ──
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 inline std::unordered_map<int, double>& doorMap() { static std::unordered_map<int, double> m; return m; }
-inline int    doorKey(int f, int x, int y) { return ((f * 32 + y) * 32 + x); }
+// ⭐УДЕРЖАНИЕ ДВЕРИ АКТЁРОМ [ROM b3ae-b3d4]: b35c держит/открывает дверь, пока в её клетке актёр с бит4
+// (живой враг; смерть чистит бит4 andi #$ff2f @184fa/189fa/15662 → ТРУП дверь НЕ держит). Порт: враги
+// помечают дверные клетки сюда (openDoorsAtEnemies), rcUpdateDoors читает как «кто-то в клетке».
+inline std::unordered_set<int>& doorHoldSet() { static std::unordered_set<int> s; return s; }
+// ⭐СТРИД КЛЕТОЧНЫХ КЛЮЧЕЙ (doorKey/pickKey/огни): ZT/ZTU = 32 (формула прежняя, сейвы совместимы);
+// June — этажи до 80 клеток → 128 (ставит loadGameDataFromRom; сейвы June в своём профиле).
+inline int&   cellKeyStride() { static int s = 32; return s; }
+inline int    cellKey(int f, int x, int y) { const int s = cellKeyStride(); return ((f * s + y) * s + x); }
+inline int    doorKey(int f, int x, int y) { return cellKey(f, x, y); }
 inline double doorOpen(int f, int x, int y) { auto& m = doorMap(); auto it = m.find(doorKey(f, x, y)); return it == m.end() ? 0.0 : it->second; }
 
 // ── РАЗРУШАЕМЫЕ/СЕКРЕТ-СТЕНЫ (ZT walls_destruct: b130/b168 разруш., a6bc секрет/пуле-метка) ──
@@ -161,19 +221,20 @@ inline bool cellBlockedForEnemy(uint8_t ct, double fx, double fy) {
     (void)fx; (void)fy;
     return enemyBlocksCell(ct);                 // LUT (двери 06/07 тоже =1 = препятствие)
 }
-// Вариант ДЛЯ ДВИЖЕНИЯ (знает клетку): враг, упёршийся в закрытую дверь, ОТКРЫВАЕТ её (фаза +0x20/кадр,
-// как b1c4) и проходит, когда приоткрылась (порог 0.4). Прочие клетки — по enemy-LUT (стены/лестницы/
-// лифт/пламя/разрушаемые блокируют).
-// canOpen: только 5 дверь-открывающих типов врагов (Sgt 0x29/FH-SF 0x69/Boss1 0x67/Boss2 0x6B/Boss3 0x6A, ZT b1c4/b202)
-// ТОЛКАЮТ закрытую створку. Прочие (FH 0x2A/Imp 0x2B/Hydaca 0x65/Revenant 0x66/Dog 0x68) двери НЕ открывают — закрытая
-// дверь их БЛОКИРУЕТ (проходят лишь уже открытую, напр. открытую опенером или игроком). corpse/стаггер → canOpen=false.
+// Вариант ДЛЯ ДВИЖЕНИЯ (знает клетку). canOpen: только 5 дверь-открывающих типов врагов
+// (Sgt 0x29/FH-SF 0x69/Boss1 0x67/Boss2 0x6B/Boss3 0x6A, ZT b1c4/b202). Прочие (FH/Imp/Hydaca/Revenant/Dog)
+// двери НЕ открывают — закрытая дверь их БЛОКИРУЕТ (проходят лишь уже открытую). corpse/стаггер → canOpen=false.
+// ⭐ROM 18c90-18d76 [VERIFIED 2026-07-28]: опенер с дверью в ПОЛУКЛЕТКЕ по ходу (pos+vel·8, lsl #3)
+// ПЕРЕМЕЩАЕТСЯ В КЛЕТКУ двери (18d0c/18d42), создаёт запись b1c4/b202 (+0x67 d740) и, стоя в клетке,
+// ДЕРЖИТ её открытой (b3ae) — створка анимируется под ним. Порт: опенеру дверь НЕ преграда — он входит
+// в клетку движением, а openDoorsAtEnemies создаёт запись + звук ОДИН раз. Прежний вариант толкал фазу
+// здесь (+0.20/тик) и конкурировал с закрытием rcUpdateDoors (−0.25/тик, враг не в клетке) — фаза
+// дребезжала у нуля → «зацикленный звук двери» (юзер: Sgt/FH-SF упёрся в дверь).
 inline bool enemyBlockedAt(uint8_t ct, int f, int cx, int cy, double fx, double fy, bool canOpen = false) {
     (void)fx; (void)fy;
     if (cellIsDoor(ct)) {
-        auto& m = doorMap(); int k = doorKey(f, cx, cy);
-        double o = m.count(k) ? m[k] : 0.0;
-        if (canOpen && o < 1.0) { double no = o + 0.20 * simDt(); m[k] = no > 1.0 ? 1.0 : no; }  // опенер толкает створку (ZT b1c4/b202; simDt: fps-инвариант)
-        return o < 0.4;                          // закрытая (<0.4) блокирует всех; открытую проходят все
+        if (canOpen) return false;               // опенер входит в дверную клетку (ROM: телепорт в клетку + запись)
+        return doorOpen(f, cx, cy) < 0.4;        // закрытая (<0.4) блокирует НЕ-опенеров; открытую проходят все
     }
     return enemyBlocksCell(ct);                  // enemy-LUT (НЕ полуплоскость игрока)
 }

@@ -37,7 +37,7 @@ inline std::string truncRight(const std::string& s, size_t n) {
 inline void drawLauncher(FB& fb, const State& st) {
     const uint32_t BG = 0xFF0C0C10, PANEL = 0xFF15151C, SELBG = 0xFF20301E, ACCENT = 0xFF6CD86C,
                    WHITE = 0xFFE8E8E8, GREY = 0xFF8A8A92, DGREY = 0xFF55555C, RED = 0xFFE86050,
-                   YELLOW = 0xFFE8D06C;
+                   YELLOW = 0xFFE8D06C, GREEN = 0xFF6CD86C;
     fb.clear(BG);
     // Шапка
     fb.rect(0, 0, LNC_W, 56, PANEL);
@@ -67,8 +67,14 @@ inline void drawLauncher(FB& fb, const State& st) {
             fb.rect(LIST_X, y, LIST_W, ROW_H, SELBG);
             fb.rect(LIST_X, y, 4, ROW_H, ACCENT);
         }
-        uint32_t nameCol = e.supported ? WHITE : DGREY;
-        uint32_t infoCol = e.supported ? ACCENT : GREY;
+        uint32_t nameCol = DGREY;
+        switch (buildTextTone(e.build)) {
+            case TextTone::Green:  nameCol = GREEN;  break;
+            case TextTone::Yellow: nameCol = YELLOW; break;
+            case TextTone::Red:    nameCol = RED;    break;
+            default: if (e.supported) nameCol = WHITE; break;
+        }
+        uint32_t infoCol = nameCol;
         drawText(fb, LIST_X + 12, y + 4, truncRight(e.file, 36).c_str(), nameCol, 2);
         char info[96];
         std::snprintf(info, sizeof(info), "%-28s %4.1f MB  %s",

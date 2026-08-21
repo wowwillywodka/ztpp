@@ -388,10 +388,22 @@ void mix(void*, Uint8* stream, int len) {
     }
 }
 
+// ⭐ПЕРФ-ДИАГНОСТИКА СТАТТЕРОВ: SDL_LockAudioDevice из главного потока ЖДЁТ конца аудио-коллбека
+// (Nuked-OPN2 рендерит буфер несколько мс) — при коллизии главный поток встаёт. Меряем худшее ожидание
+// за кадр; main забирает через takeAudioLockWaitMs() (перф-оверлей `perfstat`).
+static double s_lockWaitMs = 0.0;
+double takeAudioLockWaitMs() { double v = s_lockWaitMs; s_lockWaitMs = 0.0; return v; }
+static void lockDev() {
+    Uint64 t0 = SDL_GetPerformanceCounter();
+    SDL_LockAudioDevice(dev());                       // сам лок — только здесь (⚠ не lockDev: была авто-замена → бесконечная рекурсия)
+    double ms = (double)(SDL_GetPerformanceCounter() - t0) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+    if (ms > s_lockWaitMs) s_lockWaitMs = ms;
+}
+
 // ── ВОСПРОИЗВЕДЕНИЕ ──
 void play(int id) {
     if (!soundOn() || !dev() || id < 0 || id >= (int)samples().size()) return;
-    SDL_LockAudioDevice(dev());
+    lockDev();
     dacStartRaw(id);
     SDL_UnlockAudioDevice(dev());
 }
@@ -412,7 +424,7 @@ void dacStartRaw(int s) {
 // ЯДРО без лока (зов из аудио-потока секвенсером ИЛИ под локом из playNoise)
 void playNoise(int patchIdx) {
     if (!soundOn() || !dev()) return;
-    SDL_LockAudioDevice(dev());
+    lockDev();
     noiseOnRaw(patchIdx);
     SDL_UnlockAudioDevice(dev());
 }
@@ -442,7 +454,7 @@ void noiseOnRaw(int patchIdx) {
 void playFm(int patchIdx, int note, double hold, double tail) {
     if (!soundOn() || !dev() || patchIdx < 0 || patchIdx >= (int)patches().size()) return;
     const FmPatch& fp = patches()[patchIdx]; if (!fp.ok) return;
-    SDL_LockAudioDevice(dev());
+    lockDev();
     // ⭐АЛЬТЕРНАТОР SFX (68k c61c6/c6220): FM-SFX идут на ДВА выделенных GEMS-канала 0xD/0xE попеременно
     // ($FF270A), с note-off ПРЕДЫДУЩЕЙ ноты канала перед новой (cmd1) — хвост звенит до следующего-через-
     // один SFX. Каналы зарезервированы от музыки (cmd 0x1C бит5), но ГОЛОСА — общий пул с равным prio.
@@ -475,12 +487,12 @@ void playFm(int patchIdx, int note, double hold, double tail) {
 }
 
 // ── МУЗЫКА ──
-void musicStop() { if (!dev()) return; SDL_LockAudioDevice(dev()); musicStopLocked(); SDL_UnlockAudioDevice(dev()); }
+void musicStop() { if (!dev()) return; lockDev(); musicStopLocked(); SDL_UnlockAudioDevice(dev()); }
 // ⭐ПАУЗА (ROM GEMS cmd 0x0D sustain-all / 0x0C resume-all, 68k-обёртки c6344/c633a: пауза игры):
 // секвенции замирают (SET4), звучащие ноты глушатся, позиции/тик сохранены — resume продолжает с места.
 void musicSetPaused(bool p) {
     if (!dev()) return;
-    SDL_LockAudioDevice(dev());
+    lockDev();
     GemsMusic& m = music();
     if (m.active && m.paused != p) {
         m.paused = p;
@@ -502,7 +514,7 @@ bool musicPlay(int song, int tempo) {
     if (!dev() || m.seq.empty()) return false;
     int n = musicSongCount();
     if (song < 0 || song >= n) return false;
-    SDL_LockAudioDevice(dev());
+    lockDev();
     musicStopLocked();
     int st = m.seq[song * 2] | (m.seq[song * 2 + 1] << 8);
     if (st + 1 >= (int)m.seq.size()) { SDL_UnlockAudioDevice(dev()); return false; }
@@ -625,7 +637,7 @@ void playSfxNote(int id, int note) {
 // SOUND TEST: заглушить все SFX-голоса (FM key-off + DAC-стоп). Музыку не трогаем.
 void stopAllSfx() {
     if (!dev()) return;
-    SDL_LockAudioDevice(dev());
+    lockDev();
     for (int i = 0; i < FM_SFX_CH; ++i) { FmVoice& v = fmv()[i]; if (v.active) {
         int part, cofs, keych; chAddr(v.ch, part, cofs, keych); (void)part; (void)cofs;
         wr(0, 0x28, keych); v.active = false; v.keyOff = 0; } }
@@ -637,6 +649,12 @@ void stopAllSfx() {
 
 // ── ЗАГРУЗКА: таблица DAC-сэмплов + банк FM-патчей + секвенции + SFX-таблица + чип/аудио ──
 void load(const Rom& rom, size_t sampBase, size_t patchBase, size_t seqBase, size_t sfxBase) {
+    // Билд без вскрытых GEMS-банков (June: все базы 0) → звук выключен (иначе мусор с ROM-офсета 0).
+    if (!sampBase && !patchBase && !seqBase && !sfxBase) {
+        samples().clear(); patches().clear(); patchTypes().clear(); psgInsts().clear();
+        music().seq.clear(); sfxTable().clear();
+        return;
+    }
     // 1) DAC-сэмплы (записи 12 байт). Пустые слоты-заглушки (start=0,dlen=0) ЗАНИМАЮТ индекс (тишина),
     //    но НЕ обрывают таблицу. ZT: пустые на 73 и 75; всего 93 слота (91 сэмпл).
     samples().clear();
@@ -714,7 +732,7 @@ void load(const Rom& rom, size_t sampBase, size_t patchBase, size_t seqBase, siz
     inited() = true;
     // 4) SDL аудио (стерео S16 @44100); чип тактируется в колбэке
     SDL_AudioSpec want{}, have{};
-    want.freq = 44100; want.format = AUDIO_S16SYS; want.channels = 2; want.samples = 1024; want.callback = mix;
+    want.freq = 44100; want.format = AUDIO_S16SYS; want.channels = 2; want.samples = 512; want.callback = mix;
     dev() = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
     if (dev()) { devRate() = have.freq;
         wr(0, 0x2A, 0x80);                                   // DAC центр ($2B ДИНАМИЧЕСКИ в genNative:

@@ -27,7 +27,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
             case AT_BULLET: {                            // летит → взрыв о стену / по ВРАГУ / по истечении
                 double nx = a.x + a.vx, ny = a.y + a.vy;
                 int cx = (int)nx, cy = (int)ny;
-                bool hit = (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) ||
+                bool hit = (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) ||
                            cellBlockedAt(lvl.cellType(a.floor, cx, cy), nx - cx, ny - cy);  // диагональ-полуплоскость
                 // ⭐РАКЕТА ЗА КРАЙ КАРТЫ над крышей (ROM 14076 @1409c: X+vx ≥ 0x1F00 и ТЕКУЩАЯ клетка
                 // 0x27/0x28 → jsr 28b4(#$120) + free БЕЗ взрыва) — снаряд «улетает на фоновый слой»:
@@ -35,7 +35,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                 // (ROM для 0x27 требует Z снаряда >0 — порт высоту ракеты не моделирует, гейт опущен.)
                 if (hit && nx >= 31.0 && faSnipers()) {
                     int ocx = (int)a.x, ocy = (int)a.y;
-                    uint8_t oct = (ocx >= 0 && ocy >= 0 && ocx < Level::W && ocy < Level::H)
+                    uint8_t oct = (ocx >= 0 && ocy >= 0 && ocx < lvl.W && ocy < lvl.H)
                                   ? lvl.cellType(a.floor, ocx, ocy) : 0;
                     if (oct == 0x27 || oct == 0x28) { snip::aimTrigger(0x120); a.active = false; break; }
                 }
@@ -43,7 +43,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                 // cellID) → снаряд исчезает БЕЗ взрыва — «улетел в небо». ROM берёт high по Z снаряда $24
                 // (ракета наследует питч стрелка) — порт высоту ракеты не моделирует, high=true всегда
                 // (отступление: из приседа ракета о парапет в ROM взорвалась бы).
-                if (hit && cx >= 0 && cy >= 0 && cx < Level::W && cy < Level::H &&
+                if (hit && cx >= 0 && cy >= 0 && cx < lvl.W && cy < lvl.H &&
                     cellBlockedAt(lvl.cellType(a.floor, cx, cy), nx - cx, ny - cy) &&
                     bulletSkyCellId(lvl, lvl.cellId(a.floor, cx, cy), true)) { a.active = false; break; }
                 // РАКЕТА В ВРАГА (ZT снаряд 15f6e: актёр в ≤0x40≈0.25кл → детонация) — иначе пролетала насквозь.
@@ -52,15 +52,15 @@ void updateActors(const Level& lvl, const Camera& cam) {
                                                 gameDist(e.x - nx, e.y - ny) < 0.5) { hit = true; break; }
                 if (hit) {                                // взрыв ЧУТЬ ПЕРЕД стеной (иначе z-режется стеной)
                     double sp = std::hypot(a.vx, a.vy);
-                    if (sp > 0 && (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H ||
+                    if (sp > 0 && (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H ||
                                    cellBlockedAt(lvl.cellType(a.floor, cx, cy), nx - cx, ny - cy))) {
                         // ⭐ИМПАКТ РАКЕТЫ ломает СЕКРЕТ-СТЕНУ в клетке удара (ROM 14114: a6bc по клетке)
-                        if (cx >= 0 && cy >= 0 && cx < Level::W && cy < Level::H &&
+                        if (cx >= 0 && cy >= 0 && cx < lvl.W && cy < lvl.H &&
                             wallIsSecret(lvl.cellType(a.floor, cx, cy))) requestDestruct(a.floor, cx, cy);
                         a.x -= a.vx / sp * 0.4; a.y -= a.vy / sp * 0.4;
                     }
-                    a.active = false; explodeAt(lvl, a.x, a.y, a.floor, cam);   // взрыв ракеты (blast — на 2-м тике жизни взрыва)
-                } else { a.x = nx; a.y = ny; if (--a.timer <= 0) { a.active = false; explodeAt(lvl, a.x, a.y, a.floor, cam); } }
+                    a.active = false; explodeAt(lvl, a.x, a.y, a.floor, cam, 0.5, a.weaponId);   // взрыв ракеты
+                } else { a.x = nx; a.y = ny; if (--a.timer <= 0) { a.active = false; explodeAt(lvl, a.x, a.y, a.floor, cam, 0.5, a.weaponId); } }
                 break;
             }
             case AT_GRENADE: {                           // ФИЗИКА (0x13adc): дуга+гравитация+отскок, фитиль → взрыв
@@ -71,10 +71,10 @@ void updateActors(const Level& lvl, const Camera& cam) {
                     int gx = (int)a.x, gy = (int)a.y;
                     for (int oy = -1; oy <= 1; ++oy) for (int ox = -1; ox <= 1; ++ox) {
                         int wx = gx + ox, wy = gy + oy;
-                        if (wx >= 0 && wy >= 0 && wx < Level::W && wy < Level::H &&
+                        if (wx >= 0 && wy >= 0 && wx < lvl.W && wy < lvl.H &&
                             wallIsSecret(lvl.cellType(a.floor, wx, wy))) requestDestruct(a.floor, wx, wy);
                     }
-                    explodeAt(lvl, a.x, a.y, a.floor, cam, a.z); a.active = false; break;   // взрыв на ВЫСОТЕ гранаты (z)
+                    explodeAt(lvl, a.x, a.y, a.floor, cam, a.z, a.weaponId); a.active = false; break;   // взрыв на ВЫСОТЕ гранаты (z)
                 }
                 double nx = a.x + a.vx, ny = a.y + a.vy;   // горизонталь + отскок от стен (reflect+damp, как neg/asr)
                 bool bounced = false;
@@ -85,7 +85,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                     return cellBlocks(gc) || (cellIsDoor(gc) && doorOpen(a.floor, cx, cy) < 0.4); };
                 if (gBlk((int)nx, (int)a.y)) { a.vx = -a.vx * 0.5; nx = a.x; bounced = true; }
                 if (gBlk((int)a.x, (int)ny)) { a.vy = -a.vy * 0.5; ny = a.y; bounced = true; }
-                if (nx >= 0 && ny >= 0 && nx < Level::W && ny < Level::H) { a.x = nx; a.y = ny; }
+                if (nx >= 0 && ny >= 0 && nx < lvl.W && ny < lvl.H) { a.x = nx; a.y = ny; }
                 a.vz -= 0.0035; a.z += a.vz;               // гравитация ($2e -= ; $24 += )
                 if (a.z <= 0) { a.z = 0; if (a.vz < -0.02) { a.vz = -a.vz * 0.4; a.vx *= 0.7; a.vy *= 0.7; bounced = true; } else a.vz = 0; }  // отскок от пола
                 if (bounced && a.floor == cam.floor) snd::playSfx(0x6c);   // РИКОШЕТ гранаты о стену = 0x6c (ZT think 0x13b0a: play 0x6c → neg/asr velocity); тот же «клац», что установка мины
@@ -98,7 +98,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                 a.z += a.vz; a.vz -= 0.006;                                           // всплыв (z-vel вверх) → опад (гравитация +1/кадр)
                 double nx = a.x + a.vx, ny = a.y + a.vy;
                 int cx = (int)nx, cy = (int)ny;
-                bool land = (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) ||
+                bool land = (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) ||
                             cellBlocks(lvl.cellType(a.floor, cx, cy)) || a.z <= 0.0 || --a.timer <= 0;  // стена / пол / таймаут
                 if (land) {
                     // ⭐УРОН ИМПАКТА (ZT 14300): AoE радиус 0x100=1кл + LOS, урон = 0x400−dist (ZT 15732: d0=0x400−dist, HP−=d0).
@@ -110,12 +110,12 @@ void updateActors(const Level& lvl, const Camera& cam) {
                             // ⭐СПАЛЁН ОГНЁМ (ZT: receive пишет +0x30 из огонь-флага −$5910; death читает +0x30 → 1b8d8 BURNT REMAINS).
                             //   ГОРЮЧИЕ (органика): Sgt 0x29/FH 0x2A/Imp 0x2B/Hydaca 0x65/Dog 0x68/FH-SF 0x69 (death-путь 1b8d8: 1b4a0/184f2/
                             //   189f2/1565a/19808/19e50). НЕ горят: боссы + Revenant 0x66 (робот). Труп → burnt-remains СПРАЙТ, не перекраска.
-                            switch (e.srcType) { case 0x29: case 0x2A: case 0x2B: case 0x65: case 0x68: case 0x69: e.burned = true; break; }
-                            hitEnemy(e, raw / 100 < 1 ? 1 : raw / 100, a.x, a.y, raw);
+                            if (!juneEnemies()) switch (e.srcType) { case 0x29: case 0x2A: case 0x2B: case 0x65: case 0x68: case 0x69: e.burned = true; break; }
+                            hitEnemy(e, raw / 100 < 1 ? 1 : raw / 100, a.x, a.y, raw, 13);
                         }
                     }
                     int fx0 = (int)a.x, fy0 = (int)a.y;
-                    if (fx0 >= 0 && fy0 >= 0 && fx0 < Level::W && fy0 < Level::H && !cellBlocks(lvl.cellType(a.floor, fx0, fy0)))
+                    if (fx0 >= 0 && fy0 >= 0 && fx0 < lvl.W && fy0 < lvl.H && !cellBlocks(lvl.cellType(a.floor, fx0, fy0)))
                         spawnFire(a.x, a.y, a.floor, A_FIRE_LIFE, true);              // НАЗЕМНЫЙ ОГОНЬ = ВИЗУАЛ 16 тиков (ZT 1423a: урона НЕТ, playerSafe)
                     a.active = false; break;
                 }
@@ -135,20 +135,20 @@ void updateActors(const Level& lvl, const Camera& cam) {
                   if (e.active && (e.think == AT_FIRE || e.think == AT_FLAME) && e.floor == a.floor &&
                                       std::hypot(e.x - a.x, e.y - a.y) < 0.6) {
                     if (e.think == AT_FIRE && e.timer < 0)                       // вечный карта-огонь → запомнить как потушенный
-                        fireExtinguished().insert(e.floor * 1024 + (int)e.y * 32 + (int)e.x);
+                        fireExtinguished().insert(cellKey(e.floor, (int)e.x, (int)e.y));
                     if (e.think == AT_FIRE && e.fireCd <= 0) e.fireCd = 10;      // СВОЯ АНИМ-ЗАТУХАНИЯ: огонь гаснет ~10 кадров (не мгновенно)
                     else if (e.think == AT_FLAME) e.active = false;             // летящее пламя огнемёта — мгновенно
                 }
                 a.z += a.vz; a.vz -= 0.012;              // ПАДЕНИЕ вниз (ZT draw смещает пену вниз с возрастом)
                 double nx = a.x + a.vx, ny = a.y + a.vy;
                 int cx = (int)nx, cy = (int)ny;
-                if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H ||
+                if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H ||
                     cellBlocks(lvl.cellType(a.floor, cx, cy)) || --a.timer <= 0) { a.active = false; }
                 else { a.x = nx; a.y = ny; a.vx *= 0.9; a.vy *= 0.9; }
                 break;
             }
             case AT_EXPLOSION:                            // ⭐BLAST на 2-м тике жизни (ROM 14196: $1e==2 → 16294)
-                if (++a.timer == 2 && a.state == 1) { a.state = 0; blastAt(lvl, a.x, a.y, a.floor, cam); }
+                if (++a.timer == 2 && a.state == 1) { a.state = 0; blastAt(lvl, a.x, a.y, a.floor, cam, a.weaponId); }
                 if (a.timer >= A_EXPL_FRAMES) a.active = false; break;
             case AT_SPARK:     if (++a.timer >= A_SPARK_FRAMES) a.active = false; break;
             case AT_DEATH:     if (++a.timer >= A_EXPL_FRAMES)  a.active = false; break;
@@ -168,7 +168,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                     int cx = (int)nx, cy = (int)ny;
                     // ⭐ДИАГОНАЛЬ (ct 0x02-0x05) = ТОНКАЯ ГИПОТЕНУЗА (cellBlockedAt полуплоскость по субкоордам, как ZT think 13d42→13cbc
                     //   и импакт пули traceMiss) — кровь пролетает пустую половину, липнет к грани, а НЕ к квадрату. Полные стены — идентично.
-                    if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H ||
+                    if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H ||
                         cellBlockedAt(lvl.cellType(a.floor, cx, cy), nx - cx, ny - cy)) { hitWall = true; break; }
                     a.x = nx; a.y = ny;
                 }
@@ -183,7 +183,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                 bool trig = (a.floor == cam.floor && gameDist(cam.px - a.x, cam.py - a.y) < 1.0);  // ZT 0x100 = 1 кл (игрок)
                 if (!trig) for (auto& e : v) if (e.active && e.think == AT_ENEMY && e.floor == a.floor &&
                                                  gameDist(e.x - a.x, e.y - a.y) < 1.0) { trig = true; break; }  // или враг
-                if (trig) { explodeAt(lvl, a.x, a.y, a.floor, cam, 0.0); a.active = false; }  // мина на ПОЛУ → взрыв низко
+                if (trig) { explodeAt(lvl, a.x, a.y, a.floor, cam, 0.0, a.weaponId); a.active = false; }  // мина на ПОЛУ → взрыв низко
                 break;
             }
             case AT_ENEMY: {                             // AI: ДИСПЕТЧ ПО КЛАССУ (по разбору capstone think-функций каждого типа)
@@ -197,7 +197,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                 // Sgt → FH-SF: трансформация по истечении таймера $41=50..81 тиков (ZT 1b18a: rnd&0x1f+0x32).
                 // ⭐МОРФ — НЕ мгновенный (ZT state6 1b51a: $35++ до 9 = 9 тиков морф-фазы, актёр СТОИТ НА МЕСТЕ,
                 // затем подмена think/draw/гфх + $41=0x1e). state=98 = морф-фаза порта.
-                if (a.srcType == 0x29 && a.state == 98) {
+                if (!juneEnemies() && a.srcType == 0x29 && a.state == 98) {
                     a.vx = a.vy = 0;                                      // замер на месте (ZT: state6 не двигается)
                     if (--a.timer <= 0) {
                         a.srcType = 0x69; a.tile = enemyTileForCt(0x69);  // стал Former Human SF (1b528-1b55a)
@@ -205,13 +205,13 @@ void updateActors(const Level& lvl, const Camera& cam) {
                     }
                     break;
                 }
-                if (a.xformT > 0 && !enemiesFrozen()) {
+                if (!juneEnemies() && a.xformT > 0 && !enemiesFrozen()) {
                     if (--a.xformT == 0 && a.srcType == 0x29) { a.state = 98; a.timer = ticks(9); break; }   // → морф-фаза 9 тиков
                 }
                 EClass ec = enemyClass(a.srcType);
                 // BOSS3 ПРИТВОРЯЕТСЯ МЁРТВЫМ (ZT 0x1a3aa: state6, $35=0x19=25 тиков) — лежит неподвижно, затем ВОСКРЕСАЕТ
                 // с HP=1000 (1/8, ZT 0x1a40c). state=99 ставится в hitEnemy при первой «смерти» (до этого revived=false).
-                if (a.srcType == 0x6A && a.state == 99) {
+                if (!juneEnemies() && a.srcType == 0x6A && a.state == 99) {
                     a.vx = a.vy = 0;
                     if (--a.timer <= 0) {                               // 25 тиков истекли → встаёт
                         a.revived = true; a.hp = enemyHp(0x6A) / 8; a.state = 0; a.timer = 0; a.fireCd = 30;
@@ -219,10 +219,37 @@ void updateActors(const Level& lvl, const Camera& cam) {
                     }
                     break;
                 }
+                if (juneEnemies() && a.juneHitState != 0) {
+                    uint8_t pose = a.juneHitState == 5 ? 1 : a.juneHitState == 6 ? 2 : 0;
+                    if (a.juneHitState == 5 || a.juneHitState == 6) {
+                        a.vx = a.vy = 0; ++a.hitT;
+                        if (--a.juneHitTimer > 0) break;
+                    } else {
+                        // BZT state2: двигаться и делить velocity пополам, пока octagonal speed >= 0x5A.
+                        if (gameDist(a.vx, a.vy) >= 0x5A / 256.0) {
+                            double nx = a.x + a.vx, ny = a.y + a.vy;
+                            if (!enemyBlockedAt(lvl.cellType(a.floor, (int)nx, (int)a.y), a.floor, (int)nx, (int)a.y,
+                                                nx - (int)nx, a.y - (int)a.y, true)) a.x = nx;
+                            if (!enemyBlockedAt(lvl.cellType(a.floor, (int)a.x, (int)ny), a.floor, (int)a.x, (int)ny,
+                                                a.x - (int)a.x, ny - (int)ny, true)) a.y = ny;
+                            a.vx *= 0.5; a.vy *= 0.5; ++a.hitT;
+                            break;
+                        }
+                    }
+                    if (a.hp < 0) {                                      // BZT checks BMI: HP==0 is still alive
+                        int dr = enemyWeaponDrop(a.srcType);
+                        spawnCorpse(a.x, a.y, a.floor, a.srcType, a.vx, a.vy, a.variant, dr, false, pose);
+                        a.active = false;
+                        break;
+                    }
+                    a.juneHitState = 0; a.juneHitTimer = 0; a.hitT = 0;
+                    a.vx = a.vy = 0; a.state = 91; a.timer = 0;       // per-archetype retarget in June branch
+                    break;
+                }
                 if (a.hitT > 0) {                                        // СТАГГЕР (ZT state 2, sub_01887a): выход по ЗАТУХАНИЮ скорости
                     // ⭐REVENANT: стаггер = ФИКС 10 тиков (ZT 1afc6: state 0xA, $35=0xA, декремент 1/тик;
                     // НЕ по затуханию скорости) — иначе кадры падения (draw 1adfe) не успевают проиграться.
-                    bool revFix = (a.srcType == 0x66);
+                    bool revFix = (!juneEnemies() && a.srcType == 0x66);
                     double sp = std::hypot(a.vx, a.vy);
                     if (revFix ? (a.hitT < ticks(10)) : (sp >= 0.039)) { // ещё «летит»/тикает → скользим + ÷2, держимся в стаггере
                         double nx = a.x + a.vx, ny = a.y + a.vy;
@@ -238,7 +265,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                         int dr = enemyWeaponDrop(a.srcType);            // солдаты роняют ствол (невидимо; подбор шагом на труп)
                         if (dr == -2) dr = (enemyRng() & 0x10) ? 10 : 7;  // Sergeant/FH-SF: btst #4 → laser(10) иначе grenade(7) (дизасм 0x1b716)
                         if (a.burned) dr = -1;                           // ⭐СОЖЖЁННЫЙ труп оружие НЕ отдаёт (ROM 184f2: tst $30 → 1b8d8, обугленный think БЕЗ state3/выдачи)
-                        if (a.srcType == 0x67 || a.srcType == 0x6A || a.srcType == 0x6B)
+                        if (!juneEnemies() && (a.srcType == 0x67 || a.srcType == 0x6A || a.srcType == 0x6B))
                             episodeEndT() = ticks(15);                   // ⭐БОСС УБИТ → конец эпизода (ROM 18e5c/1933c/1a696: -$58dc=0xF, ~1с)
                         spawnCorpse(a.x, a.y, a.floor, a.srcType, a.vx, a.vy, a.variant, dr, a.burned);  // burned → обугленный труп
                         a.active = false; break;
@@ -251,11 +278,12 @@ void updateActors(const Level& lvl, const Camera& cam) {
                 // ≥ порога, враг «пере-засыпает»: обратно в pendingSpawns СВЕЖИМ маркером в текущей клетке
                 // (HP/морф теряются — ROM-верно, маркер состояния не несёт), слот освобождается. Боссы не
                 // эвиктятся (фазы/притворство Boss3 нельзя терять; ROM-люфт: они и не уходят от игрока далеко).
-                if (((s_evTick + (uint32_t)(&a - v.data())) & 7) == 0 && a.hitT == 0 && a.hp > 0 &&
-                    a.srcType != 0x67 && a.srcType != 0x6A && a.srcType != 0x6B &&
+                if (((s_evTick + (uint32_t)(&a - v.data())) & 7) == 0 && a.hitT == 0 &&
+                    (juneEnemies() ? a.hp >= 0 : a.hp > 0) &&
+                    (juneEnemies() || (a.srcType != 0x67 && a.srcType != 0x6A && a.srcType != 0x6B)) &&
                     gameDist(a.x - cam.px, a.y - cam.py) >= evictDist) {
                     int mx = (int)a.x, my = (int)a.y;
-                    if (mx >= 0 && my >= 0 && mx < Level::W && my < Level::H) {
+                    if (mx >= 0 && my >= 0 && mx < lvl.W && my < lvl.H) {
                         pendingSpawns().push_back({mx, my, a.floor, a.srcType});
                         a.active = false;
                     }
@@ -290,6 +318,172 @@ void updateActors(const Level& lvl, const Camera& cam) {
                 double ux = (de > 0.01) ? rx / de : 0.0, uy = (de > 0.01) ? ry / de : 0.0;
                 double d = gameDist(rx, ry);                                 // ГЕЙМПЛЕЙНАЯ дистанция (октаг. d7c0) — все пороги/урон ниже
                 bool los = enemyLOS(lvl, a.floor, a.x, a.y, cam.px, cam.py);
+                // ══ BZT JUNE: пять разных автоматов состояний (13DAA/1479E/14F10/156A6/16068). ══
+                // state 90=однотиковая инициализация $CD, 0=движение, 1=10-тиковое окно атаки (кроме RedMan). Специальные hit-state
+                // 2/5/6 обрабатываются выше и напрямую выбирают hit/stagger A/stagger B в draw.
+                if (juneEnemies()) {
+                    const int kind = enemyGfxSlot(a.srcType);     // 0 RedRobo, 1 Purple, 2 Man, 3 RedMan, 4 GrenMan
+                    auto walkTicks = [&]() { return kind == 0 ? ticks(15) : kind == 4 ? ticks(10) : ticks(5); };
+                    auto juneRetarget = [&]() {
+                        const double turn = 2.0 * M_PI / 512.0;
+                        double camAng = std::atan2(cam.dirY, cam.dirX);
+                        double pvjx = cam.px - juneppx(), pvjy = cam.py - juneppy();
+                        switch (kind) {
+                            case 0:                               // RedRobo: перехватчик + два фланга пак-роли
+                                if (a.juneFlags == 1) {
+                                    a.aimX = cam.px + pvjx; a.aimY = cam.py + pvjy;
+                                } else {
+                                    int da = a.juneFlags == 2 ? 0xA8 : 0x158;
+                                    a.aimX = cam.px + std::cos(camAng + da * turn);
+                                    a.aimY = cam.py + std::sin(camAng + da * turn);
+                                }
+                                break;
+                            case 1: {                             // Purple 146F4: постоянная орбита + половина скорости игрока
+                                if (a.juneAngle == 0) { a.juneAngle = (uint16_t)(enemyRng() & 0x1FF); if (!a.juneAngle) a.juneAngle = 1; }
+                                double ang = camAng + a.juneAngle * turn;
+                                a.aimX = cam.px + pvjx * 0.5 + std::cos(ang);
+                                a.aimY = cam.py + pvjy * 0.5 + std::sin(ang);
+                                break;
+                            }
+                            case 2: {                             // Man 145FA/14678: чередующиеся фланги ±90°, lead 6→1
+                                int da = a.juneFlags ? 0x180 : 0x80;
+                                double ang = camAng + da * turn;
+                                int lead = a.juneLead ? a.juneLead : 1;
+                                a.aimX = cam.px + std::cos(ang) * 2.0 + pvjx * 0.5 * lead;
+                                a.aimY = cam.py + std::sin(ang) * 2.0 + pvjy * 0.5 * lead;
+                                a.juneFlags ^= 1; if (a.juneLead > 1) --a.juneLead;
+                                break;
+                            }
+                            case 3:                               // RedMan 15710: рывок к игроку, после кражи бегство на 4 клетки
+                                if (a.juneFlags) {
+                                    double ang = camAng + (enemyRng() & 0x1FF) * turn;
+                                    a.aimX = cam.px + std::cos(ang) * 4.0;
+                                    a.aimY = cam.py + std::sin(ang) * 4.0;
+                                    a.juneFlags = 0;
+                                } else { a.aimX = cam.px; a.aimY = cam.py; }
+                                break;
+                            default: {                            // GrenMan 14752: случайная орбита радиусом 2
+                                double ang = camAng + (enemyRng() & 0x1FF) * turn;
+                                a.aimX = cam.px + std::cos(ang) * 2.0;
+                                a.aimY = cam.py + std::sin(ang) * 2.0;
+                                break;
+                            }
+                        }
+                    };
+                    if (a.state == 91) {                         // восстановление после hit: родная функция пере-цели типа
+                        a.state = 0; juneRetarget(); a.timer = walkTicks();
+                        break;
+                    }
+                    if (a.state == 90) {                          // $CD снимается ПЕРВЫМ think, без ожидания (13E00/147F4/14F66/156FE/160C0)
+                        a.state = 0; a.juneLead = 6; a.juneFlags = 0; a.juneAngle = 0;
+                        a.aimX = cam.px; a.aimY = cam.py;         // 92DC: $3C/$3E = позиция игрока в момент пробуждения
+                        a.timer = ticks(20);                      // 92DC: $39=0x14 — это таймер ДВИЖЕНИЯ, не материализации
+                        if (kind == 0) {                          // 13E0A: наименее занятая роль RedRobo
+                            int c1 = 0, c2 = 0, c3 = 0;
+                            for (auto& b : v) if (b.active && b.think == AT_ENEMY && b.srcType == 0x29 && &b != &a) {
+                                if (b.juneFlags == 1) ++c1; else if (b.juneFlags == 2) ++c2; else if (b.juneFlags == 3) ++c3; }
+                            a.juneFlags = (c2 >= c1) ? 1 : (c3 >= c2 ? 2 : 3);
+                        }
+                        // Только GrenMan в своём CD-хендлере сразу заменяет стартовую цель орбитой (160C0→14752).
+                        // Остальные начинают идти прямо к записанной 92DC позиции игрока.
+                        if (kind == 4) juneRetarget();
+                        break;
+                    }
+                    // RedMan 156A6 содержит ниже по листингу копию общего state1/hitscan-блока,
+                    // но она мёртвая: 158D2 всегда уходит в 15710. Если актёр остался в state1
+                    // от старой версии порта, сразу вернуть его в единственный живой thief-loop.
+                    if (kind == 3 && a.state == 1) {
+                        a.state = 0; a.fireAnimT = 0; juneRetarget();
+                    }
+                    // gain=1/8; RedRobo max 0x12, Purple/Man/GrenMan 0x19, RedMan 0x4B.
+                    // Purple и Man переходят в attack-handler ДО вызова движения (148A2/15008), GrenMan
+                    // явно гасит скорость (16222). RedRobo во время очереди продолжает скольжение; RedMan в очередь не входит.
+                    const bool attackStops = a.state == 1 && (kind == 1 || kind == 2 || kind == 4);
+                    bool targetSettled = false;
+                    bool thiefRetargeted = false;
+                    bool thiefBlocked = false;
+                    if (!attackStops) {
+                        double oldX = a.x, oldY = a.y;
+                        double avx = (a.aimX - a.x) / 8.0, avy = (a.aimY - a.y) / 8.0;
+                        const double VM = (kind == 0 ? 0x12 : kind == 3 ? 0x4B : 0x19) / 256.0;
+                        if (avx >  VM) avx =  VM; else if (avx < -VM) avx = -VM;
+                        if (avy >  VM) avy =  VM; else if (avy < -VM) avy = -VM;
+                        targetSettled = std::fabs(avx) < VM && std::fabs(avy) < VM;
+                        double nx = a.x + avx, ny = a.y + avy;
+                        if (!enemyBlockedAt(lvl.cellType(a.floor, (int)nx, (int)a.y), a.floor, (int)nx, (int)a.y,
+                                            nx - (int)nx, a.y - (int)a.y, true)) a.x = nx;
+                        if (!enemyBlockedAt(lvl.cellType(a.floor, (int)a.x, (int)ny), a.floor, (int)a.x, (int)ny,
+                                            a.x - (int)a.x, ny - (int)ny, true)) a.y = ny;
+                        a.vx = avx; a.vy = avy;
+                        thiefBlocked = kind == 3 && std::fabs(a.x - oldX) < 1e-9 && std::fabs(a.y - oldY) < 1e-9;
+                        if (kind == 3 && a.state == 0 && gameDist(a.x - cam.px, a.y - cam.py) <= 0x20 / 256.0) {
+                            auto& drain = juneDrainInventoryFn();
+                            if (drain && drain()) {
+                                // 1588A: успешная 15EF8 оставляет $50=$FF; ближайший 15710
+                                // выбирает точку отхода радиусом 4 и возвращает, не заходя в стрельбу.
+                                a.juneFlags = 1; juneRetarget(); a.timer = walkTicks();
+                                a.fireAnimT = 0; thiefRetargeted = true;
+                            }
+                        }
+                        enemyPlayerStandoff(a, cam, lvl);
+                    } else a.vx = a.vy = 0;
+                    if (a.state == 0) {
+                        if (kind == 3) {
+                            if (thiefRetargeted) break;
+                            // 158A0..158D6: RedMan лишь проверяет, что дошёл до цели, и снова
+                            // вызывает 15710. Стоящий вслед за этим fire-код недостижим.
+                            const double nearV = 0x19 / 256.0;
+                            bool thiefSettled = std::fabs((a.aimX - a.x) / 8.0) <= nearV &&
+                                                std::fabs((a.aimY - a.y) / 8.0) <= nearV;
+                            if (thiefSettled || thiefBlocked || (std::fabs(a.vx) < 1e-9 && std::fabs(a.vy) < 1e-9)) {
+                                a.vx = a.vy = 0; juneRetarget(); a.timer = walkTicks();
+                            }
+                            break;
+                        }
+                        // После движения оригинал проверяет малую скорость/остаток до цели и сразу вызывает
+                        // per-enemy retarget (148C8/1502A/158A0 и аналоги). Без этого Man доходил до старой
+                        // позиции обнаружения и стоял там до конца $39, выглядя «затупившим».
+                        if (targetSettled) { a.vx = a.vy = 0; juneRetarget(); a.timer = walkTicks(); break; }
+                        if (--a.timer <= 0) { a.state = 1; a.timer = ticks(10); }
+                        break;
+                    }
+                    --a.timer;
+                    int t = a.timer;
+                    { int W = ticks(10); if (W < 1) W = 1;
+                      a.fireAnimT = (t > 0) ? (t * 10 + W - 1) / W : 0; }
+                    if (t <= 0) {
+                        juneRetarget(); a.state = 0; a.timer = walkTicks(); a.fireAnimT = 0;
+                        break;
+                    }
+                    if (t == ticks(5)) {
+                        if (kind == 4) {
+                            if (!los) {                          // 16258: провал sub_1904C → state0 + новая орбита
+                                a.state = 0; a.fireAnimT = 0; juneRetarget(); a.timer = walkTicks(); break;
+                            }
+                            spawnGrenade(a.x, a.y, a.floor, rx, ry, 1, 1.0, true);
+                            snd::playSfxPolite(0x1b, 0x0F);
+                            break;
+                        }
+                        if (!los) {                             // 13F72/14964/150EE/15940: сорвать очередь, а не ждать остаток окна
+                            a.state = 0; a.fireAnimT = 0; a.timer = walkTicks();
+                            if (kind == 0) juneRetarget();       // RedRobo сразу выбирает новую pack-цель; humanoid держит прежнюю
+                            break;
+                        }
+                        if (d >= 4.0) break;
+                        int thr = 0x400;
+                        bool crouch = player().crouchY < -1.0, dark = (lvl.env(a.floor) != 0);
+                        if (crouch) thr = dark ? 0x17B : 0x200; else if (dark) thr = 0x300;
+                        bool noticed = (int)(enemyRng() & 0x3FF) < thr;
+                        bool shot = !noticed;                       // stealth-miss still makes the t5 shot sound
+                        if (noticed && (enemyRng() & 0x300) != 0) {
+                            damagePlayer(9, cam.px, cam.py, a.x, a.y); shot = true;
+                        }
+                        if (shot) { snd::playSfx(0x68); snd::playSfx(0x97); }
+                        break;
+                    }
+                    if (t == ticks(4) || t == ticks(3)) { snd::playSfx(0x68); snd::playSfx(0x97); }
+                    break;
+                }
                 if (a.fireCd > 0) --a.fireCd;
                 if (a.fireAnimT > 0) --a.fireAnimT;                      // таймер анимации стрельбы/удара
                 EMove mv = enemyMove(a.srcType);
@@ -314,7 +508,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                     if (!stuck) {                                       // ROM 145aa: кламп суб-позиции у солидных соседей
                         int cx = (int)a.x, cy = (int)a.y;
                         auto solid = [&](int sx, int sy) {
-                            if (sx < 0 || sy < 0 || sx >= Level::W || sy >= Level::H) return true;
+                            if (sx < 0 || sy < 0 || sx >= lvl.W || sy >= lvl.H) return true;
                             // ⚠canOpen ОБЯЗАТЕЛЕН (регрессия 2026-07-21: кламп держал ОПЕНЕРОВ в 0.25 от двери —
                             // центр не входил в дверную клетку → openDoorsAtEnemies не срабатывал → двери «сломались»)
                             return enemyBlockedAt(lvl.cellType(a.floor, sx, sy), a.floor, sx, sy, 0.5, 0.5, canOpen); };
@@ -386,7 +580,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                         int cx0 = (int)std::floor(a.x), cy0 = (int)std::floor(a.y);
                         double fx = a.x - cx0, fy = a.y - cy0;
                         const double LO = 0x20 / 256.0, HI = 0xDF / 256.0;
-                        auto blockedN = [&](int bx, int by){ return bx < 0 || by < 0 || bx >= Level::W || by >= Level::H ||
+                        auto blockedN = [&](int bx, int by){ return bx < 0 || by < 0 || bx >= lvl.W || by >= lvl.H ||
                             enemyBlockedAt(lvl.cellType(a.floor, bx, by), a.floor, bx, by, 0.5, 0.5, false); };
                         if (fx < LO && blockedN(cx0 - 1, cy0)) a.x = cx0 + LO;
                         else if (fx > HI && blockedN(cx0 + 1, cy0)) a.x = cx0 + HI;
@@ -697,8 +891,8 @@ void updateActors(const Level& lvl, const Camera& cam) {
                 }
                 double nx = a.x + a.vx, ny = a.y + a.vy;
                 int cx = (int)nx, cy = (int)ny;
-                uint8_t sct = (cx >= 0 && cy >= 0 && cx < Level::W && cy < Level::H) ? lvl.cellType(a.floor, cx, cy) : 1;
-                if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H ||
+                uint8_t sct = (cx >= 0 && cy >= 0 && cx < lvl.W && cy < lvl.H) ? lvl.cellType(a.floor, cx, cy) : 1;
+                if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H ||
                     cellBlockedAt(sct, nx - cx, ny - cy) || cellIsDoor(sct) || --a.timer <= 0) {  // дверь тоже останавливает
                     spawnSparkA(a.x, a.y, a.floor); a.active = false;
                 } else { a.x = nx; a.y = ny; }
@@ -720,6 +914,28 @@ void updateActors(const Level& lvl, const Camera& cam) {
                     if (!enemyBlockedAt(lvl.cellType(a.floor, (int)a.x, (int)ny), a.floor, (int)a.x, (int)ny, a.x - (int)a.x, ny - (int)ny)) a.y = ny;
                     a.vx *= 0.5; a.vy *= 0.5; --a.timer;                 // затухание ÷2/кадр (ZT asr.w скорости стаггера)
                 }
+                // ⭐ТРУП В ЗАКРЫВШЕЙСЯ ДВЕРИ [VERIFIED 160e8/1628a, 2026-07-28]: corpse-think раз в 4 тика
+                // проверяет клетку под собой; открытая дверь = клетка 0x2D/2E (не триггерит), но когда дверь
+                // ДОЗАКРЫЛАСЬ (b43c вернул исходный cellID → celltype снова 6/7/0x83/0x84) — труп ВЫТАЛКИВАЕТСЯ
+                // из створки: суб-координата поперёк двери клампится к 0x40/0xC0 (=0.25/0.75), звук 0x36
+                // («шлепок», PCM type2, d740 = слышен на этаже игрока).
+                if (((s_evTick + (uint32_t)(&a - v.data())) & 3) == 0) {
+                    int dcx = (int)a.x, dcy = (int)a.y;
+                    if (dcx >= 0 && dcy >= 0 && dcx < lvl.W && dcy < lvl.H) {
+                        uint8_t dct = lvl.cellType(a.floor, dcx, dcy);
+                        bool horiz = (dct == 6 || dct == 0x83), vert = (dct == 7 || dct == 0x84);
+                        if ((horiz || vert) && doorOpen(a.floor, dcx, dcy) < 1e-3) {   // дверь ЗАКРЫТА (иначе клетка «открытая створка»)
+                            double sub = horiz ? (a.y - dcy) : (a.x - dcx);
+                            double ns = sub;
+                            if (sub < 0.5) { if (sub > 0.25) ns = 0.25; }              // 16160/16186: кламп 0x40
+                            else           { if (sub < 0.75) ns = 0.75; }              // кламп 0xC0
+                            if (ns != sub) {
+                                if (horiz) a.y = dcy + ns; else a.x = dcx + ns;
+                                if (a.floor == cam.floor) snd::playSfx(0x36);          // 1628a: d740 (этаж игрока)
+                            }
+                        }
+                    }
+                }
                 break;
             }
             default: break;
@@ -737,10 +953,16 @@ void updateActors(const Level& lvl, const Camera& cam) {
     // ⭐СТАТУИ СПЯЩИХ МАРКЕРОВ (ROM 9a6a: клетка спящего врага рендерится СТАТИЧНЫМ биллбордом врага
     // через 1131e — враги НЕ «появляются из ниоткуда»; оживают при dist<0x800=8 кл, эвикция обратно 10).
     // Стоячая поза 0 фронтом к камере; вариант/потолок — той же формулой, что даст будущий спавн.
+    // Не добавляем дальние маркеры: стеновой проход и обычный декор отсекают тот же квадрат drawDist.
+    // Иначе на больших BZT-картах в очередь/сортировку попадал ВЕСЬ этаж (до 193 статуй), хотя эти
+    // объекты не могут попасть в кадр. Это давало именно визуальные фризы при движении, не меняя AI.
+    const int markerDrawDist = (faDrawDist() > 0) ? faDrawDist() : drawDistForEnv(lvl.env(cam.floor));
+    const int markerCamX = (int)cam.px, markerCamY = (int)cam.py;
     for (auto& m : pendingSpawns()) {
         if (m.floor != cam.floor) continue;
+        if (std::abs(m.x - markerCamX) > markerDrawDist || std::abs(m.y - markerCamY) > markerDrawDist) continue;
         uint8_t ct = m.ct ? m.ct : lvl.cellType(m.floor, m.x, m.y);
-        if (!((ct >= 0x29 && ct <= 0x2B) || (ct >= 0x65 && ct <= 0x6B))) continue;
+        // BZT имеет другие ID Man/GrenMan (08/09/27); единственный источник истины — таблица графических слотов.
         int slot = enemyGfxSlot(ct);
         if (slot < 0 || slot >= 16 || !g_enemyAnim[slot].ok) continue;
         EnemyAnimSet& A = g_enemyAnim[slot];
@@ -828,11 +1050,21 @@ void updateActors(const Level& lvl, const Camera& cam) {
                 if (slot >= 0 && slot < 16 && g_enemyAnim[slot].ok) {
                     EnemyAnimSet& A = g_enemyAnim[slot];
                     uint8_t animSt = (a.hitT > 0) ? 2 : (a.fireAnimT > 0 ? 1 : 0);     // стаггер > стрельба/удар > ходьба
+                    if (juneEnemies() && a.juneHitState != 0) {
+                        if (a.juneHitState == 5)
+                            animSt = a.juneHitTimer > ticks(5) ? 2 : 11;
+                        else if (a.juneHitState == 6) animSt = 12;
+                        else animSt = a.hp < 0 ? 3 : 2;
+                    }
+                    // June draw selectors 15254/1648C return directly for weapon-B
+                    // stagger (state 6) on Man and GrenMan: they are invisible for its
+                    // six ticks. RedRobo, Purple and RedMan use their five-frame pose.
+                    if (juneEnemies() && a.juneHitState == 6 && (slot == 2 || slot == 4)) break;
                     // ⭐REVENANT СМЕРТЕЛЬНЫЙ СТАГГЕР (ZT draw 1adfe, HP<0): НЕ hit-аним, а ПАДЕНИЕ
                     // a8→a4→a6→a5 по фазе $35 (10 тиков). animSt=10, efr = стадия 0..3 (2 тика на стадию).
-                    if (animSt == 2 && a.srcType == 0x66 && a.hp <= 0 && !A.revFall[0].empty()) animSt = 10;
+                    if (!juneEnemies() && animSt == 2 && a.srcType == 0x66 && a.hp <= 0 && !A.revFall[0].empty()) animSt = 10;
                     // ⭐SGT МОРФ (ZT draw 1b628): кадр a6, суб = прогресс/2 кламп 4 (5 ступеней превращения)
-                    if (a.srcType == 0x29 && a.state == 98 && !A.morph.empty()) {
+                    if (!juneEnemies() && a.srcType == 0x29 && a.state == 98 && !A.morph.empty()) {
                         int p = 9 - a.timer; if (p < 0) p = 0;                        // $35: 0..8 за 9 тиков морф-фазы
                         int sub = (p + 1) >> 1; int mn = (int)A.morph.size();
                         if (sub > 4) sub = 4; if (sub >= mn) sub = mn - 1;
@@ -840,7 +1072,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                         break;
                     }
                     // ⭐BOSS3 ПРИТВОРСТВО (ZT draw 1a752/1a7dc): $35<5 → a10 лежит смирно; дальше RNG-дёрг a7 (15/16) / a8 (1/16)
-                    if (a.srcType == 0x6A && a.state == 99 && !A.pretendLie.empty()) {
+                    if (!juneEnemies() && a.srcType == 0x6A && a.state == 99 && !A.pretendLie.empty()) {
                         int p = 25 - a.timer; if (p < 0) p = 0;
                         uint8_t sub = 0; uint8_t st7;
                         if (p < 5) st7 = 7;                                            // лежит (pretendLie)
@@ -849,10 +1081,10 @@ void updateActors(const Level& lvl, const Camera& cam) {
                         fx.push_back({a.x, a.y, a.floor, 0, (int8_t)-8, 16, 7, slot, sub, false, (float)a.z, 0, st7, a.variant});
                         break;
                     }
-                    if (a.srcType == 0x6A && a.state == 99) animSt = 3;               // фолбэк (кадры не декодировались) → death-поза
-                    else if (a.srcType == 0x65 && a.state >= 3 && a.hitT <= 0 && !A.climb.empty()) animSt = 4;  // Hydaca ЛАЗАНИЕ (states 3-10) → DIRECTIONAL вертик. поза (ZT draw states 3-A)
-                    else if (a.srcType == 0x65 && std::fabs(a.vz) > 0.001 && a.hitT <= 0 && !A.climb.empty()) animSt = 5;  // Hydaca ПАДЕНИЕ (баллистика vz≠0) → a1(вниз)/a8(вверх-срыв)/a10(мёртв) (ZT draw state2), НЕ directional
-                    if (a.srcType == 0x68 && a.hitT <= 0) animSt = (a.state == 1) ? 1 : 0;  // Dog: боевая (бег a1/прыжок a2) ТОЛЬКО в погоне state1; отход state2 → ходьба a0 (ZT draw 198c4 state0/2→anim0)
+                    if (!juneEnemies() && a.srcType == 0x6A && a.state == 99) animSt = 3;               // фолбэк (кадры не декодировались) → death-поза
+                    else if (!juneEnemies() && a.srcType == 0x65 && a.state >= 3 && a.hitT <= 0 && !A.climb.empty()) animSt = 4;  // Hydaca ЛАЗАНИЕ
+                    else if (!juneEnemies() && a.srcType == 0x65 && std::fabs(a.vz) > 0.001 && a.hitT <= 0 && !A.climb.empty()) animSt = 5;  // Hydaca ПАДЕНИЕ
+                    if (!juneEnemies() && a.srcType == 0x68 && a.hitT <= 0) animSt = (a.state == 1) ? 1 : 0;  // Dog
                     // НАПРАВЛЕНИЕ: climb Hydaca = DIRECTIONAL по ракурсу к игроку (6 поз, ZT draw states 3-A по self↔cam); иначе по скорости
                     uint8_t dir;
                     bool hydClimb = (animSt == 4 && a.srcType == 0x65 && A.climbDirs > 0);
@@ -861,7 +1093,9 @@ void updateActors(const Level& lvl, const Camera& cam) {
                     else {
                         // ⭐DIRECTIONAL и для огня/стаггера (ROM 1ba04 крутит виды у ЛЮБОГО кадра по velocity):
                         int dc = (animSt == 1 && !a.atkPose && A.fireDirs > 0) ? A.fireDirs
-                               : (animSt == 2 && A.hitDirs  > 0) ? A.hitDirs : A.walkDirs;
+                               : (animSt == 2 && A.hitDirs > 0) ? A.hitDirs
+                               : (animSt == 11 && A.juneStagADirs > 0) ? A.juneStagADirs
+                               : (animSt == 12 && A.juneStagBDirs > 0) ? A.juneStagBDirs : A.walkDirs;
                         dir = (uint8_t)enemyDirIndex(a.vx, a.vy, cam.px - a.x, cam.py - a.y, dc);
                     }
                     bool useFire2 = (a.atkPose && !A.fire2.empty());                              // 2-я боевая поза (fire2)
@@ -870,11 +1104,16 @@ void updateActors(const Level& lvl, const Camera& cam) {
                                                      ? A.fireD[dir].size() : A.fire.size())
                            : (animSt == 2) ? (int)((A.hitDirs > 0 && dir < (uint8_t)A.hitDirs && !A.hitD[dir].empty())
                                                      ? A.hitD[dir].size() : A.hit.size())
+                                           : (animSt == 3) ? (int)A.death.size()
+                                           : (animSt == 11) ? (int)((A.juneStagADirs > 0 && dir < (uint8_t)A.juneStagADirs && !A.juneStagAD[dir].empty())
+                                                     ? A.juneStagAD[dir].size() : A.juneStagA.size())
+                                           : (animSt == 12) ? (int)((A.juneStagBDirs > 0 && dir < (uint8_t)A.juneStagBDirs && !A.juneStagBD[dir].empty())
+                                                     ? A.juneStagBD[dir].size() : A.juneStagB.size())
                                            : (animSt == 4) ? (int)(hydClimb ? A.climbDir[dir].size() : A.climb.size())
                                            : (animSt == 5) ? (int)((dir==0) ? A.fallUp.size() : (dir==2) ? A.fallDead.size() : A.climb.size())
                                            : (int)A.walk[dir < A.walkDirs ? dir : 0].size();
                     if (nf < 1) nf = 1;
-                    bool dogRun = (a.srcType == 0x68 && animSt == 1 && a.fireAnimT <= 0);           // Dog бег: цикл по движению, не по fire-таймеру
+                    bool dogRun = (!juneEnemies() && a.srcType == 0x68 && animSt == 1 && a.fireAnimT <= 0); // Dog бег: цикл по движению
                     uint8_t efr;
                     if (animSt == 5) {
                         // ⭐ПАДЕНИЕ (ZT draw 15402): ФИКС-суб-кадры, НЕ цикл по таймеру («дёргается иначе» — юзер):
@@ -884,10 +1123,31 @@ void updateActors(const Level& lvl, const Camera& cam) {
                             : (dir == 1) ? (uint8_t)0
                             : (uint8_t)((a.z > 0.0625 || nf < 2) ? 0 : 1);
                     } else if (dogRun) efr = walkFrame(a, nf);                                    // бег Dog: дистанс-модель
-                    else if (a.srcType == 0x2B && animSt == 1) efr = walkFrame(a, nf);            // Imp замах/удар: суб-кадры = дистанс-ходьба (ROM 18aa0 d2=−1)
+                    else if (!juneEnemies() && a.srcType == 0x2B && animSt == 1) efr = walkFrame(a, nf); // Imp замах/удар
                     else if (animSt == 10) {                                                      // Revenant-падение: стадия по 2 тика (ROM $35 10→0)
                         int st = a.hitT / (ticks(2) > 0 ? ticks(2) : 2); if (st > 3) st = 3;
                         efr = (uint8_t)st;
+                    }
+                    // BZT passes literal d2 frame indices to 19CF8. Frame 0 is the
+                    // standing pose; combat/death selectors deliberately use 1..N.
+                    else if (juneEnemies() && animSt == 1) {
+                        int t = a.fireAnimT;
+                        int f = (t >= 8) ? 1 : (t >= 6) ? 2 : (t == 5) ? 3 : (t >= 3) ? 2 : 1;
+                        efr = (uint8_t)(f < nf ? f : 0);
+                    }
+                    else if (juneEnemies() && animSt == 2) efr = (uint8_t)(nf > 1 ? 1 : 0);
+                    else if (juneEnemies() && animSt == 3) efr = (uint8_t)(nf > 1 ? 1 : 0);
+                    else if (juneEnemies() && animSt == 11) {
+                        int W = ticks(8); if (W < 1) W = 1;
+                        int t = (a.juneHitTimer * 8 + W - 1) / W;
+                        int f = t >= 4 ? 1 : 5 - t;
+                        efr = (uint8_t)(f < nf ? f : 0);
+                    }
+                    else if (juneEnemies() && animSt == 12) {
+                        int W = ticks(6); if (W < 1) W = 1;
+                        int t = (a.juneHitTimer * 6 + W - 1) / W;
+                        int f = 6 - t; if (f < 1) f = 1;
+                        efr = (uint8_t)(f < nf ? f : 0);
                     }
                     else if (animSt == 1) efr = (uint8_t)(((12 - a.fireAnimT) / 3) % nf);          // стрельба: прогон кадров
                     else if (animSt == 2) efr = (uint8_t)((a.hitT / 3) % nf);                      // стаггер (hitT растёт)
@@ -909,7 +1169,30 @@ void updateActors(const Level& lvl, const Camera& cam) {
                     // (ножки вверх-вниз); Imp/FH-SF кадр 0 (или 1 при простреле, $35=a.state); прочие — статик кадр 0
                     // (ZT d2=−1 «осел» / 1-кадровые). Простреливание (corpse-hHit) крутит a.state → сменяет кадр.
                     uint8_t efr;
-                    if (a.burned && !g_burntRemains.empty()) {        // ⭐СПАЛЁННЫЙ → BURNT REMAINS (ZT draw 1b952): 2-кадр мерцание (tick/4&1), +3 простреленный
+                    uint8_t corpseAnimSt = hasDeath ? 3 : 0;
+                    if (juneEnemies()) {
+                        if (a.juneCorpsePose == 1 && !A.juneStagA.empty()) {
+                            corpseAnimSt = 11;
+                            efr = (uint8_t)(A.juneStagA.size() > 4 ? 4 : 0); // C8: d2=4
+                        } else if (a.juneCorpsePose == 2 && !A.juneStagB.empty()) {
+                            corpseAnimSt = 12;
+                            efr = (uint8_t)(A.juneStagB.size() > 5 ? 5 : 0); // C9: d2=5
+                        } else if (!A.juneCorpse.empty()) {
+                            // Ordinary June death is a three-step selector, not a
+                            // permanently frozen fall frame: CB→death f1, CC→death f2,
+                            // then its separate resting corpse sprite f2.
+                            if (a.frameT == 0) {
+                                efr = (uint8_t)(nd > 1 ? 1 : 0);          // CB: d2=1
+                            } else if (a.frameT == 1) {
+                                efr = (uint8_t)(nd > 2 ? 2 : nd - 1);     // CC: d2=2
+                            } else {
+                                corpseAnimSt = 13;
+                                efr = (uint8_t)(A.juneCorpse.size() > 2 ? 2 : A.juneCorpse.size() - 1);
+                            }
+                        } else {
+                            efr = (uint8_t)((a.state & 1) && nd > 2 ? 2 : (nd > 1 ? 1 : 0));
+                        }
+                    } else if (a.burned && !g_burntRemains.empty()) { // ⭐СПАЛЁННЫЙ → BURNT REMAINS (ZT draw 1b952): 2-кадр мерцание (tick/4&1), +3 простреленный
                         int nb = (int)g_burntRemains.size();
                         efr = (uint8_t)((((a.state & 1) ? 3 : 0) + ((a.frameT >> 2) & 1)) % nb);
                     } else if (slot == 1 && nd > 1) {                 // FH: LUT-мерцание + фаза простреливания
@@ -936,7 +1219,7 @@ void updateActors(const Level& lvl, const Camera& cam) {
                         efr = (uint8_t)((a.state & 1) && nd > 1 ? 1 : 0);   // 1-кадровые → всегда 0; многокадр. Sgt → 0/1
                     }
                     fx.push_back({a.x, a.y, a.floor, 0, (int8_t)-8, 16, 7, slot, efr, !hasDeath, (float)a.z, 0,
-                                  (uint8_t)(hasDeath ? 3 : 0), a.variant, false, a.burned});   // burned → обугленный труп
+                                  corpseAnimSt, a.variant, false, a.burned});   // burned → обугленный труп
                 }
                 // ⚠ БЕЗ видимого напольного пикапа: труп САМ носит оружие (ROM corpse-think 186fa). Отдельный
                 // объект-пикап на полу (cmd 0x13→1c03a) спавнится ТОЛЬКО в 2P-link (ветка a3≠игрок @18774), не
@@ -945,4 +1228,5 @@ void updateActors(const Level& lvl, const Camera& cam) {
             default: break;
         }
     }
+    juneppx() = cam.px; juneppy() = cam.py;   // ⭐June 145BE: прошлотиковая поза игрока (перехват = игрок + скорость)
 }

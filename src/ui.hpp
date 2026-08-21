@@ -77,7 +77,7 @@ inline void drawTextFontC(FB& fb, int cx, int y, const char* s, uint32_t col, in
 inline const ZtFontBig* g_uiFontBig = nullptr;   // ставится из main после загрузки GameData
 // ⭐ПАЛИТРА ТЕКСТА ЭКРАНА ОПЦИЙ (ROM CRAM line3 0x1CDAE = gd.pauseTextPal): ESC-меню рисуется ею через palOv.
 inline const uint32_t* g_uiOptPal   = nullptr;   // 16 ARGB или nullptr (тогда родная жёлтая палитра Font_grph)
-// ⭐СТРЕЛКА-КУРСОР МЕНЮ ОПЦИЙ (ROM sub_10B4C8, спрайт 8×16 ARGB @gd.optArrow) или nullptr → векторный треугольник.
+// ⭐СТРЕЛКА-КУРСОР МЕНЮ ОПЦИЙ (оригинальный спрайт 16×8 ARGB @gd.optArrow) или nullptr → векторный треугольник.
 inline const uint32_t* g_uiOptArrow = nullptr;
 // ⭐КУРСОР-СКОБКА ЭКРАНА ПАРОЛЯ (ROM тайл 0x243, 8×8 ARGB @gd.pwCursor) или nullptr → векторные уголки.
 inline const uint32_t* g_pwCursor = nullptr;

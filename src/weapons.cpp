@@ -11,7 +11,7 @@
 static void snipTryAimKill(const Level& lvl, const Camera& cam) {
     if (!faSnipers() || cam.floor != 0) return;                      // 1685a
     int cx = (int)cam.px, cy = (int)cam.py;
-    if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return;
+    if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) return;
     uint8_t ct = lvl.cellType(cam.floor, cx, cy);
     double camH = player().crouchY + player().knockPitch;            // -71e6 (полный питч)
     if (!(ct == 0x28 || (ct == 0x27 && camH >= -5.0))) return;       // 16878/1687e
@@ -20,7 +20,7 @@ static void snipTryAimKill(const Level& lvl, const Camera& cam) {
 
 int rcTryPickup(Inventory& inv, const Level& lvl, int floor, double px, double py) {
     int x = (int)px, y = (int)py;
-    if (x < 0 || y < 0 || x >= Level::W || y >= Level::H) return -1;
+    if (x < 0 || y < 0 || x >= lvl.W || y >= lvl.H) return -1;
     uint8_t ct = lvl.cellType(floor, x, y);
     int k = pickKey(floor, x, y);
     if (pickedSet().count(k)) return -1;             // уже подобрано
@@ -53,11 +53,11 @@ void fireSpawn(const Inventory& inv, const Level& lvl, const Camera& cam) {
             int raw = 0x400 - X;                                     // урон = 0x400 − X (187c8)
             Actor& a = actors()[ti];
             if (a.think == AT_CORPSE) corpseHit(a, cam.px, cam.py, raw);   // пнуть/ударить ТРУП (из приседа) → лёгкий отлёт
-            else { int dmg = raw / 100 < 1 ? 1 : raw / 100; hitEnemy(a, dmg, cam.px, cam.py, raw); }
+            else { int dmg = raw / 100 < 1 ? 1 : raw / 100; hitEnemy(a, dmg, cam.px, cam.py, raw, -1); }
             snd::playSfxForce(inv.punchVariant >= 2 ? 0x1a : 0x17, 0x0F);   // КОНТАКТ по врагу: кик-вниз(вар2)=0x1a / удар=0x17 (ZT 12146→12158: ФОРС, arm 0xF)
         } else {                                                     // промах: удар в стену вплотную → 0x1c; в воздух → только замах 0x1b (ZT 12178 beq)
             int cx = (int)(cam.px + cam.dirX * 0.5), cy = (int)(cam.py + cam.dirY * 0.5);
-            if (cx >= 0 && cy >= 0 && cx < Level::W && cy < Level::H &&
+            if (cx >= 0 && cy >= 0 && cx < lvl.W && cy < lvl.H &&
                 cellBlockedAt(lvl.cellType(cam.floor, cx, cy), 0.5, 0.5)) snd::playSfxForce(0x1c, 0x0F);   // ZT 12186→12192: ФОРС, arm 0xF
         }
         return;
@@ -98,7 +98,7 @@ void fireSpawn(const Inventory& inv, const Level& lvl, const Camera& cam) {
         } else spawnGrenade(gx, gy, cam.floor, cam.dirX, cam.dirY, 0,
                             playerFighter() == 1 ? 2.0 : 1.0);      // без цели (БОЕЦ1: дальность ×2, ZT 12e7c)
         return; }
-    if (id == 11) { spawnBullet(x, y, cam.floor, cam.dirX, cam.dirY, 0.5, A_EXPL_TILE, 200); return; }  // РАКЕТА vel=0.5кл/кадр (ZT dir/2)
+    if (id == 11) { spawnBullet(x, y, cam.floor, cam.dirX, cam.dirY, 0.5, A_EXPL_TILE, 200, id); return; }  // РАКЕТА vel=0.5кл/кадр (ZT dir/2)
     // ⭐HIT-SCAN (handgun/laser/shotgun/pulse): КОНУС-АВТОНАВЕДЕНИЕ (ZT 167b0) — ближайший враг в конусе оружия;
     // урон = дист-кривая (playerWeaponRawDamage, с перками бойца). Промах/вне дальности → искра у стены / прострел трупа.
     // minScale = depth-порог стены в прицеле (ZT d0=-$1e5a): нельзя навестись на врага ДАЛЬШЕ стены перед прицелом.
@@ -115,7 +115,7 @@ void fireSpawn(const Inventory& inv, const Level& lvl, const Camera& cam) {
             if (raw > 0x200) { detonateActor(lvl, a, cam); return; }
         } else if (raw > 0) {
             if (a.think == AT_CORPSE) { corpseHit(a, cam.px, cam.py, raw); return; }   // ТРУП (в конусе из приседа) → отлёт ПО ОРУЖИЮ
-            int dmg = raw / 100 < 1 ? 1 : raw / 100; hitEnemy(a, dmg, cam.px, cam.py, raw); return;
+            int dmg = raw / 100 < 1 ? 1 : raw / 100; hitEnemy(a, dmg, cam.px, cam.py, raw, id); return;
         }
     }
     // ⭐КАМЕРА-ТРЕВОГА (0x26): сбивается ТОЛЬКО В ПРЫЖКЕ (целясь ВВЕРХ — ROM стойка-маска 0x80 vs флаг камеры 0x84).
@@ -143,7 +143,7 @@ void drawInventoryHud(uint32_t* frame, int FW, int FH, const GameData& gd, const
         gd.decodeIcon(icon, ip);
         int bx = SLOT_X[k];
         for (int y = 0; y < 32; ++y)
-            for (int x = 0; x < 32; ++x) { uint8_t i = ip[y * 32 + x]; if (i) px(bx + x, SLOT_Y + y, gd.heldPal.c[i]); }
+            for (int x = 0; x < 32; ++x) { uint8_t i = ip[y * 32 + x]; if (i) px(bx + x, SLOT_Y + y, gd.hudIconPal.c[i]); }
         // боезапас — маленький номер ZT-шрифтом в НИЗ-ЛЕВО углу (FUN_1DF54). Оружие-счётчик (кап 99) = count;
         // расходники (кап 10 @0x11240: сканер/жилет/огнетуш/костюм/фонарь/ночник/огнемёт) = ПРОЦЕНТ 0..100 (ammo·100/cap).
         if (id >= 1 && id < 15) {

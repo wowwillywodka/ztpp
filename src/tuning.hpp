@@ -13,7 +13,7 @@ inline bool& playerPhysics()     { static bool v = true; return v; }
 inline bool& gameDistOctagonal() { static bool v = true; return v; }
 
 // Снять лимит инвентаря (5 несомых, как в ZT). true = безлимит (любое число слотов; пикапы всегда берутся).
-inline bool& inventoryUnlimited() { static bool v = true; return v; }
+inline bool& inventoryUnlimited() { static bool v = false; return v; }   // ⭐ДЕФОЛТ = ZT 5 слотов (юзер); тумблер в меню/ini снимает лимит
 
 // Замедление анимации стен (множитель периода). ZT-аниматор шёл per-frame, но рейкастер ~30fps; на 60fps порт вдвое
 // быстрее → дефолт 2.0. Больше = медленнее. Настраивается в меню (1.0..4.0).
@@ -162,6 +162,29 @@ inline double& faStairUni() { static double v = 0.35; return v; }  // СИЛА �
 // при pitch=0 (стоя) — тождество (D4A6 identity, viewShiftPx=0) → обычная игра не меняется; влияет на прыжок/
 // присед/лестницы (полная сила как ROM, стены+пол+спрайты согласованы). OFF = прежний faStairUni-ослабленный.
 inline bool& faTransitZT() { static bool b = true; return b; }
+// ⚠ОТМЕНЕНО (2026-07-24, адверсарная перепроверка): «June стены ×2» было ОШИБКОЙ разбора c812 —
+// скейлер-блок d0 пишет РОВНО d0 строк (посчитано по таблице 0x3B58: блоки 8/16/32 = 8/16/32 записей);
+// c812 = сверхвысокая ветка «из центра наружу» (аналог ZT cfb2). June высота стены = D0 = 64/perp = ZT.
+inline int&  faWallHMul() { static int m = 1; return m; }
+// ⭐BZT June: ЛЕСТНИЦА БАНД ЗАТЕНЕНИЯ СТЕН зашита в скейлер-блоки таблицы 0x3B58 [VERIFIED скан всех
+// 82 блоков: какой -$71xx LUT грузит блок d0]: d0>=42 БЕЗ LUT (полная яркость!), 38-40→b0, 34-36→b1,
+// 30-32→b2, 26-28→b3, 22-24→b4, 16-20→b5, 10-14→b6, 2-8→b7. Таблица 0x3BFC (env0 Bright/фонарь) —
+// все блоки без LUT. −1 = не затенять колонну.
+inline bool& faJuneBands() { static bool b = false; return b; }
+// ⭐BZT June: June-думалки врагов (роли пака RedRobo/кружение/материализация 0xCD) вместо ZT-аналогий.
+// Ставится в main по билду (вместе с faJuneBands).
+inline bool& juneEnemies() { static bool b = false; return b; }
+inline int juneBandForHeight(int d0) {
+    if (d0 >= 42) return -1;
+    if (d0 >= 38) return 0;
+    if (d0 >= 34) return 1;
+    if (d0 >= 30) return 2;
+    if (d0 >= 26) return 3;
+    if (d0 >= 22) return 4;
+    if (d0 >= 16) return 5;
+    if (d0 >= 10) return 6;
+    return 7;
+}
 
 // ROM-ТОЧНЫЙ АВТОМАТ ДВИЖЕНИЯ ЛИФТА (вскрыто 2026-07-10 по дизасму b4e4/b768/b7aa/e69e-e7d6/a3ec, тройная
 // сверка ROM+2 агента). Заменяет самодельный автомат порта (роли departure/arrival, нет ±2, жёсткий блок ввода).

@@ -112,6 +112,24 @@ struct Inventory {
     void reset() { *this = Inventory{}; }
 };
 
+// BZT June RedMan (15EF8): выбирает случайный непустой из пяти слотов и снимает
+// примерно четверть заряда, но никогда не забирает последнюю единицу предмета.
+inline bool drainRandomInventory(Inventory& inv) {
+    int candidates[5], count = 0;
+    for (int id : inv.carried) {
+        if (count >= 5) break;
+        // 15EF8 сначала выбирает среди всех непустых HUD-слотов и лишь ПОТОМ
+        // отказывается трогать выбранный слот, если в нём осталась одна единица.
+        if (id > 0 && id < 15 && inv.ammo[id] > 0) candidates[count++] = id;
+    }
+    if (count == 0) return false;
+    int id = candidates[enemyRng() % (uint32_t)count];
+    if (inv.ammo[id] <= 1) return false;
+    int loss = inv.ammo[id] / 4; if (loss < 1) loss = 1;
+    inv.ammo[id] -= loss; if (inv.ammo[id] < 1) inv.ammo[id] = 1;
+    return true;
+}
+
 // Отдача тела по кадру выстрела (таблица ZT @0x12828, индекс 905a): сдвиг Y вниз. 4-кадровая анимация.
 static const int FIRE_RECOIL[6] = {0, 4, 7, 6, 3, 0};
 inline int fireRecoil(int fire) { return (fire >= 0 && fire <= 5) ? FIRE_RECOIL[fire] : 0; }
@@ -196,7 +214,7 @@ inline void updateHeld(Inventory& inv, double speed = 0.0) {
 // ── ПОДБОР ПИКАПОВ (по аналогии с doorMap: множество «погашенных» клеток floor*1024+y*32+x) ──
 inline std::unordered_set<int>& pickedSet() { static std::unordered_set<int> s; return s; }
 inline void rcResetPickups() { pickedSet().clear(); }
-inline int  pickKey(int f, int x, int y) { return ((f * 32 + y) * 32 + x); }
+inline int  pickKey(int f, int x, int y) { return cellKey(f, x, y); }
 // idx предмета-в-инвентарь по celltype (icon 10 оружие / 11 предмет → idx = ct−0x18). Возвращает idx или −1.
 // ⚠ ct0x25 = МЕДПАК (+HP, НЕ инвентарь) → −1 (обрабатывается в rcTryPickup отдельно). ОГНЕМЁТ-оружие
 // (weapon-id 13) = пикап ct0x82 (НЕ ct0x25!). Лазерн. ВИНТОВКА = ct0x36 → 14 (НЕ laser-aimed-gun ct0x22=10).
@@ -308,12 +326,12 @@ inline bool transitNoImpactCell(uint8_t ct) {                     // ненул�
 inline void traceMiss(const Level& lvl, int floor, double px, double py, double dx, double dy) {
     const bool high = playerAimHigh();
     int pcx = (int)px, pcy = (int)py;
-    const bool noImpact = (pcx >= 0 && pcy >= 0 && pcx < Level::W && pcy < Level::H) &&
+    const bool noImpact = (pcx >= 0 && pcy >= 0 && pcx < lvl.W && pcy < lvl.H) &&
                           transitNoImpactCell(lvl.cellType(floor, pcx, pcy));
     double x = px, y = py;
     for (int i = 0; i < 600; ++i) {
         double nx = x + dx * 0.06, ny = y + dy * 0.06; int cx = (int)nx, cy = (int)ny;
-        if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return;
+        if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) return;
         uint8_t ct = lvl.cellType(floor, cx, cy);
         if (cellBlockedAt(ct, nx - cx, ny - cy)) {                // 1-я солидная клетка (13d48, диагональ-полуплоскость)
             double d2 = (nx - px) * (nx - px) + (ny - py) * (ny - py);
@@ -337,7 +355,7 @@ inline double laserAimDepth(const Level& lvl, int floor, double px, double py, d
     double x = px, y = py;
     for (int i = 0; i < 600; ++i) {
         double nx = x + dx * 0.06, ny = y + dy * 0.06; int cx = (int)nx, cy = (int)ny;
-        if (cx < 0 || cy < 0 || cx >= Level::W || cy >= Level::H) return 1e9;
+        if (cx < 0 || cy < 0 || cx >= lvl.W || cy >= lvl.H) return 1e9;
         if (cellBlockedAt(lvl.cellType(floor, cx, cy), nx - cx, ny - cy) &&
             !bulletSkyCellId(lvl, lvl.cellId(floor, cx, cy), high))
             return std::hypot(nx - px, ny - py);
@@ -415,8 +433,10 @@ inline void drawHeldRegion(Put put, int rx, int ry, int rw, int rh,
     if (block < 0 || block >= gd.heldBlocks) block = 0;
     const uint8_t* base = gd.heldGfx.data() + (size_t)block * HELD_BLOCK;
     int bw = (block == 6) ? 4 : 3;                      // ракетница: тело 4×3
+    int nt = 12;
+    if (juneEnemies()) { bw = (id < 0) ? 4 : 3; if (id < 0) nt = 16; }   // ⭐June: кулак = спрайт 4×4 (1208E, 0xF00), стволы 3×4 (118E0, 0xB00)
     int sw = 0, sh = 0;
-    std::vector<uint8_t> body = decodeColMajor(base, 0, 12, bw, sw, sh);
+    std::vector<uint8_t> body = decodeColMajor(base, 0, nt, bw, sw, sh);
 
     if (scale < 1) scale = 1;
     int dstW = sw * scale, dstH = sh * scale;
