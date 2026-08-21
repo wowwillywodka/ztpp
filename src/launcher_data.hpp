@@ -97,19 +97,24 @@ inline bool probeRom(const std::string& path, Entry& out, bool keepUnknown) {
     return true;
 }
 
-// ---- Скан каталогов: cwd, два родителя (= пути findRom), каталог бинарника ----
+// ---- Скан каталога рядом с исполняемым файлом ----
+// ROM для релиза кладётся рядом с ztpp. Не обходим cwd и его родителей: при запуске
+// из build/ это легко захватывает личные ROM'ы и посторонние файлы из дерева проекта.
 inline std::vector<Entry> scanRoms() {
     namespace fs = std::filesystem;
     std::vector<fs::path> dirs;
     std::error_code ec;
-    fs::path cwd = fs::current_path(ec);
-    if (!ec) { dirs.push_back(cwd); dirs.push_back(cwd.parent_path()); dirs.push_back(cwd.parent_path().parent_path()); }
     if (char* bp = SDL_GetBasePath()) {
         fs::path base(bp); SDL_free(bp);
         dirs.push_back(base);
-        // ⭐.app-бандл: SDL_GetBasePath = …/ztpp.app/Contents/MacOS → ROM ищем ещё РЯДОМ С БАНДЛОМ
+        // .app-бандл: SDL_GetBasePath = …/ztpp.app/Contents/MacOS → ROM лежит рядом с .app.
         if (base.string().find(".app/Contents/MacOS") != std::string::npos)
-            dirs.push_back(base.parent_path().parent_path().parent_path().parent_path());
+            dirs.push_back(base.parent_path().parent_path().parent_path());
+    } else {
+        // SDL_GetBasePath почти всегда доступен; fallback оставляет портативную
+        // сборку рабочей, но всё равно не поднимается в родительские каталоги.
+        fs::path cwd = fs::current_path(ec);
+        if (!ec) dirs.push_back(cwd);
     }
 
     std::vector<Entry> out;
